@@ -1,0 +1,54 @@
+services:
+  shard1:
+    image: postgres:15-alpine
+    container_name: shardmaster_shard1
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin@shardmaster
+      POSTGRES_DB: shard_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - shard1_data:/var/lib/postgresql/data
+
+  shard2:
+    image: postgres:15-alpine
+    container_name: shardmaster_shard2
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin@shardmaster
+      POSTGRES_DB: shard_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - shard2_data:/var/lib/postgresql/data
+
+  shard3:
+    image: postgres:15-alpine
+    container_name: shardmaster_shard3
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin@shardmaster
+      POSTGRES_DB: shard_db
+    ports:
+      - "5434:5432"
+    volumes:
+      - shard3_data:/var/lib/postgresql/data
+
+  shard4:
+    image: postgres:15-alpine
+    container_name: shardmaster_shard4
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin@shardmaster
+      POSTGRES_DB: shard_db
+    ports:
+      - "5435:5432"
+    volumes:
+      - shard4_data:/var/lib/postgresql/data
+
+volumes:
+  shard1_data:
+  shard2_data:
+  shard3_data:
+  shard4_data:
