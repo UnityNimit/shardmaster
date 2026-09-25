@@ -240,13 +240,28 @@ Verified on a 16 GB RAM Windows workstation (`go1.22+ windows/amd64`):
 
 ## 5. Complete CLI Executable Command Reference (`shardmaster.exe`)
 
-Running `.\shardmaster.exe` with no arguments (or `.\shardmaster.exe help`) displays the complete built-in functionality guide. Below is every command available in the compiled binary:
+Running `.\shardmaster.exe` with no arguments (or double-clicking `shardmaster.exe` in Windows Explorer) automatically boots the **entire distributed system** (`PGWire :6000`, HTTP `:8080`, 4 Physical Shards, `1,024` Virtual Buckets, and the EWMA Hotspot Monitor) and launches the **Unified Interactive Control Center (`shardmaster>` prompt)**:
 
-### 5.1 View Built-In Startup Guide and Help Reference
+### 5.1 Launch the All-in-One Interactive Control Center (Recommended)
 ```powershell
 .\shardmaster.exe
-.\shardmaster.exe help
 ```
+Inside the `shardmaster>` prompt, cluster state persists across commands and you never need to memorize flags. Simply type a menu number (`1` through `12`), a keyword, or raw SQL:
+- **`1` or `learn`**: Interactive Step-by-Step Guided Academy (teaches and demos all 6 Pillars interactively)
+- **`2` or `status`**: Live Cluster Topology and CDC Status Dashboard
+- **`3` or `tui`**: Full-Screen Charmbracelet Bubbletea TUI (press `q` to return to the Control Center)
+- **`4` or `lookup`**: O(1) Shard Key Lookup Inspector (prompts for `user_id`)
+- **`5` or `sql`**: Interactive SQL Router & K-Way Merge Console (presets `1`-`6` or custom SQL)
+- **`6` or `add`**: Add a New Physical Shard in a geographic region and auto-rebalance via CDC
+- **`7` or `split`**: Zero-Downtime Shard Split (`4 -> 8` shards) with live progress and `VDiff`
+- **`8` or `hotspot`**: Inject a Celebrity Traffic Spike (`>6,800 QPS`) on `Bucket #412` and watch EWMA Self-Healing
+- **`9` or `vdiff`**: Run a Cryptographic 256-Bit `XOR-SHA256` `VDiff` Audit across all shards
+- **`10` or `bench`**: Run the Multi-Million Req/Sec Lock-Free Core Benchmark (`500M+` ops/sec)
+- **`11` or `petabyte`**: Run the 1-Petabyte (`1 Trillion` rows) Topology & Network Savings Simulator
+- **`12` or `help`**: Built-In Architecture Encyclopedia (explains every Pillar, formula, and `psql` command)
+- **`demo` / `reset` / `menu` / `exit`**: Additional quick controls
+
+You can also run any feature directly as a standalone subcommand:
 
 ### 5.2 Run the Complete 6-Pillar End-to-End Automated Showcase
 Executes all 6 Pillars sequentially (Point Routing, K-Way Merge Scatter-Gather, 4->5 Shard CDC Resharding, VDiff Cryptographic Proof, Autonomous Bucket #412 Hotspot Isolation, Multi-Million QPS Benchmark, 1-Petabyte Simulation, and TUI Topology Snapshot):
