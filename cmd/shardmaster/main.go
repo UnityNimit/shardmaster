@@ -65,11 +65,17 @@ func printMasterHelpScreen() {
 }
 
 func main() {
+	// Disable Cobra's Windows Explorer mousetrap so double-clicking shardmaster.exe
+	// in Windows File Explorer directly launches the interactive Control Center!
+	cobra.MousetrapHelpText = ""
+	initNativeConsole()
+
 	rootCmd := &cobra.Command{
 		Use:   "shardmaster",
 		Short: "ShardMaster v2.0 - Unified Interactive Control Center, PGWire Proxy & CDC Engine",
 		Long:  "ShardMaster v2.0 - Distributed PostgreSQL Proxy, Zero-Downtime CDC Resharding & Bubbletea TUI",
 		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Println(cyanStyle.Render("[BOOT] Initializing ShardMaster v2.0 (Seeding 50,000,000 rows across 1,024 Virtual Buckets in parallel)..."))
 			qr := bootstrapEngine(4, storage.DefaultInitialRows)
 			console.RunInteractiveShell(qr)
 		},
