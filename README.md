@@ -332,8 +332,10 @@ Executes all 6 Pillars sequentially (Point Routing, K-Way Merge Scatter-Gather, 
 
 ## 6. Interactive Terminal UI (TUI) Guide
 
-When running `.\shardmaster.exe tui`, the Charmbracelet Bubbletea dashboard renders live 60-FPS cluster telemetry while simultaneously listening on TCP port `:6000` for PostgreSQL client connections:
+When running `.\shardmaster.exe tui` (or pressing `3` in the Control Center), the Charmbracelet Bubbletea dashboard renders live 60-FPS cluster telemetry with a **sticky header, scrollable viewport, and sticky footer** so content never clips off your terminal window:
 
+- **Scroll Controls (`Up`/`Down`, `PgUp`/`PgDn`, `Home`/`End`, or `Mouse Wheel`)**: Smoothly scroll vertically through the topology, active CDC workflows, EWMA hotspot alerts, and live SQL query results on any terminal window size.
+- **Keys `1` through `9` (Live Internal SQL Inspector)**: Execute internal diagnostic and data queries directly inside the TUI (`[1] SHOW SHARDS`, `[2] SHOW BUCKETS`, `[3] SHOW CDC`, `[4] SHOW HOTSPOTS`, `[5] SHOW STATS`, `[6] RUN VDIFF`, `[7] EXPLAIN SHARD`, `[8] K-Way Merge Top 5`, `[9] SHOW QUERIES`).
 - **Press `s`**: Trigger a live Zero-Downtime CDC Shard Split (`4 -> 5 -> 8` Shards) and watch the progress bar, replication lag (`ms`), and `VDiff` checksum verification update in real time.
 - **Press `h`**: Inject a simulated celebrity traffic spike (`> 6,500 QPS`) onto `Bucket #412` and watch the Autonomous EWMA Hotspot Engine isolate `Bucket #412` to the coldest shard.
 - **Press `m`**: Trigger a 1-second Multi-Core Zero-Allocation Routing Burst across all logical CPU threads and display peak `req/sec` in the top status bar.
@@ -345,35 +347,54 @@ When running `.\shardmaster.exe tui`, the Charmbracelet Bubbletea dashboard rend
 
 ## 7. Connecting via Native PostgreSQL Clients (`psql`, DBeaver, pgAdmin)
 
-While `.\shardmaster.exe serve` or `.\shardmaster.exe tui` is running, connect with any standard PostgreSQL client on port `6000`:
+While `.\shardmaster.exe` (or `.\shardmaster.exe serve` / `tui`) is running, connect with any standard PostgreSQL client on port `6000` (or select option `5` in the Interactive Control Center):
 
 ```bash
 psql -h localhost -p 6000 -U admin -d shardmaster
 ```
 
-Supported SQL and administrative statements inside `psql`:
+Supported internal diagnostic and data SQL statements:
 
 ```sql
 -- 1. Inspect Physical Shard Topology, Virtual Bucket Counts, and CDC LSNs
 SHOW SHARDS;
 
--- 2. Inspect O(1) xxHash64 & Virtual Bucket Routing Path
+-- 2. Inspect Contiguous Virtual Bucket Ranges [0..1023] and Shard Ownership
+SHOW BUCKETS;
+
+-- 3. Inspect Active and Historical CDC VReplication Streams and VDiff Status
+SHOW CDC;
+
+-- 4. Inspect Top EWMA Hottest Virtual Buckets and Autonomous Isolations
+SHOW HOTSPOTS;
+
+-- 5. Inspect Internal Engine Memory, L1 Directory, CPU Threads, and Query Counters
+SHOW STATS;
+
+-- 6. List All 16 Built-In Internal and Data SQL Queries
+SHOW QUERIES;
+
+-- 7. Inspect O(1) xxHash64 & Virtual Bucket Routing Path
 EXPLAIN SHARD SELECT * FROM users WHERE user_id = 42;
 
--- 3. Execute Single-Shard Point Queries (INSERT / SELECT / DELETE)
+-- 8. Execute Single-Shard Point Queries (INSERT / SELECT / DELETE)
 SELECT * FROM users WHERE user_id = 42;
+SELECT * FROM users WHERE user_id = 49999999;
 INSERT INTO users (user_id, name, email) VALUES (42, 'Ada Lovelace', 'ada@gmail.com');
+DELETE FROM users WHERE user_id = 100;
 
--- 4. Execute Distributed Scatter-Gather + Streaming K-Way Merge Sort
+-- 9. Execute Distributed Scatter-Gather + Streaming K-Way Merge Sort
 SELECT * FROM users WHERE email LIKE '%@gmail.com' ORDER BY created_at DESC LIMIT 10;
+SELECT * FROM users WHERE email LIKE '%@stripe.com' ORDER BY created_at DESC LIMIT 10;
+SELECT * FROM users WHERE region = 'us-west' ORDER BY created_at DESC LIMIT 10;
 
--- 5. Execute Cluster-Wide Count Aggregation
+-- 10. Execute Cluster-Wide 50,000,000-Row Count Aggregation
 SELECT COUNT(*) FROM users;
 
--- 6. Run Cryptographic 256-Bit XOR-SHA256 VDiff Audit
+-- 11. Run Cryptographic 256-Bit XOR-SHA256 VDiff Audit
 RUN VDIFF;
 
--- 7. Trigger Asynchronous Zero-Downtime CDC Resharding
+-- 12. Trigger Asynchronous Zero-Downtime CDC Resharding
 REBALANCE TO 8 SHARDS;
 ```
 

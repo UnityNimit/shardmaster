@@ -14,6 +14,11 @@ const (
 	QueryScatterGather
 	QueryCountAggregate
 	QueryAdminShowShards
+	QueryAdminShowBuckets
+	QueryAdminShowCDC
+	QueryAdminShowHotspots
+	QueryAdminShowStats
+	QueryAdminShowQueries
 	QueryAdminExplainShard
 	QueryAdminRebalance
 	QueryAdminVDiff
@@ -51,6 +56,21 @@ func ClassifySQL(sql string) ClassifiedQuery {
 
 	if strings.HasPrefix(upper, "SHOW SHARDS") || strings.HasPrefix(upper, "SHOW TOPOLOGY") {
 		return ClassifiedQuery{Kind: QueryAdminShowShards, RawSQL: trimmed}
+	}
+	if strings.HasPrefix(upper, "SHOW BUCKETS") {
+		return ClassifiedQuery{Kind: QueryAdminShowBuckets, RawSQL: trimmed}
+	}
+	if strings.HasPrefix(upper, "SHOW CDC") || strings.HasPrefix(upper, "SHOW WORKFLOW") || strings.HasPrefix(upper, "SHOW REPLICATION") {
+		return ClassifiedQuery{Kind: QueryAdminShowCDC, RawSQL: trimmed}
+	}
+	if strings.HasPrefix(upper, "SHOW HOTSPOT") || strings.HasPrefix(upper, "SHOW EWMA") {
+		return ClassifiedQuery{Kind: QueryAdminShowHotspots, RawSQL: trimmed}
+	}
+	if strings.HasPrefix(upper, "SHOW STATS") || strings.HasPrefix(upper, "SHOW MEMORY") || strings.HasPrefix(upper, "SHOW TELEMETRY") {
+		return ClassifiedQuery{Kind: QueryAdminShowStats, RawSQL: trimmed}
+	}
+	if strings.HasPrefix(upper, "SHOW QUERIES") || strings.HasPrefix(upper, "SHOW HELP") || strings.HasPrefix(upper, "SHOW COMMANDS") {
+		return ClassifiedQuery{Kind: QueryAdminShowQueries, RawSQL: trimmed}
 	}
 	if strings.HasPrefix(upper, "EXPLAIN SHARD") {
 		uid, ukey, ok := extractUserIDClause(trimmed)

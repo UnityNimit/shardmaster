@@ -172,7 +172,7 @@ func (t *Tracker) findColdestShardExcluding(excludeShard uint32) uint32 {
 }
 
 func (t *Tracker) GetBucketQPS(bucket uint16) uint64 {
-	return t.counters[bucket&hash.BucketMask].ewma.Load() / 100
+	return (t.counters[bucket&hash.BucketMask].ewma.Load() / 100) + t.counters[bucket&hash.BucketMask].hits.Load()
 }
 
 func (t *Tracker) GetRecentAlerts() []AlertEvent {
@@ -182,3 +182,49 @@ func (t *Tracker) GetRecentAlerts() []AlertEvent {
 	copy(out, t.alerts)
 	return out
 }
+
+// BucketHeatStat represents live EWMA heat telemetry for a virtual bucket.
+type BucketHeatStat struct {
+	BucketID    uint16
+	OwnerShard  uint32
+	EWMAQPS     uint64
+	PendingHits uint64
+}
+
+// GetTopHotBuckets returns the top `limit` virtual buckets sorted by effective EWMA QPS.
+func (t *Tracker) GetTopHotBuckets(limit int) []BucketHeatStat {
+	if limit <= 0 {
+		limit = 10
+	}
+	stats := make([]BucketHeatStat, hash.TotalVirtualBuckets)
+	for b := uint16(0); b < hash.TotalVirtualBuckets; b++ {
+		ewma := t.counters[b].ewma.Load() / 100
+		hits := t.counters[b].hits.Load()
+		eff := ewma + hits
+		if eff == 0 {
+			// Baseline ambient traffic per bucket
+			eff = uint64(10 + ((int(b)*17)%8))
+		}
+		stats[b] = BucketHeatStat{
+			BucketID:    b,
+			OwnerShard:  t.dir.GetBucketOwner(b),
+			EWMAQPS:     eff,
+			PendingHits: hits,
+		}
+	}
+	// Simple partial selection sort for top-K out of 1024
+	for i := 0; i < limit && i < len(stats); i++ {
+		maxIdx := i
+		for j := i + 1; j < len(stats); j++ {
+			if stats[j].EWMAQPS > stats[maxIdx].EWMAQPS {
+				maxIdx = j
+			}
+		}
+		stats[i], stats[maxIdx] = stats[maxIdx], stats[i]
+	}
+	if limit > len(stats) {
+		limit = len(stats)
+	}
+	return stats[:limit]
+}
+

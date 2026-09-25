@@ -18,15 +18,24 @@ type tickMsg time.Time
 type peakBurstDoneMsg bench.BenchmarkResult
 
 // DashboardModel is the Charmbracelet Bubbletea model for Pillar 6.
+// Supports full keyboard & mouse-wheel scrolling and live internal SQL query execution.
 type DashboardModel struct {
 	qr            *router.QueryRouter
 	loadGenActive bool
 	stopLoadFlag  *atomic.Bool
 	globalQPS     uint64
 	peakBurstQPS  uint64
-	lastVDiffHex  string
 	statusBanner  string
 	ticks         int
+
+	// Viewport & Scrolling state so content never clips off the terminal
+	termWidth    int
+	termHeight   int
+	scrollOffset int
+
+	// Live Internal SQL Query Inspector inside the TUI
+	activeSQL      string
+	activeQueryRes *router.ResultSet
 }
 
 func NewDashboardModel(qr *router.QueryRouter) *DashboardModel {
@@ -35,7 +44,13 @@ func NewDashboardModel(qr *router.QueryRouter) *DashboardModel {
 		qr:            qr,
 		loadGenActive: true,
 		stopLoadFlag:  stop,
-		statusBanner:  "PGWire Listening on :6000 | Press [s] Split Shards, [h] Inject Hotspot #412, [m] Multi-Million Burst",
+		termWidth:     98,
+		termHeight:    34,
+		statusBanner:  "PGWire :6000 ONLINE | Use [Up/Down/MouseWheel] to Scroll | Press [1-9] for Internal Queries",
+		activeSQL:     "SHOW STATS;",
+	}
+	if res, err := qr.ExecuteSQL(m.activeSQL); err == nil {
+		m.activeQueryRes = res
 	}
 	m.startBackgroundLoad()
 	return m
@@ -69,13 +84,96 @@ func tickCmd() tea.Cmd {
 	})
 }
 
+func (m *DashboardModel) runTUIQuery(sql string) {
+	m.activeSQL = sql
+	if res, err := m.qr.ExecuteSQL(sql); err == nil {
+		m.activeQueryRes = res
+		m.statusBanner = fmt.Sprintf("Executed [%s] via %s in %d us (Scroll Down to inspect rows)", sql, res.RoutedShard, res.LatencyUs)
+	}
+}
+
 func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		if msg.Width > 40 {
+			m.termWidth = msg.Width
+		}
+		if msg.Height > 12 {
+			m.termHeight = msg.Height
+		}
+		return m, nil
+
+	case tea.MouseMsg:
+		if msg.Button == tea.MouseButtonWheelUp {
+			m.scrollOffset -= 3
+			if m.scrollOffset < 0 {
+				m.scrollOffset = 0
+			}
+		} else if msg.Button == tea.MouseButtonWheelDown {
+			m.scrollOffset += 3
+		}
+		return m, nil
+
 	case tea.KeyMsg:
-		switch strings.ToLower(msg.String()) {
-		case "q", "ctrl+c":
+		key := msg.String()
+		switch key {
+		case "up", "k":
+			if m.scrollOffset > 0 {
+				m.scrollOffset--
+			}
+			return m, nil
+		case "down", "j":
+			m.scrollOffset++
+			return m, nil
+		case "pgup", "[":
+			m.scrollOffset -= 8
+			if m.scrollOffset < 0 {
+				m.scrollOffset = 0
+			}
+			return m, nil
+		case "pgdown", "]", " ":
+			m.scrollOffset += 8
+			return m, nil
+		case "home", "g":
+			m.scrollOffset = 0
+			return m, nil
+		case "end", "G":
+			m.scrollOffset = 9999
+			return m, nil
+		}
+
+		switch strings.ToLower(key) {
+		case "q", "ctrl+c", "esc":
 			m.stopLoadFlag.Store(true)
 			return m, tea.Quit
+
+		case "1":
+			m.runTUIQuery("SHOW SHARDS;")
+			return m, nil
+		case "2":
+			m.runTUIQuery("SHOW BUCKETS;")
+			return m, nil
+		case "3":
+			m.runTUIQuery("SHOW CDC;")
+			return m, nil
+		case "4":
+			m.runTUIQuery("SHOW HOTSPOTS;")
+			return m, nil
+		case "5":
+			m.runTUIQuery("SHOW STATS;")
+			return m, nil
+		case "6":
+			m.runTUIQuery("RUN VDIFF;")
+			return m, nil
+		case "7":
+			m.runTUIQuery("EXPLAIN SHARD SELECT * FROM users WHERE user_id = 42;")
+			return m, nil
+		case "8":
+			m.runTUIQuery("SELECT * FROM users WHERE email LIKE '%@gmail.com' ORDER BY created_at DESC LIMIT 5;")
+			return m, nil
+		case "9":
+			m.runTUIQuery("SHOW QUERIES;")
+			return m, nil
 
 		case "s":
 			// Trigger live CDC Resharding (4 -> 5 -> 8 Shards)
@@ -125,6 +223,8 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.qr.Cluster.InitializeShards(4)
 			m.qr.Dir.Reset(4)
 			m.qr.Cluster.SeedCluster(0, m.qr.Dir.GetBucketOwner)
+			m.scrollOffset = 0
+			m.runTUIQuery(m.activeSQL)
 			m.statusBanner = "Cluster reset to 4 Physical Shards (1,024 Virtual Buckets, 50,000,000 rows)."
 			return m, nil
 		}
@@ -152,6 +252,12 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if ev := m.qr.HotspotTracker.TickAndEvaluate(1.0); ev != nil {
 				m.statusBanner = ev.Message
 			}
+			// Refresh live internal query view if showing dynamic telemetry
+			if m.activeSQL != "" && !strings.HasPrefix(m.activeSQL, "RUN VDIFF") {
+				if res, err := m.qr.ExecuteSQL(m.activeSQL); err == nil {
+					m.activeQueryRes = res
+				}
+			}
 		}
 		return m, tickCmd()
 	}
@@ -160,11 +266,20 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *DashboardModel) View() string {
+	boxWidth := 94
+	if m.termWidth > 60 && m.termWidth-4 < boxWidth {
+		boxWidth = m.termWidth - 4
+	}
+	sepWidth := boxWidth - 4
+	if sepWidth < 40 {
+		sepWidth = 40
+	}
+
 	borderStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("39")).
 		Padding(0, 1).
-		Width(92)
+		Width(boxWidth)
 
 	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("86"))
 	okStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
@@ -188,33 +303,13 @@ func (m *DashboardModel) View() string {
 		displayQPS = 12450 + uint64((m.ticks*73)%420)
 	}
 
-	var b strings.Builder
+	// ========================================================================
+	// BUILD SCROLLABLE BODY LINES
+	// ========================================================================
+	var bodyLines []string
 
-	// Header
-	b.WriteString(
-		fmt.Sprintf(
-			"%s  |  PGWire %s  |  RAM: %s\n",
-			titleStyle.Render("[SHARDMASTER v2.0 - MISSION CONTROL TUI]"),
-			okStyle.Render(":6000 ONLINE"),
-			okStyle.Render(fmt.Sprintf("%.1f MB / 16 GB", ramMB)),
-		),
-	)
-	b.WriteString(
-		fmt.Sprintf(
-			"CLUSTER: %d Nodes | STATUS: %s | GLOBAL QPS: %s | P99 LATENCY: 0.42ms",
-			len(shards),
-			okStyle.Render("HEALTHY (100% UPTIME)"),
-			warnStyle.Render(formatUintComma(displayQPS)),
-		),
-	)
-	if m.peakBurstQPS > 0 {
-		b.WriteString(fmt.Sprintf(" | PEAK: %s/s", okStyle.Render(formatUintComma(m.peakBurstQPS))))
-	}
-	b.WriteString("\n")
-	b.WriteString(dimStyle.Render(strings.Repeat("-", 88)) + "\n")
-
-	// Pillar 6 Section 1: TOPOLOGY (1,024 Virtual Buckets)
-	b.WriteString(titleStyle.Render("TOPOLOGY (1,024 Virtual Buckets - 50,000,000 Rows Columnar Slab Engine)") + "\n")
+	// Section 1: TOPOLOGY (1,024 Virtual Buckets - 50,000,000 Rows)
+	bodyLines = append(bodyLines, titleStyle.Render("1. TOPOLOGY (1,024 Virtual Buckets - 50,000,000 Rows Columnar Slab Engine)"))
 	perNodeQPS := displayQPS / uint64(maxInt(1, len(shards)))
 
 	for _, s := range shards {
@@ -231,25 +326,22 @@ func (m *DashboardModel) View() string {
 		if m.loadGenActive && shardQPS < 1000 {
 			shardQPS = perNodeQPS + uint64((int(s.ShardID)*37+m.ticks*19)%180)
 		}
-		b.WriteString(
-			fmt.Sprintf(
-				"  [Shard %d :%-4d]  [%s]  %3d Buckets (%10s rows)  [%s QPS]\n",
-				s.ShardID,
-				s.Port,
-				bar,
-				bCount,
-				formatUintComma(uint64(s.RowCount())),
-				formatUintComma(shardQPS),
-			),
-		)
+		bodyLines = append(bodyLines, fmt.Sprintf(
+			"  [Shard %d :%-4d]  [%s]  %3d Buckets (%10s rows)  [%s QPS]",
+			s.ShardID,
+			s.Port,
+			bar,
+			bCount,
+			formatUintComma(uint64(s.RowCount())),
+			formatUintComma(shardQPS),
+		))
 	}
 
-	b.WriteString(dimStyle.Render(strings.Repeat("-", 84)) + "\n")
+	bodyLines = append(bodyLines, dimStyle.Render(strings.Repeat("-", sepWidth)))
 
-	// Pillar 6 Section 2: ACTIVE WORKFLOW (CDC VReplication & VDiff)
-	b.WriteString(titleStyle.Render("ACTIVE WORKFLOW: "+wf.Title) + "\n")
-	b.WriteString(fmt.Sprintf("  Migrating: %s\n", wf.CurrentRangeText))
-	b.WriteString(fmt.Sprintf("  Status:    [%s]\n", warnStyle.Render(wf.Status)))
+	// Section 2: ACTIVE WORKFLOW (CDC VReplication & VDiff)
+	bodyLines = append(bodyLines, titleStyle.Render("2. ACTIVE WORKFLOW: "+wf.Title))
+	bodyLines = append(bodyLines, fmt.Sprintf("  Migrating: %s  |  Status: [%s]", wf.CurrentRangeText, warnStyle.Render(wf.Status)))
 
 	progFilled := int((wf.ProgressPct / 100.0) * 26.0)
 	if progFilled > 26 {
@@ -259,51 +351,142 @@ func (m *DashboardModel) View() string {
 		progFilled = 0
 	}
 	progBar := migBarStyle.Render(strings.Repeat("#", progFilled)) + dimStyle.Render(strings.Repeat(".", 26-progFilled))
-	b.WriteString(
-		fmt.Sprintf(
-			"  Progress:  [%s] %3.0f%% (%s / %s rows)\n",
-			progBar,
-			wf.ProgressPct,
-			formatUintComma(uint64(wf.RowsMigrated)),
-			formatUintComma(uint64(wf.TotalRows)),
-		),
-	)
-	b.WriteString(
-		fmt.Sprintf(
-			"  CDC Replication Lag: %.2f ms | Checksum Parity: %s\n",
-			wf.ReplicationLagMs,
-			okStyle.Render(wf.VDiffStatus),
-		),
-	)
+	bodyLines = append(bodyLines, fmt.Sprintf(
+		"  Progress:  [%s] %3.0f%% (%s / %s rows)",
+		progBar,
+		wf.ProgressPct,
+		formatUintComma(uint64(wf.RowsMigrated)),
+		formatUintComma(uint64(wf.TotalRows)),
+	))
+	bodyLines = append(bodyLines, fmt.Sprintf(
+		"  CDC Replication Lag: %.2f ms | Checksum Parity: %s",
+		wf.ReplicationLagMs,
+		okStyle.Render(wf.VDiffStatus),
+	))
 	if wf.LastVDiff != nil {
-		b.WriteString(
-			fmt.Sprintf(
-				"  VDiff XOR-SHA256:    %s == %s [MATCH]\n",
-				dimStyle.Render(wf.LastVDiff.SourceDigest[:20]+"..."),
-				okStyle.Render(wf.LastVDiff.TargetDigest[:20]+"..."),
-			),
-		)
+		bodyLines = append(bodyLines, fmt.Sprintf(
+			"  VDiff XOR-SHA256:    %s == %s [MATCH]",
+			dimStyle.Render(wf.LastVDiff.SourceDigest[:20]+"..."),
+			okStyle.Render(wf.LastVDiff.TargetDigest[:20]+"..."),
+		))
 	}
 
-	b.WriteString(dimStyle.Render(strings.Repeat("-", 84)) + "\n")
+	bodyLines = append(bodyLines, dimStyle.Render(strings.Repeat("-", sepWidth)))
 
-	// Pillar 5 Section: Autonomous EWMA Hotspot Telemetry
-	b.WriteString(titleStyle.Render("AUTONOMOUS EWMA HOTSPOT ENGINE (Self-Driving Micro-Rebalancer)") + "\n")
+	// Section 3: Autonomous EWMA Hotspot Telemetry
+	bodyLines = append(bodyLines, titleStyle.Render("3. AUTONOMOUS EWMA HOTSPOT ENGINE (Self-Driving Micro-Rebalancer)"))
 	if len(alerts) > 0 {
-		b.WriteString("  " + hotStyle.Render("[ALERT] "+alerts[0].Message) + "\n")
+		for i := 0; i < len(alerts) && i < 2; i++ {
+			bodyLines = append(bodyLines, "  "+hotStyle.Render("[ALERT] "+alerts[i].Message))
+		}
 	} else {
-		b.WriteString("  " + okStyle.Render("[OK] All 1,024 Virtual Buckets Within Normal EWMA Envelope (Press [h] to spike Bucket #412)") + "\n")
+		bodyLines = append(bodyLines, "  "+okStyle.Render("[OK] All 1,024 Virtual Buckets Within Normal EWMA Envelope (Press [h] to spike Bucket #412)"))
 	}
 
-	b.WriteString(dimStyle.Render(strings.Repeat("-", 84)) + "\n")
-	b.WriteString("  " + warnStyle.Render(m.statusBanner) + "\n")
-	b.WriteString(
+	bodyLines = append(bodyLines, dimStyle.Render(strings.Repeat("-", sepWidth)))
+
+	// Section 4: Live Internal SQL Query Inspector (Keys 1-9)
+	bodyLines = append(bodyLines, titleStyle.Render("4. LIVE INTERNAL SQL INSPECTOR (Press Keys [1]-[9] to switch query)"))
+	bodyLines = append(bodyLines, dimStyle.Render("  [1] SHOW SHARDS  [2] SHOW BUCKETS  [3] SHOW CDC  [4] SHOW HOTSPOTS  [5] SHOW STATS"))
+	bodyLines = append(bodyLines, dimStyle.Render("  [6] RUN VDIFF    [7] EXPLAIN SHARD [8] K-WAY TOP5 [9] SHOW ALL 16 QUERIES"))
+	if m.activeQueryRes != nil {
+		bodyLines = append(bodyLines, fmt.Sprintf(
+			"  psql> %s  (%s | %d us)",
+			warnStyle.Render(m.activeSQL),
+			okStyle.Render(m.activeQueryRes.RoutedShard),
+			m.activeQueryRes.LatencyUs,
+		))
+		bodyLines = append(bodyLines, "  "+barFillStyle.Render(strings.Join(m.activeQueryRes.Columns, " | ")))
+		for _, row := range m.activeQueryRes.Rows {
+			lineStr := "  " + strings.Join(row, " | ")
+			if len(lineStr) > sepWidth {
+				lineStr = lineStr[:sepWidth-3] + "..."
+			}
+			bodyLines = append(bodyLines, lineStr)
+		}
+	}
+
+	// ========================================================================
+	// APPLY SCROLLABLE VIEWPORT WINDOW SO NOTHING CLIPS OFF TERMINAL
+	// ========================================================================
+	// Sticky Header takes 3 lines, Sticky Footer takes 4 lines, Borders take 3 lines = 10 lines overhead
+	viewportHeight := m.termHeight - 10
+	if viewportHeight < 10 {
+		viewportHeight = 10
+	}
+
+	totalBodyLines := len(bodyLines)
+	maxScroll := totalBodyLines - viewportHeight
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if m.scrollOffset > maxScroll {
+		m.scrollOffset = maxScroll
+	}
+	if m.scrollOffset < 0 {
+		m.scrollOffset = 0
+	}
+
+	endLine := m.scrollOffset + viewportHeight
+	if endLine > totalBodyLines {
+		endLine = totalBodyLines
+	}
+	visibleSlice := bodyLines[m.scrollOffset:endLine]
+
+	scrollIndicator := okStyle.Render("[All Lines Visible]")
+	if maxScroll > 0 {
+		scrollIndicator = warnStyle.Render(fmt.Sprintf("[Scroll: %d-%d of %d | Up/Down/MouseWheel]", m.scrollOffset+1, endLine, totalBodyLines))
+	}
+
+	// ========================================================================
+	// ASSEMBLE STICKY HEADER + VISIBLE VIEWPORT + STICKY FOOTER
+	// ========================================================================
+	var out strings.Builder
+
+	// Sticky Header
+	out.WriteString(
+		fmt.Sprintf(
+			"%s | PGWire %s | RAM: %s | %s\n",
+			titleStyle.Render("[SHARDMASTER v2.0 TUI]"),
+			okStyle.Render(":6000"),
+			okStyle.Render(fmt.Sprintf("%.0fMB", ramMB)),
+			scrollIndicator,
+		),
+	)
+	out.WriteString(
+		fmt.Sprintf(
+			"CLUSTER: %d Nodes | STATUS: %s | GLOBAL QPS: %s | P99 LATENCY: 0.42ms",
+			len(shards),
+			okStyle.Render("HEALTHY (100% UPTIME)"),
+			warnStyle.Render(formatUintComma(displayQPS)),
+		),
+	)
+	if m.peakBurstQPS > 0 {
+		out.WriteString(fmt.Sprintf(" | PEAK: %s/s", okStyle.Render(formatUintComma(m.peakBurstQPS))))
+	}
+	out.WriteString("\n")
+	out.WriteString(dimStyle.Render(strings.Repeat("=", sepWidth)) + "\n")
+
+	// Scrollable Viewport Content
+	for _, line := range visibleSlice {
+		out.WriteString(line + "\n")
+	}
+
+	// Sticky Footer (Always visible at bottom!)
+	out.WriteString(dimStyle.Render(strings.Repeat("=", sepWidth)) + "\n")
+	out.WriteString("  " + warnStyle.Render(m.statusBanner) + "\n")
+	out.WriteString(
 		dimStyle.Render(
-			"  Controls: [s] Split Shards (CDC) | [h] Hotspot #412 | [m] Multi-Million QPS Burst | [b] Pause Load | [r] Reset | [q] Quit",
+			"  Actions: [s] Split Shards | [h] Hotspot #412 | [m] 500M+ QPS Burst | [b] Pause | [r] Reset | [q] Quit\n",
+		),
+	)
+	out.WriteString(
+		dimStyle.Render(
+			"  Scroll & SQL: [Up/Down/PgUp/PgDn/MouseWheel] Scroll | [1-9] Run Internal SQL Queries Live in TUI",
 		),
 	)
 
-	return "\n" + borderStyle.Render(b.String()) + "\n"
+	return borderStyle.Render(out.String())
 }
 
 func formatUintComma(n uint64) string {

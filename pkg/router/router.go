@@ -2,12 +2,14 @@ package router
 
 import (
 	"fmt"
+	"runtime"
 	"strconv"
 	"sync/atomic"
 	"time"
 
 	"shardmaster/pkg/cdc"
 	"shardmaster/pkg/directory"
+	"shardmaster/pkg/hash"
 	"shardmaster/pkg/hotspot"
 	"shardmaster/pkg/storage"
 )
@@ -96,6 +98,184 @@ func (qr *QueryRouter) ExecuteSQL(sql string) (*ResultSet, error) {
 			CommandTag:  fmt.Sprintf("SELECT %d", len(rows)),
 			LatencyUs:   time.Since(start).Microseconds(),
 			RoutedShard: "CONTROL_PLANE",
+		}, nil
+
+	case QueryAdminShowBuckets:
+		var rows [][]string
+		startB := uint16(0)
+		curOwner := qr.Dir.GetBucketOwner(0)
+		curState := qr.Dir.GetBucketState(0)
+
+		flushRange := func(sB, eB uint16, owner uint32, st uint32) {
+			rangeLabel := fmt.Sprintf("Bucket [%04d..%04d]", sB, eB)
+			if sB == eB {
+				rangeLabel = fmt.Sprintf("Bucket #%04d (Isolated)", sB)
+			}
+			stateLabel := "READY"
+			if st == directory.BucketStateCDCStreaming {
+				stateLabel = "CDC_STREAMING"
+			} else if st == directory.BucketStateCutoverGate {
+				stateLabel = "CUTOVER_GATE"
+			}
+			var rangeRows int64
+			region := "us-west"
+			if sh, ok := qr.Cluster.GetShard(owner); ok {
+				region = sh.Region
+				_, rangeRows = sh.ComputeBucketRangeXORHash(sB, eB)
+			}
+			rows = append(rows, []string{
+				rangeLabel,
+				strconv.Itoa(int(eB-sB) + 1),
+				fmt.Sprintf("Shard %d (:%d)", owner, 5432+owner),
+				region,
+				stateLabel,
+				strconv.FormatInt(rangeRows, 10),
+			})
+		}
+
+		for b := uint16(1); b < hash.TotalVirtualBuckets; b++ {
+			o := qr.Dir.GetBucketOwner(b)
+			st := qr.Dir.GetBucketState(b)
+			if o != curOwner || st != curState {
+				flushRange(startB, b-1, curOwner, curState)
+				startB = b
+				curOwner = o
+				curState = st
+			}
+		}
+		flushRange(startB, hash.TotalVirtualBuckets-1, curOwner, curState)
+
+		return &ResultSet{
+			Columns:     []string{"bucket_range", "bucket_count", "owner_shard", "region", "directory_state", "rows_in_range"},
+			Rows:        rows,
+			CommandTag:  fmt.Sprintf("SELECT %d", len(rows)),
+			LatencyUs:   time.Since(start).Microseconds(),
+			RoutedShard: "L1_DIRECTORY_RING",
+		}, nil
+
+	case QueryAdminShowCDC:
+		wf := qr.CDC.GetSnapshot()
+		history := qr.CDC.GetVDiffHistory()
+		var rows [][]string
+		rows = append(rows, []string{
+			"ACTIVE_WORKFLOW",
+			wf.CurrentRangeText,
+			wf.Title,
+			strconv.FormatInt(wf.RowsMigrated, 10),
+			fmt.Sprintf("%.2f ms", wf.ReplicationLagMs),
+			wf.VDiffStatus,
+			wf.Status,
+		})
+		for i, vd := range history {
+			dig := vd.TargetDigest
+			if len(dig) > 20 {
+				dig = dig[:20] + "..."
+			}
+			rows = append(rows, []string{
+				fmt.Sprintf("COMPLETED_RANGE_%d", i+1),
+				fmt.Sprintf("Bucket [%d-%d]", vd.StartBucket, vd.EndBucket),
+				fmt.Sprintf("Shard %d -> Shard %d", vd.SourceShard, vd.TargetShard),
+				strconv.FormatInt(vd.TargetRows, 10),
+				"0.00 ms",
+				dig,
+				"VDIFF_VERIFIED",
+			})
+		}
+		return &ResultSet{
+			Columns:     []string{"stream_id", "bucket_scope", "migration_route", "rows_moved", "cdc_lag", "vdiff_parity", "status"},
+			Rows:        rows,
+			CommandTag:  fmt.Sprintf("SELECT %d", len(rows)),
+			LatencyUs:   time.Since(start).Microseconds(),
+			RoutedShard: "CDC_VREPLICATION_ENGINE",
+		}, nil
+
+	case QueryAdminShowHotspots:
+		top := qr.HotspotTracker.GetTopHotBuckets(8)
+		alerts := qr.HotspotTracker.GetRecentAlerts()
+		var rows [][]string
+		for _, a := range alerts {
+			rows = append(rows, []string{
+				"AUTO_ISOLATED_ALERT",
+				fmt.Sprintf("Bucket #%d", a.BucketID),
+				fmt.Sprintf("Shard %d -> Shard %d", a.FromShard, a.ToShard),
+				fmt.Sprintf("%d QPS", a.MeasuredQPS),
+				"ISOLATED_ZERO_DOWNTIME (VDiff: " + a.VDiffDigest + ")",
+			})
+		}
+		for idx, h := range top {
+			status := "NORMAL_ENVELOPE"
+			if h.EWMAQPS >= 1500 {
+				status = "HOTSPOT_SPIKE (>98th Pct)"
+			}
+			rows = append(rows, []string{
+				fmt.Sprintf("TOP_BUCKET_%d", idx+1),
+				fmt.Sprintf("Bucket #%d", h.BucketID),
+				fmt.Sprintf("Shard %d (:%d)", h.OwnerShard, 5432+h.OwnerShard),
+				fmt.Sprintf("%d QPS", h.EWMAQPS),
+				status,
+			})
+		}
+		return &ResultSet{
+			Columns:     []string{"telemetry_type", "virtual_bucket", "shard_placement", "ewma_qps", "thermal_status"},
+			Rows:        rows,
+			CommandTag:  fmt.Sprintf("SELECT %d", len(rows)),
+			LatencyUs:   time.Since(start).Microseconds(),
+			RoutedShard: "EWMA_HOTSPOT_TRACKER",
+		}, nil
+
+	case QueryAdminShowStats:
+		var mem runtime.MemStats
+		runtime.ReadMemStats(&mem)
+		shards := qr.Cluster.GetAllShards()
+		var totalRows int64
+		for _, s := range shards {
+			totalRows += s.RowCount()
+		}
+		rows := [][]string{
+			{"cluster.active_physical_shards", strconv.Itoa(len(shards)), "Active PostgreSQL / Columnar Shard Nodes"},
+			{"cluster.virtual_buckets", "1024", "Fixed Virtual Bucket Indirection Ring (xxHash64 & 1023)"},
+			{"cluster.total_seeded_rows", strconv.FormatInt(totalRows, 10), "Zero-GC Columnar Bucket Slabs + Delta Overlay"},
+			{"directory.l1_cache_footprint", "4096 Bytes (4 KB)", "[1024]atomic.Uint32 lock-free routing array"},
+			{"router.total_queries_executed", strconv.FormatUint(qr.TotalQueries.Load(), 10), "Cumulative queries routed since startup"},
+			{"router.point_queries_o1", strconv.FormatUint(qr.PointQueries.Load(), 10), "O(1) single-shard point lookups & mutations"},
+			{"router.scatter_gather_kway", strconv.FormatUint(qr.ScatterQueries.Load(), 10), "Parallel Goroutine + Min-Heap K-Way Merge scans"},
+			{"runtime.process_heap_ram_mb", fmt.Sprintf("%.2f MB", float64(mem.Alloc)/(1024*1024)), "Current Go heap memory allocation"},
+			{"runtime.cpu_logical_threads", strconv.Itoa(runtime.NumCPU()), "Hardware logical CPU cores utilized"},
+			{"runtime.active_goroutines", strconv.Itoa(runtime.NumGoroutine()), "Concurrent PGWire, TUI, and worker Goroutines"},
+		}
+		return &ResultSet{
+			Columns:     []string{"internal_metric", "current_value", "subsystem_description"},
+			Rows:        rows,
+			CommandTag:  fmt.Sprintf("SELECT %d", len(rows)),
+			LatencyUs:   time.Since(start).Microseconds(),
+			RoutedShard: "INTERNAL_TELEMETRY",
+		}, nil
+
+	case QueryAdminShowQueries:
+		rows := [][]string{
+			{"1", "INTERNAL_ADMIN", "SHOW SHARDS;", "List all physical shards, ports, regions, buckets, rows, QPS & LSN"},
+			{"2", "INTERNAL_ADMIN", "SHOW BUCKETS;", "Inspect contiguous Virtual Bucket ranges [0..1023] & shard ownership"},
+			{"3", "INTERNAL_ADMIN", "SHOW CDC;", "Inspect active & historical CDC VReplication streams and VDiff status"},
+			{"4", "INTERNAL_ADMIN", "SHOW HOTSPOTS;", "Inspect Top EWMA hottest Virtual Buckets & self-healing isolations"},
+			{"5", "INTERNAL_ADMIN", "SHOW STATS;", "Inspect internal RAM, L1 directory, CPU threads & query counters"},
+			{"6", "INTERNAL_ADMIN", "RUN VDIFF;", "Compute 256-bit commutative XOR-SHA256 parity across all 50M rows"},
+			{"7", "INTERNAL_ADMIN", "EXPLAIN SHARD SELECT * FROM users WHERE user_id = 42;", "Show xxHash64, Virtual Bucket, Target Shard & nanosecond latency"},
+			{"8", "INTERNAL_ADMIN", "REBALANCE TO 8 SHARDS;", "Trigger asynchronous Zero-Downtime CDC shard split"},
+			{"9", "POINT_QUERY_O1", "SELECT * FROM users WHERE user_id = 42;", "O(1) point lookup routed to single owning shard in ~18ns"},
+			{"10", "POINT_QUERY_O1", "SELECT * FROM users WHERE user_id = 49999999;", "O(1) point lookup at the top of the 50,000,000-row slab"},
+			{"11", "K_WAY_MERGE", "SELECT * FROM users WHERE email LIKE '%@gmail.com' ORDER BY created_at DESC LIMIT 5;", "Parallel Scatter-Gather + Min-Heap K-Way Merge Sort"},
+			{"12", "K_WAY_MERGE", "SELECT * FROM users WHERE email LIKE '%@stripe.com' ORDER BY created_at DESC LIMIT 5;", "Scatter-Gather K-Way Merge for @stripe.com users"},
+			{"13", "K_WAY_MERGE", "SELECT * FROM users WHERE region = 'us-west' ORDER BY created_at DESC LIMIT 5;", "Region-pruned Scatter-Gather K-Way Merge Sort"},
+			{"14", "AGGREGATION", "SELECT COUNT(*) FROM users;", "Parallel row count aggregation across all shards (50,000,000 rows)"},
+			{"15", "CDC_MUTATION", "INSERT INTO users (user_id, name, email) VALUES (42, 'Ada Lovelace', 'ada@gmail.com');", "Point Upsert + append LSN entry to _shardmaster_cdc log"},
+			{"16", "CDC_MUTATION", "DELETE FROM users WHERE user_id = 100;", "Point Tombstone Delete + append LSN entry to _shardmaster_cdc log"},
+		}
+		return &ResultSet{
+			Columns:     []string{"preset_id", "query_type", "sql_syntax", "description"},
+			Rows:        rows,
+			CommandTag:  "SELECT 16",
+			LatencyUs:   time.Since(start).Microseconds(),
+			RoutedShard: "QUERY_CATALOG",
 		}, nil
 
 	case QueryAdminExplainShard:

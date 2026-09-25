@@ -83,10 +83,10 @@ func RunInteractiveShell(qr *router.QueryRouter) {
 			PrintStaticDashboard(qr, false)
 
 		case "3", "tui", "dashboard":
-			fmt.Println(cyanStyle.Render("\nLaunching Full-Screen Bubbletea TUI (Press 'q' anytime to return to this Control Center)..."))
-			time.Sleep(300 * time.Millisecond)
+			fmt.Println(cyanStyle.Render("\nLaunching Scrollable Full-Screen Bubbletea TUI (Use Up/Down/MouseWheel to scroll, 'q' to return)..."))
+			time.Sleep(250 * time.Millisecond)
 			model := tui.NewDashboardModel(qr)
-			p := tea.NewProgram(model, tea.WithAltScreen())
+			p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 			_, _ = p.Run()
 			fmt.Println(okStyle.Render("\n[OK] Returned from Full-Screen TUI to Interactive Control Center. Type 'menu' to view options."))
 
@@ -99,7 +99,7 @@ func RunInteractiveShell(qr *router.QueryRouter) {
 			}
 			runLookupAction(qr, key)
 
-		case "5", "sql", "query":
+		case "5", "sql", "query", "queries":
 			if len(args) > 0 {
 				runSQLAction(qr, strings.Join(args, " "))
 			} else {
@@ -214,6 +214,7 @@ func RunInteractiveShell(qr *router.QueryRouter) {
 				strings.HasPrefix(upper, "DELETE ") ||
 				strings.HasPrefix(upper, "SHOW ") ||
 				strings.HasPrefix(upper, "EXPLAIN ") ||
+				strings.HasPrefix(upper, "REBALANCE") ||
 				strings.HasPrefix(upper, "RUN VDIFF") {
 				runSQLAction(qr, input)
 			} else {
@@ -379,34 +380,80 @@ func runLookupAction(qr *router.QueryRouter, key string) {
 }
 
 func runInteractiveSQLMenu(qr *router.QueryRouter, reader *bufio.Reader) {
-	fmt.Println(headerStyle.Render("\n[INTERACTIVE SQL ROUTER & K-WAY MERGE CONSOLE]"))
-	fmt.Println("  Choose a preset query (1-6) or type any custom SQL statement:")
-	fmt.Println("  [1] Point Query (O(1)):    SELECT * FROM users WHERE user_id = 42;")
-	fmt.Println("  [2] Routing Plan Explain:  EXPLAIN SHARD SELECT * FROM users WHERE user_id = 42;")
-	fmt.Println("  [3] K-Way Merge Top 5:     SELECT * FROM users WHERE email LIKE '%@gmail.com' ORDER BY created_at DESC LIMIT 5;")
-	fmt.Println("  [4] Point Upsert (CDC):    INSERT INTO users (user_id, name, email) VALUES (42, 'Ada Lovelace', 'ada@gmail.com');")
-	fmt.Println("  [5] Cluster Topology DDL:  SHOW SHARDS;")
-	fmt.Println("  [6] Cluster Row Count:     SELECT COUNT(*) FROM users;")
+	fmt.Println(headerStyle.Render("\n+------------------------------------------------------------------------------------+"))
+	fmt.Println(headerStyle.Render("| SHARDMASTER INTERNAL & DATA SQL QUERY CONSOLE (50,000,000 ROWS LIVE)               |"))
+	fmt.Println(headerStyle.Render("+------------------------------------------------------------------------------------+"))
+	fmt.Println(cyanStyle.Render("  INTERNAL CONTROL PLANE & DIAGNOSTIC QUERIES:"))
+	fmt.Printf("    %s  %-52s %s\n", okStyle.Render("[1]"), "SHOW SHARDS;", "(Physical shards, buckets, rows, QPS & LSN)")
+	fmt.Printf("    %s  %-52s %s\n", okStyle.Render("[2]"), "SHOW BUCKETS;", "(Virtual Bucket ranges [0..1023] & owners)")
+	fmt.Printf("    %s  %-52s %s\n", okStyle.Render("[3]"), "SHOW CDC;", "(Active & historical CDC streams + VDiff)")
+	fmt.Printf("    %s  %-52s %s\n", okStyle.Render("[4]"), "SHOW HOTSPOTS;", "(Top EWMA hottest buckets & isolations)")
+	fmt.Printf("    %s  %-52s %s\n", okStyle.Render("[5]"), "SHOW STATS;", "(Internal RAM, L1 cache, CPUs & counters)")
+	fmt.Printf("    %s  %-52s %s\n", okStyle.Render("[6]"), "RUN VDIFF;", "(Cryptographic 256-bit XOR-SHA256 parity)")
+	fmt.Printf("    %s  %-52s %s\n", okStyle.Render("[7]"), "EXPLAIN SHARD SELECT * FROM users WHERE user_id=42;", "(xxHash64, Virtual Bucket & ns latency)")
+	fmt.Printf("    %s  %-52s %s\n", okStyle.Render("[8]"), "SHOW QUERIES;", "(Full catalog of all 16 internal queries)")
+	fmt.Println("")
+	fmt.Println(cyanStyle.Render("  DATA PLANE POINT, K-WAY MERGE & CDC MUTATION QUERIES:"))
+	fmt.Printf("    %s  %-52s %s\n", warnStyle.Render("[9]"), "SELECT * FROM users WHERE user_id = 42;", "(O(1) Point Lookup on single shard)")
+	fmt.Printf("    %s %-52s %s\n", warnStyle.Render("[10]"), "SELECT * FROM users WHERE user_id = 49999999;", "(O(1) Point Lookup at 50M slab boundary)")
+	fmt.Printf("    %s %-52s %s\n", warnStyle.Render("[11]"), "SELECT * FROM users WHERE email LIKE '%@gmail.com' ORDER BY created_at DESC LIMIT 5;", "")
+	fmt.Printf("    %s %-52s %s\n", warnStyle.Render("[12]"), "SELECT * FROM users WHERE email LIKE '%@stripe.com' ORDER BY created_at DESC LIMIT 5;", "")
+	fmt.Printf("    %s %-52s %s\n", warnStyle.Render("[13]"), "SELECT * FROM users WHERE region = 'us-west' ORDER BY created_at DESC LIMIT 5;", "")
+	fmt.Printf("    %s %-52s %s\n", warnStyle.Render("[14]"), "SELECT COUNT(*) FROM users;", "(Parallel count across 50,000,000 rows)")
+	fmt.Printf("    %s %-52s %s\n", warnStyle.Render("[15]"), "INSERT INTO users (user_id, name, email) VALUES (42, 'Ada Lovelace', 'ada@gmail.com');", "")
+	fmt.Printf("    %s %-52s %s\n", warnStyle.Render("[16]"), "DELETE FROM users WHERE user_id = 100;", "(Tombstone delete + _shardmaster_cdc log)")
+	fmt.Printf("    %s %-52s %s\n", cyanStyle.Render("[all]"), "Run ALL Internal Diagnostic Queries (1-7) in sequence", "")
 
-	choice := promptDefault(reader, "Select [1-6] or enter custom SQL [default: 3]", "3")
-	var sql string
-	switch choice {
+	choice := promptDefault(reader, "Select [1-16, 'all', or enter custom SQL] [default: all]", "all")
+	switch strings.ToLower(choice) {
 	case "1":
-		sql = "SELECT * FROM users WHERE user_id = 42;"
+		runSQLAction(qr, "SHOW SHARDS;")
 	case "2":
-		sql = "EXPLAIN SHARD SELECT * FROM users WHERE user_id = 42;"
+		runSQLAction(qr, "SHOW BUCKETS;")
 	case "3":
-		sql = "SELECT * FROM users WHERE email LIKE '%@gmail.com' ORDER BY created_at DESC LIMIT 5;"
+		runSQLAction(qr, "SHOW CDC;")
 	case "4":
-		sql = "INSERT INTO users (user_id, name, email) VALUES (42, 'Ada Lovelace', 'ada@gmail.com');"
+		runSQLAction(qr, "SHOW HOTSPOTS;")
 	case "5":
-		sql = "SHOW SHARDS;"
+		runSQLAction(qr, "SHOW STATS;")
 	case "6":
-		sql = "SELECT COUNT(*) FROM users;"
+		runSQLAction(qr, "RUN VDIFF;")
+	case "7":
+		runSQLAction(qr, "EXPLAIN SHARD SELECT * FROM users WHERE user_id = 42;")
+	case "8":
+		runSQLAction(qr, "SHOW QUERIES;")
+	case "9":
+		runSQLAction(qr, "SELECT * FROM users WHERE user_id = 42;")
+	case "10":
+		runSQLAction(qr, "SELECT * FROM users WHERE user_id = 49999999;")
+	case "11":
+		runSQLAction(qr, "SELECT * FROM users WHERE email LIKE '%@gmail.com' ORDER BY created_at DESC LIMIT 5;")
+	case "12":
+		runSQLAction(qr, "SELECT * FROM users WHERE email LIKE '%@stripe.com' ORDER BY created_at DESC LIMIT 5;")
+	case "13":
+		runSQLAction(qr, "SELECT * FROM users WHERE region = 'us-west' ORDER BY created_at DESC LIMIT 5;")
+	case "14":
+		runSQLAction(qr, "SELECT COUNT(*) FROM users;")
+	case "15":
+		runSQLAction(qr, "INSERT INTO users (user_id, name, email) VALUES (42, 'Ada Lovelace', 'ada@gmail.com');")
+	case "16":
+		runSQLAction(qr, "DELETE FROM users WHERE user_id = 100;")
+	case "all", "0":
+		allInternal := []string{
+			"SHOW SHARDS;",
+			"SHOW BUCKETS;",
+			"SHOW CDC;",
+			"SHOW HOTSPOTS;",
+			"SHOW STATS;",
+			"EXPLAIN SHARD SELECT * FROM users WHERE user_id = 42;",
+			"SELECT COUNT(*) FROM users;",
+		}
+		for _, q := range allInternal {
+			runSQLAction(qr, q)
+		}
 	default:
-		sql = choice
+		runSQLAction(qr, choice)
 	}
-	runSQLAction(qr, sql)
 }
 
 func runSQLAction(qr *router.QueryRouter, sql string) {
@@ -422,7 +469,7 @@ func runSQLAction(qr *router.QueryRouter, sql string) {
 		okStyle.Render(fmt.Sprintf("%d us", res.LatencyUs)),
 		okStyle.Render(res.CommandTag))
 	fmt.Printf("  %s\n", cyanStyle.Render(strings.Join(res.Columns, " | ")))
-	fmt.Printf("  %s\n", dimStyle.Render(strings.Repeat("-", 78)))
+	fmt.Printf("  %s\n", dimStyle.Render(strings.Repeat("-", 84)))
 	for _, r := range res.Rows {
 		fmt.Printf("  %s\n", strings.Join(r, " | "))
 	}
