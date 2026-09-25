@@ -136,11 +136,10 @@ func (qr *QueryRouter) ExecuteSQL(sql string) (*ResultSet, error) {
 		shards := qr.Cluster.GetAllShards()
 		rows := make([][]string, 0, len(shards))
 		for _, s := range shards {
-			allRows := s.GetBucketRows(0, 1023)
-			digest, count := cdc.ComputeRollingXORHash(allRows)
+			digest, count := s.ComputeBucketRangeXORHash(0, 1023)
 			rows = append(rows, []string{
 				fmt.Sprintf("Shard %d (:%d)", s.ShardID, s.Port),
-				strconv.Itoa(count),
+				strconv.FormatInt(count, 10),
 				digest,
 				"VERIFIED_INTACT",
 			})

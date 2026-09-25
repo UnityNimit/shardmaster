@@ -11,17 +11,17 @@ import (
 
 // VDiffReport contains the cryptographic verification proof between Source and Target shards.
 type VDiffReport struct {
-	StartBucket   uint16    `json:"start_bucket"`
-	EndBucket     uint16    `json:"end_bucket"`
-	SourceShard   uint32    `json:"source_shard"`
-	TargetShard   uint32    `json:"target_shard"`
-	SourceRows    int       `json:"source_rows"`
-	TargetRows    int       `json:"target_rows"`
-	SourceDigest  string    `json:"source_digest"`
-	TargetDigest  string    `json:"target_digest"`
-	Matched       bool      `json:"matched"`
-	DurationUs    int64     `json:"duration_us"`
-	VerifiedAt    time.Time `json:"verified_at"`
+	StartBucket  uint16    `json:"start_bucket"`
+	EndBucket    uint16    `json:"end_bucket"`
+	SourceShard  uint32    `json:"source_shard"`
+	TargetShard  uint32    `json:"target_shard"`
+	SourceRows   int64     `json:"source_rows"`
+	TargetRows   int64     `json:"target_rows"`
+	SourceDigest string    `json:"source_digest"`
+	TargetDigest string    `json:"target_digest"`
+	Matched      bool      `json:"matched"`
+	DurationUs   int64     `json:"duration_us"`
+	VerifiedAt   time.Time `json:"verified_at"`
 }
 
 // ComputeRowSHA256 computes a canonical 256-bit SHA-256 digest of every column of a UserRow.
@@ -52,9 +52,7 @@ func ComputeRowSHA256(r storage.UserRow) [32]byte {
 	return digest
 }
 
-// ComputeRollingXORHash computes the commutative 256-bit XOR of SHA-256 row digests:
-//   Hash = XOR_{i=1..M} SHA256(col_1 || col_2 || ... || updated_at)
-// Order-independent and requires O(1) memory (32 bytes).
+// ComputeRollingXORHash computes the commutative 256-bit XOR of SHA-256 row digests.
 func ComputeRollingXORHash(rows []storage.UserRow) (string, int) {
 	var acc [32]byte
 	for _, r := range rows {
@@ -75,11 +73,8 @@ func VerifyBucketRangeVDiff(
 ) VDiffReport {
 	start := time.Now()
 
-	srcRows := sourceShard.GetBucketRows(startBucket, endBucket)
-	dstRows := targetShard.GetBucketRows(startBucket, endBucket)
-
-	srcHex, srcCount := ComputeRollingXORHash(srcRows)
-	dstHex, dstCount := ComputeRollingXORHash(dstRows)
+	srcHex, srcCount := sourceShard.ComputeBucketRangeXORHash(startBucket, endBucket)
+	dstHex, dstCount := targetShard.ComputeBucketRangeXORHash(startBucket, endBucket)
 
 	elapsedUs := time.Since(start).Microseconds()
 	if elapsedUs < 15 {

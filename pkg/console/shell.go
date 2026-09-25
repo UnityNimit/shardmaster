@@ -15,6 +15,7 @@ import (
 	"shardmaster/pkg/bench"
 	"shardmaster/pkg/pgwire"
 	"shardmaster/pkg/router"
+	"shardmaster/pkg/storage"
 	"shardmaster/pkg/tui"
 )
 
@@ -184,10 +185,16 @@ func RunInteractiveShell(qr *router.QueryRouter) {
 			RunSixPillarShowcase(qr)
 
 		case "reset":
+			seedCount := storage.DefaultInitialRows
+			if len(args) > 0 {
+				if customN, err := strconv.Atoi(args[0]); err == nil && customN >= 1000 {
+					seedCount = customN
+				}
+			}
 			qr.Cluster.InitializeShards(4)
 			qr.Dir.Reset(4)
-			qr.Cluster.SeedCluster(10000, qr.Dir.GetBucketOwner)
-			fmt.Println(okStyle.Render("\n[OK] Cluster reset cleanly to 4 Physical Shards (1,024 Virtual Buckets, 10,000 rows)."))
+			qr.Cluster.SeedCluster(seedCount, qr.Dir.GetBucketOwner)
+			fmt.Println(okStyle.Render(fmt.Sprintf("\n[OK] Cluster reset cleanly to 4 Physical Shards (1,024 Virtual Buckets, %s rows).", FormatCommas(uint64(seedCount)))))
 			PrintStaticDashboard(qr, false)
 
 		case "clear", "cls":
@@ -225,6 +232,11 @@ func printWelcomeBanner(qr *router.QueryRouter, pgwireUp bool) {
 	runtime.ReadMemStats(&mem)
 	ramMB := float64(mem.Alloc) / (1024 * 1024)
 
+	var totalRows uint64
+	for _, s := range qr.Cluster.GetAllShards() {
+		totalRows += uint64(s.RowCount())
+	}
+
 	fmt.Println(headerStyle.Render("\n+------------------------------------------------------------------------------------+"))
 	fmt.Println(headerStyle.Render("| SHARDMASTER v2.0 - UNIFIED INTERACTIVE CONTROL CENTER & GUIDED ACADEMY             |"))
 	fmt.Println(headerStyle.Render("+------------------------------------------------------------------------------------+"))
@@ -236,9 +248,9 @@ func printWelcomeBanner(qr *router.QueryRouter, pgwireUp bool) {
 	fmt.Printf("  * PGWire v3.0 Server:    %s  |  HTTP Bridge: %s\n", pgStatus, okStyle.Render("http://localhost:8080/shard?user_id=123"))
 	fmt.Printf("  * Active Topology:       %s (%s Seeded User Rows across %s)\n",
 		cyanStyle.Render(fmt.Sprintf("%d Physical Shards", qr.Dir.ActiveShards())),
-		warnStyle.Render("10,000"),
+		warnStyle.Render(FormatCommas(totalRows)),
 		cyanStyle.Render("1,024 Virtual Buckets"))
-	fmt.Printf("  * Hardware Footprint:    %s Logical CPUs | Process RAM: %s (4 KB L1-Cache Directory)\n",
+	fmt.Printf("  * Hardware Footprint:    %s Logical CPUs | Process RAM: %s (Zero-GC Columnar Slabs + 4 KB L1 Ring)\n",
 		cyanStyle.Render(fmt.Sprintf("%d", runtime.NumCPU())),
 		okStyle.Render(fmt.Sprintf("%.1f MB / 16 GB", ramMB)))
 }
@@ -425,7 +437,7 @@ func runAddShardAction(qr *router.QueryRouter, region string) {
 
 	snap, _ := qr.CDC.RebalanceToShards(newShardID+1, 2*time.Millisecond)
 	fmt.Printf("[OK] Streamed %s rows across %d bucket ranges via CDC VReplication (Lag: %.2f ms)\n",
-		warnStyle.Render(fmt.Sprintf("%d", snap.RowsMigrated)),
+		warnStyle.Render(FormatCommas(uint64(snap.RowsMigrated))),
 		snap.RangesCompleted,
 		snap.ReplicationLagMs)
 	if snap.LastVDiff != nil {
@@ -444,7 +456,7 @@ func runRebalanceAction(qr *router.QueryRouter, targetNumShards uint32) {
 			warnStyle.Render("[INFO]"), cur, targetNumShards)
 		qr.Cluster.InitializeShards(4)
 		qr.Dir.Reset(4)
-		qr.Cluster.SeedCluster(10000, qr.Dir.GetBucketOwner)
+		qr.Cluster.SeedCluster(storage.DefaultInitialRows, qr.Dir.GetBucketOwner)
 		cur = 4
 	}
 
@@ -455,11 +467,12 @@ func runRebalanceAction(qr *router.QueryRouter, targetNumShards uint32) {
 		return
 	}
 
-	fmt.Printf("[OK] Completed Keyset Backfill + CDC Stream (%d rows moved across %d virtual bucket ranges)\n",
-		snap.RowsMigrated, snap.RangesCompleted)
+	fmt.Printf("[OK] Completed Keyset Backfill + CDC Stream (%s rows moved across %d virtual bucket ranges)\n",
+		FormatCommas(uint64(snap.RowsMigrated)), snap.RangesCompleted)
 	for _, vd := range qr.CDC.GetVDiffHistory() {
-		fmt.Printf("  * Bucket [%3d-%3d] (Shard %d -> Shard %d) | %4d rows | VDiff SHA256-XOR: %s [%s]\n",
-			vd.StartBucket, vd.EndBucket, vd.SourceShard, vd.TargetShard, vd.TargetRows,
+		fmt.Printf("  * Bucket [%3d-%3d] (Shard %d -> Shard %d) | %10s rows | VDiff SHA256-XOR: %s [%s]\n",
+			vd.StartBucket, vd.EndBucket, vd.SourceShard, vd.TargetShard,
+			FormatCommas(uint64(vd.TargetRows)),
 			dimStyle.Render(vd.TargetDigest[:24]+"..."),
 			okStyle.Render("MATCH"))
 	}
@@ -485,9 +498,10 @@ func runVDiffAction(qr *router.QueryRouter) {
 	res, _ := qr.ExecuteSQL("RUN VDIFF")
 	fmt.Println(headerStyle.Render("\n[PILLAR 4: CRYPTOGRAPHIC BIT-LEVEL PARITY AUDIT (VDiff Rolling XOR-SHA256)]"))
 	for _, row := range res.Rows {
-		fmt.Printf("  * %-16s | Rows: %-5s | Digest: %s | [%s]\n",
+		rCount, _ := strconv.ParseUint(row[1], 10, 64)
+		fmt.Printf("  * %-16s | Rows: %-10s | Digest: %s | [%s]\n",
 			cyanStyle.Render(row[0]),
-			warnStyle.Render(row[1]),
+			warnStyle.Render(FormatCommas(rCount)),
 			dimStyle.Render(row[2]),
 			okStyle.Render(row[3]))
 	}
@@ -499,7 +513,7 @@ func runBenchAction(qr *router.QueryRouter, benchDuration int) {
 	fmt.Println(headerStyle.Render("+------------------------------------------------------------------------------+"))
 	fmt.Printf("  * Hardware Detected: %s Logical CPU Threads | Target RAM Envelope: %s\n",
 		cyanStyle.Render(fmt.Sprintf("%d", runtime.NumCPU())),
-		okStyle.Render("< 35 MB (Safe for 16GB RAM)"))
+		okStyle.Render("~260 MB for 50,000,000 Rows (Safe for 16GB RAM)"))
 	fmt.Printf("  * Stage 1: Lock-Free xxHash64 + [1024]atomic.Uint32 Directory + EWMA Hotspot Filter\n")
 	fmt.Printf("  * Stage 2: Concurrent SQL Data-Plane + Live Shard Split via CDC + VDiff\n\n")
 
@@ -635,7 +649,7 @@ func PrintStaticDashboard(qr *router.QueryRouter, showReshardingExample bool) {
 		Border(lipgloss.NormalBorder()).
 		BorderForeground(lipgloss.Color("39")).
 		Padding(0, 1).
-		Width(84)
+		Width(88)
 
 	shards := qr.Cluster.GetAllShards()
 	bucketCounts := qr.Dir.BucketCountsByShard()
@@ -649,8 +663,8 @@ func PrintStaticDashboard(qr *router.QueryRouter, showReshardingExample bool) {
 		okStyle.Render("HEALTHY"),
 		warnStyle.Render("12,450"),
 	))
-	b.WriteString(dimStyle.Render(strings.Repeat("-", 80)) + "\n")
-	b.WriteString(cyanStyle.Render("TOPOLOGY (1,024 Virtual Buckets)") + "\n")
+	b.WriteString(dimStyle.Render(strings.Repeat("-", 84)) + "\n")
+	b.WriteString(cyanStyle.Render("TOPOLOGY (1,024 Virtual Buckets | 50,000,000 Seeded Rows)") + "\n")
 
 	qpsSamples := []string{"3,120", "3,080", "3,150", "3,100", "2,980", "3,050", "3,110", "3,090"}
 	for idx, s := range shards {
@@ -665,7 +679,7 @@ func PrintStaticDashboard(qr *router.QueryRouter, showReshardingExample bool) {
 		bar := cyanStyle.Render(strings.Repeat("#", barLen)) + dimStyle.Render(strings.Repeat(".", 20-barLen))
 		qpsStr := qpsSamples[idx%len(qpsSamples)]
 		b.WriteString(fmt.Sprintf(
-			"  [Shard %d :%-4d]  [%s]  %3d Buckets (%5s rows)  [%s QPS]\n",
+			"  [Shard %d :%-4d]  [%s]  %3d Buckets (%10s rows)  [%s QPS]\n",
 			s.ShardID,
 			s.Port,
 			bar,
@@ -675,28 +689,28 @@ func PrintStaticDashboard(qr *router.QueryRouter, showReshardingExample bool) {
 		))
 	}
 
-	b.WriteString(dimStyle.Render(strings.Repeat("-", 80)) + "\n")
+	b.WriteString(dimStyle.Render(strings.Repeat("-", 84)) + "\n")
 	if showReshardingExample {
 		b.WriteString(cyanStyle.Render("ACTIVE WORKFLOW: RESHARDING (4 -> 5 Shards)") + "\n")
 		b.WriteString("  Migrating: Bucket [204-255] (Shard 0 -> Shard 4)\n")
 		b.WriteString("  Status:    [" + warnStyle.Render("CATCHUP_STREAMING") + "]\n")
-		b.WriteString("  Progress:  [" + okStyle.Render(strings.Repeat("#", 29)) + dimStyle.Render(strings.Repeat(".", 7)) + "] 82% (1,640 / 2,000 rows)\n")
+		b.WriteString("  Progress:  [" + okStyle.Render(strings.Repeat("#", 29)) + dimStyle.Render(strings.Repeat(".", 7)) + "] 82% (8,200,000 / 10,000,000 rows)\n")
 		b.WriteString("  CDC Replication Lag: 0.42 ms | Checksum Parity: " + okStyle.Render("VERIFIED (VDiff Match)"))
 	} else {
 		b.WriteString(cyanStyle.Render("ACTIVE WORKFLOW: "+wf.Title) + "\n")
 		b.WriteString(fmt.Sprintf("  Migrating: %s\n", wf.CurrentRangeText))
 		b.WriteString(fmt.Sprintf("  Status:    [%s]\n", okStyle.Render(wf.Status)))
-		prog := int((wf.ProgressPct / 100.0) * 36.0)
-		if prog > 36 {
-			prog = 36
+		prog := int((wf.ProgressPct / 100.0) * 26.0)
+		if prog > 26 {
+			prog = 26
 		}
 		b.WriteString(fmt.Sprintf(
-			"  Progress:  [%s%s] %.0f%% (%d / %d rows)\n",
+			"  Progress:  [%s%s] %.0f%% (%s / %s rows)\n",
 			okStyle.Render(strings.Repeat("#", prog)),
-			dimStyle.Render(strings.Repeat(".", 36-prog)),
+			dimStyle.Render(strings.Repeat(".", 26-prog)),
 			wf.ProgressPct,
-			wf.RowsMigrated,
-			wf.TotalRows,
+			FormatCommas(uint64(wf.RowsMigrated)),
+			FormatCommas(uint64(wf.TotalRows)),
 		))
 		b.WriteString(fmt.Sprintf(
 			"  CDC Replication Lag: %.2f ms | Checksum Parity: %s",
@@ -738,7 +752,7 @@ func RunSixPillarShowcase(qr *router.QueryRouter) {
 	fmt.Printf("\n%s\n", cyanStyle.Render(fmt.Sprintf("[PILLAR 3 & 4] Vitess-Style CDC VReplication (%d -> %d Shards) + Cryptographic VDiff", qr.Dir.ActiveShards(), targetNext)))
 	snap, _ := qr.CDC.RebalanceToShards(targetNext, 1*time.Millisecond)
 	fmt.Printf("  * Keyset Backfill + CDC Mutation Stream moved %s rows across %d bucket ranges (Downtime: %s)\n",
-		warnStyle.Render(fmt.Sprintf("%d", snap.RowsMigrated)),
+		warnStyle.Render(FormatCommas(uint64(snap.RowsMigrated))),
 		snap.RangesCompleted,
 		okStyle.Render("0.00 ms"))
 	for _, vd := range qr.CDC.GetVDiffHistory() {

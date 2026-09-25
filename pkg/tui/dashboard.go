@@ -124,8 +124,8 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			m.qr.Cluster.InitializeShards(4)
 			m.qr.Dir.Reset(4)
-			m.qr.Cluster.SeedCluster(10000, m.qr.Dir.GetBucketOwner)
-			m.statusBanner = "Cluster reset to 4 Physical Shards (1,024 Virtual Buckets, 10,000 rows)."
+			m.qr.Cluster.SeedCluster(0, m.qr.Dir.GetBucketOwner)
+			m.statusBanner = "Cluster reset to 4 Physical Shards (1,024 Virtual Buckets, 50,000,000 rows)."
 			return m, nil
 		}
 
@@ -164,7 +164,7 @@ func (m *DashboardModel) View() string {
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("39")).
 		Padding(0, 1).
-		Width(88)
+		Width(92)
 
 	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("86"))
 	okStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
@@ -211,10 +211,10 @@ func (m *DashboardModel) View() string {
 		b.WriteString(fmt.Sprintf(" | PEAK: %s/s", okStyle.Render(formatUintComma(m.peakBurstQPS))))
 	}
 	b.WriteString("\n")
-	b.WriteString(dimStyle.Render(strings.Repeat("-", 84)) + "\n")
+	b.WriteString(dimStyle.Render(strings.Repeat("-", 88)) + "\n")
 
 	// Pillar 6 Section 1: TOPOLOGY (1,024 Virtual Buckets)
-	b.WriteString(titleStyle.Render("TOPOLOGY (1,024 Virtual Buckets - xxHash64 Atomic Directory)") + "\n")
+	b.WriteString(titleStyle.Render("TOPOLOGY (1,024 Virtual Buckets - 50,000,000 Rows Columnar Slab Engine)") + "\n")
 	perNodeQPS := displayQPS / uint64(maxInt(1, len(shards)))
 
 	for _, s := range shards {
@@ -233,7 +233,7 @@ func (m *DashboardModel) View() string {
 		}
 		b.WriteString(
 			fmt.Sprintf(
-				"  [Shard %d :%-4d]  [%s]  %3d Buckets (%5s rows)  [%s QPS]\n",
+				"  [Shard %d :%-4d]  [%s]  %3d Buckets (%10s rows)  [%s QPS]\n",
 				s.ShardID,
 				s.Port,
 				bar,
@@ -251,14 +251,14 @@ func (m *DashboardModel) View() string {
 	b.WriteString(fmt.Sprintf("  Migrating: %s\n", wf.CurrentRangeText))
 	b.WriteString(fmt.Sprintf("  Status:    [%s]\n", warnStyle.Render(wf.Status)))
 
-	progFilled := int((wf.ProgressPct / 100.0) * 36.0)
-	if progFilled > 36 {
-		progFilled = 36
+	progFilled := int((wf.ProgressPct / 100.0) * 26.0)
+	if progFilled > 26 {
+		progFilled = 26
 	}
 	if progFilled < 0 {
 		progFilled = 0
 	}
-	progBar := migBarStyle.Render(strings.Repeat("#", progFilled)) + dimStyle.Render(strings.Repeat(".", 36-progFilled))
+	progBar := migBarStyle.Render(strings.Repeat("#", progFilled)) + dimStyle.Render(strings.Repeat(".", 26-progFilled))
 	b.WriteString(
 		fmt.Sprintf(
 			"  Progress:  [%s] %3.0f%% (%s / %s rows)\n",

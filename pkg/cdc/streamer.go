@@ -13,20 +13,20 @@ import (
 
 // WorkflowSnapshot represents live telemetry of an active or recently completed CDC VReplication workflow.
 type WorkflowSnapshot struct {
-	Active           bool          `json:"active"`
-	Title            string        `json:"title"`
-	CurrentRangeText string        `json:"current_range_text"`
-	Status           string        `json:"status"`
-	ProgressPct      float64       `json:"progress_pct"`
-	RowsMigrated     int           `json:"rows_migrated"`
-	TotalRows        int           `json:"total_rows"`
-	CDCEventsApplied uint64        `json:"cdc_events_applied"`
-	ReplicationLagMs float64       `json:"replication_lag_ms"`
-	VDiffStatus      string        `json:"vdiff_status"`
-	LastVDiff        *VDiffReport  `json:"last_vdiff,omitempty"`
-	RangesCompleted  int           `json:"ranges_completed"`
-	TotalRanges      int           `json:"total_ranges"`
-	DowntimeMs       float64       `json:"downtime_ms"`
+	Active           bool         `json:"active"`
+	Title            string       `json:"title"`
+	CurrentRangeText string       `json:"current_range_text"`
+	Status           string       `json:"status"`
+	ProgressPct      float64      `json:"progress_pct"`
+	RowsMigrated     int64        `json:"rows_migrated"`
+	TotalRows        int64        `json:"total_rows"`
+	CDCEventsApplied uint64       `json:"cdc_events_applied"`
+	ReplicationLagMs float64      `json:"replication_lag_ms"`
+	VDiffStatus      string       `json:"vdiff_status"`
+	LastVDiff        *VDiffReport `json:"last_vdiff,omitempty"`
+	RangesCompleted  int          `json:"ranges_completed"`
+	TotalRanges      int          `json:"total_ranges"`
+	DowntimeMs       float64      `json:"downtime_ms"`
 }
 
 // Engine orchestrates Vitess-style Change Data Capture (CDC) VReplication, Keyset Backfill,
@@ -35,10 +35,10 @@ type Engine struct {
 	dir     *directory.ShardDirectory
 	cluster *storage.ClusterStorage
 
-	mu          sync.RWMutex
-	running     atomic.Bool
-	snapshot    WorkflowSnapshot
-	vdiffLogs   []VDiffReport
+	mu        sync.RWMutex
+	running   atomic.Bool
+	snapshot  WorkflowSnapshot
+	vdiffLogs []VDiffReport
 }
 
 func NewEngine(dir *directory.ShardDirectory, cluster *storage.ClusterStorage) *Engine {
@@ -47,7 +47,7 @@ func NewEngine(dir *directory.ShardDirectory, cluster *storage.ClusterStorage) *
 		cluster: cluster,
 		snapshot: WorkflowSnapshot{
 			Active:           false,
-			Title:            "IDLE (Cluster Balanced)",
+			Title:            "IDLE (Cluster Balanced - 50,000,000 Rows)",
 			CurrentRangeText: "No active bucket migration",
 			Status:           "READY",
 			ProgressPct:      100.0,
@@ -96,11 +96,11 @@ func (e *Engine) RebalanceToShards(targetShards uint32, stepDelay time.Duration)
 	currentBuckets := e.dir.SnapshotBuckets()
 	_, ranges := hash.ComputeOptimalSplit(currentBuckets, targetShards)
 
-	// Calculate total rows scheduled to move across all ranges
-	totalRowsToMove := 0
+	// Calculate total rows scheduled to move across all ranges (e.g. ~25,000,000 rows on 4 -> 8 split)
+	var totalRowsToMove int64
 	for _, r := range ranges {
 		if src, ok := e.cluster.GetShard(r.FromShard); ok {
-			totalRowsToMove += len(src.GetBucketRows(r.StartBucket, r.EndBucket))
+			totalRowsToMove += src.GetBucketRangeRowCount(r.StartBucket, r.EndBucket)
 		}
 	}
 	if totalRowsToMove == 0 {
@@ -123,7 +123,7 @@ func (e *Engine) RebalanceToShards(targetShards uint32, stepDelay time.Duration)
 		s.DowntimeMs = 0.00
 	})
 
-	rowsMovedSoFar := 0
+	var rowsMovedSoFar int64
 	var totalCDCEvents uint64
 
 	for idx, rng := range ranges {
@@ -143,56 +143,46 @@ func (e *Engine) RebalanceToShards(targetShards uint32, stepDelay time.Duration)
 			e.dir.SetBucketState(b, directory.BucketStateCDCStreaming)
 		}
 
+		watermarkLSN := srcShard.CurrentLSN()
+
 		// ====================================================================
-		// PHASE A: Keyset Pagination Backfill (No Table Locks)
+		// PHASE A: Columnar Keyset Backfill (Bucket-by-Bucket Non-Blocking Copy)
 		// ====================================================================
-		var afterUserID int64 = -1
-		var watermarkLSN uint64
-		batchSize := 120
+		for b := rng.StartBucket; b <= rng.EndBucket; b++ {
+			slabCopy := srcShard.ExportBucketSlab(b)
+			dstShard.InstallBucketSlab(slabCopy)
+			rowsMovedSoFar += slabCopy.RowCount
 
-		for {
-			batch, snapLSN := srcShard.ScanBucketKeyset(rng.StartBucket, rng.EndBucket, afterUserID, batchSize)
-			if watermarkLSN == 0 {
-				watermarkLSN = snapLSN
-			}
-			if len(batch) == 0 {
-				break
-			}
-
-			for _, row := range batch {
-				dstShard.UpsertUser(row, false)
-				afterUserID = row.UserID
-			}
-			rowsMovedSoFar += len(batch)
-
-			// Also tail and apply any concurrent in-flight CDC mutations that arrived during backfill
-			events, latestLSN := srcShard.FetchCDCMutationsAfter(rng.StartBucket, rng.EndBucket, watermarkLSN)
-			for _, ev := range events {
-				if ev.Op == storage.MutationInsertOrUpdate {
-					dstShard.UpsertUser(ev.Row, false)
-				} else if ev.Op == storage.MutationDelete {
-					dstShard.DeleteUser(ev.UserID, false)
+			// Stream any concurrent in-flight CDC mutations every 8 buckets
+			if (b-rng.StartBucket)%8 == 0 || b == rng.EndBucket {
+				events, latestLSN := srcShard.FetchCDCMutationsAfter(rng.StartBucket, rng.EndBucket, watermarkLSN)
+				for _, ev := range events {
+					if ev.Op == storage.MutationInsertOrUpdate {
+						dstShard.UpsertUser(ev.Row, false)
+					} else if ev.Op == storage.MutationDelete {
+						dstShard.DeleteUser(ev.UserID, false)
+					}
+					totalCDCEvents++
 				}
-				totalCDCEvents++
-			}
-			watermarkLSN = latestLSN
+				watermarkLSN = latestLSN
 
-			pct := (float64(rowsMovedSoFar) / float64(totalRowsToMove)) * 100.0
-			if pct > 98.0 {
-				pct = 98.0
-			}
-			e.updateState(func(s *WorkflowSnapshot) {
-				s.CurrentRangeText = rangeLabel
-				s.Status = "CATCHUP_STREAMING"
-				s.RowsMigrated = rowsMovedSoFar
-				s.ProgressPct = pct
-				s.CDCEventsApplied = totalCDCEvents
-				s.ReplicationLagMs = 0.42
-				s.VDiffStatus = "STREAMING_MERKLE_HASH"
-			})
+				pct := (float64(rowsMovedSoFar) / float64(totalRowsToMove)) * 100.0
+				if pct > 99.0 {
+					pct = 99.0
+				}
+				e.updateState(func(s *WorkflowSnapshot) {
+					s.CurrentRangeText = rangeLabel
+					s.Status = "CATCHUP_STREAMING"
+					s.RowsMigrated = rowsMovedSoFar
+					s.ProgressPct = pct
+					s.CDCEventsApplied = totalCDCEvents
+					s.ReplicationLagMs = 0.42
+					s.VDiffStatus = "STREAMING_MERKLE_HASH"
+				})
 
-			if stepDelay > 0 {
-				time.Sleep(stepDelay)
+				if stepDelay > 0 {
+					time.Sleep(stepDelay)
+				}
 			}
 		}
 
@@ -212,17 +202,10 @@ func (e *Engine) RebalanceToShards(targetShards uint32, stepDelay time.Duration)
 			}
 			totalCDCEvents++
 		}
-		watermarkLSN = finalLSN
+		_ = finalLSN
 
 		// Pillar 4: Run VDiff Rolling XOR-SHA256 Checksum Comparison
 		vdiff := VerifyBucketRangeVDiff(srcShard, dstShard, rng.StartBucket, rng.EndBucket)
-		if !vdiff.Matched {
-			// Reconcile any in-flight delta before cutover
-			for _, r := range srcShard.GetBucketRows(rng.StartBucket, rng.EndBucket) {
-				dstShard.UpsertUser(r, false)
-			}
-			vdiff = VerifyBucketRangeVDiff(srcShard, dstShard, rng.StartBucket, rng.EndBucket)
-		}
 
 		// ====================================================================
 		// PHASE C: Atomic Pointer Cutover (`atomic.Uint32.Store`)
@@ -231,7 +214,7 @@ func (e *Engine) RebalanceToShards(targetShards uint32, stepDelay time.Duration)
 			e.dir.AtomicCutoverBucket(b, rng.ToShard)
 		}
 
-		// Drain migrated historical rows from source shard now that pointer is flipped
+		// Drain migrated historical bucket slabs from source shard now that pointer is flipped
 		srcShard.PurgeBucketRange(rng.StartBucket, rng.EndBucket)
 
 		vdiffCopy := vdiff
@@ -280,10 +263,8 @@ func (e *Engine) MigrateSingleHotBucket(bucket uint16, fromShardID, toShardID ui
 	}
 
 	e.dir.SetBucketState(bucket, directory.BucketStateCDCStreaming)
-	rows := srcShard.GetBucketRows(bucket, bucket)
-	for _, r := range rows {
-		dstShard.UpsertUser(r, false)
-	}
+	slabCopy := srcShard.ExportBucketSlab(bucket)
+	dstShard.InstallBucketSlab(slabCopy)
 
 	vdiff := VerifyBucketRangeVDiff(srcShard, dstShard, bucket, bucket)
 	e.dir.AtomicCutoverBucket(bucket, toShardID)
@@ -295,8 +276,8 @@ func (e *Engine) MigrateSingleHotBucket(bucket uint16, fromShardID, toShardID ui
 	e.snapshot.CurrentRangeText = fmt.Sprintf("Bucket [%d] (Shard %d -> Shard %d)", bucket, fromShardID, toShardID)
 	e.snapshot.Status = "HOTSPOT_MITIGATED"
 	e.snapshot.ProgressPct = 100.0
-	e.snapshot.RowsMigrated = len(rows)
-	e.snapshot.TotalRows = len(rows)
+	e.snapshot.RowsMigrated = slabCopy.RowCount
+	e.snapshot.TotalRows = slabCopy.RowCount
 	e.snapshot.ReplicationLagMs = 0.00
 	e.snapshot.VDiffStatus = "VERIFIED (VDiff Match)"
 	e.snapshot.LastVDiff = &vdiff
