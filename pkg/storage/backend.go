@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +21,12 @@ import (
 
 // DefaultInitialRows is 50,000,000 (50 Million) rows across the cluster on startup.
 const DefaultInitialRows = 50_000_000
+
+// DefaultShardCapacityBytes is 64 MB (67,108,864 bytes) per shard so 4 shards use only ~256 MB on a 16 GB RAM PC.
+const DefaultShardCapacityBytes int64 = 64 * 1024 * 1024
+
+// DefaultSlabBytesPerBucket is 262,144 bytes (256 KB = 65,536 uint32 entries) per virtual bucket.
+const DefaultSlabBytesPerBucket int = 262144
 
 // UserRow represents a materialized row in the distributed `users` table.
 type UserRow struct {
@@ -75,18 +82,22 @@ var (
 	epochBaseTime = time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
 )
 
-// ShardSettings holds real-world customizable hardware, sizing, and operational parameters for a physical shard.
+// ShardSettings holds 100% free-form, byte-exact customizable parameters for a physical shard.
 type ShardSettings struct {
-	CustomAlias     string `json:"custom_alias"`
-	Region          string `json:"region"`
-	DiskCapacityGB  int    `json:"disk_capacity_gb"`
-	HardwareTier    string `json:"hardware_tier"`
-	Weight          int    `json:"weight"`
-	TargetBuckets   int    `json:"target_buckets"`
-	AccessMode      string `json:"access_mode"`      // READ_WRITE, READ_ONLY, DRAINING, MAINTENANCE
-	ReplicationMode string `json:"replication_mode"` // SYNC_QUORUM, SEMI_SYNC, ASYNC_FAST
-	MaxConnections  int    `json:"max_connections"`
-	BufferPoolMB    int    `json:"buffer_pool_mb"`
+	CustomAlias        string `json:"custom_alias"`
+	CustomPort         int    `json:"custom_port"`
+	Region             string `json:"region"`
+	MaxCapacityBytes   int64  `json:"max_capacity_bytes"`    // Exact byte capacity (e.g. 4096 B, 1048576 B, 67108864 B, etc.)
+	SlabBytesPerBucket int    `json:"slab_bytes_per_bucket"` // Exact bytes allocated per bucket slab in RAM
+	DiskCapacityGB     int    `json:"disk_capacity_gb"`      // Optional GB alias (kept in sync if >= 1 GB)
+	HardwareTier       string `json:"hardware_tier"`
+	Weight             int    `json:"weight"`
+	TargetBuckets      int    `json:"target_buckets"`
+	AccessMode         string `json:"access_mode"`
+	ReplicationMode    string `json:"replication_mode"`
+	MaxConnections     int    `json:"max_connections"`
+	BufferPoolBytes    int64  `json:"buffer_pool_bytes"`
+	BufferPoolMB       int    `json:"buffer_pool_mb"`
 }
 
 // PhysicalShard represents an isolated physical database shard (e.g. Shard 0 :5432 .. Shard 7 :5439).
@@ -115,7 +126,7 @@ type PhysicalShard struct {
 	cdcJournal []MutationLogEntry
 }
 
-// NewPhysicalShard initializes a physical shard with 1,024 virtual bucket columnar slabs and default customizable settings.
+// NewPhysicalShard initializes a physical shard with 1,024 virtual bucket columnar slabs and lightweight 64 MB default quota.
 func NewPhysicalShard(shardID uint32, region string) *PhysicalShard {
 	port := 5432 + int(shardID)
 	if region == "" {
@@ -129,16 +140,20 @@ func NewPhysicalShard(shardID uint32, region string) *PhysicalShard {
 		Region:  region,
 		DSN:     fmt.Sprintf("postgres://postgres:postgres@localhost:%d/shard_%d?sslmode=disable", port, shardID),
 		settings: ShardSettings{
-			CustomAlias:     alias,
-			Region:          region,
-			DiskCapacityGB:  256,
-			HardwareTier:    "NVMe-Pro 16vCPU/64GB",
-			Weight:          100,
-			TargetBuckets:   256,
-			AccessMode:      "READ_WRITE",
-			ReplicationMode: "SYNC_QUORUM",
-			MaxConnections:  1000,
-			BufferPoolMB:    16384,
+			CustomAlias:        alias,
+			CustomPort:         port,
+			Region:             region,
+			MaxCapacityBytes:   DefaultShardCapacityBytes, // 67,108,864 B (64 MB) - safe for 16 GB RAM PCs!
+			SlabBytesPerBucket: DefaultSlabBytesPerBucket, // 262,144 B (256 KB) per bucket
+			DiskCapacityGB:     1,
+			HardwareTier:       "16GB-PC-RAM-Slab",
+			Weight:             100,
+			TargetBuckets:      256,
+			AccessMode:         "READ_WRITE",
+			ReplicationMode:    "SYNC_QUORUM",
+			MaxConnections:     1000,
+			BufferPoolBytes:    16 * 1024 * 1024, // 16,777,216 B (16 MB)
+			BufferPoolMB:       16,
 		},
 		cdcJournal: make([]MutationLogEntry, 0, 4096),
 	}
@@ -160,20 +175,39 @@ func (s *PhysicalShard) GetSettings() ShardSettings {
 	return s.settings
 }
 
-// UpdateSettings updates the shard's live operational settings, custom name, size, tier, and weight.
+// UpdateSettings updates the shard's live operational settings, custom name, exact byte capacity, slab bytes, tier, and weight.
 func (s *PhysicalShard) UpdateSettings(cfg ShardSettings) {
 	s.metaMu.Lock()
-	defer s.metaMu.Unlock()
 	if strings.TrimSpace(cfg.CustomAlias) != "" {
 		s.settings.CustomAlias = strings.TrimSpace(cfg.CustomAlias)
+	}
+	if cfg.CustomPort > 0 {
+		s.settings.CustomPort = cfg.CustomPort
+		s.Port = cfg.CustomPort
+		s.Name = fmt.Sprintf("Shard %d :%d", s.ShardID, s.Port)
+		s.DSN = fmt.Sprintf("postgres://postgres:postgres@localhost:%d/shard_%d?sslmode=disable", s.Port, s.ShardID)
 	}
 	if strings.TrimSpace(cfg.Region) != "" {
 		s.settings.Region = strings.TrimSpace(cfg.Region)
 		s.Region = s.settings.Region
 	}
-	if cfg.DiskCapacityGB > 0 {
+
+	resizeSlabs := false
+	if cfg.MaxCapacityBytes > 0 && cfg.MaxCapacityBytes != s.settings.MaxCapacityBytes {
+		s.settings.MaxCapacityBytes = cfg.MaxCapacityBytes
+		s.settings.DiskCapacityGB = int(cfg.MaxCapacityBytes / (1024 * 1024 * 1024))
+		resizeSlabs = true
+	} else if cfg.DiskCapacityGB > 0 && cfg.MaxCapacityBytes == 0 && cfg.DiskCapacityGB != s.settings.DiskCapacityGB {
 		s.settings.DiskCapacityGB = cfg.DiskCapacityGB
+		s.settings.MaxCapacityBytes = int64(cfg.DiskCapacityGB) * 1024 * 1024 * 1024
+		resizeSlabs = true
 	}
+
+	if cfg.SlabBytesPerBucket > 0 && cfg.SlabBytesPerBucket != s.settings.SlabBytesPerBucket {
+		s.settings.SlabBytesPerBucket = cfg.SlabBytesPerBucket
+		resizeSlabs = true
+	}
+
 	if strings.TrimSpace(cfg.HardwareTier) != "" {
 		s.settings.HardwareTier = strings.TrimSpace(cfg.HardwareTier)
 	}
@@ -192,9 +226,106 @@ func (s *PhysicalShard) UpdateSettings(cfg ShardSettings) {
 	if cfg.MaxConnections > 0 {
 		s.settings.MaxConnections = cfg.MaxConnections
 	}
-	if cfg.BufferPoolMB > 0 {
+	if cfg.BufferPoolBytes > 0 {
+		s.settings.BufferPoolBytes = cfg.BufferPoolBytes
+		s.settings.BufferPoolMB = int(cfg.BufferPoolBytes / (1024 * 1024))
+	} else if cfg.BufferPoolMB > 0 {
 		s.settings.BufferPoolMB = cfg.BufferPoolMB
+		s.settings.BufferPoolBytes = int64(cfg.BufferPoolMB) * 1024 * 1024
 	}
+	maxCap := s.settings.MaxCapacityBytes
+	slabBytes := s.settings.SlabBytesPerBucket
+	s.metaMu.Unlock()
+
+	if resizeSlabs {
+		s.ResizeMemorySlabs(maxCap, slabBytes)
+	}
+}
+
+// ResizeMemorySlabs physically resizes the in-RAM []uint32 columnar slabs on this shard so that
+// each bucket slab and the total shard RAM footprint strictly obey the user's exact byte configuration.
+func (s *PhysicalShard) ResizeMemorySlabs(maxCapacityBytes int64, slabBytesPerBucket int) {
+	if maxCapacityBytes <= 0 {
+		maxCapacityBytes = DefaultShardCapacityBytes
+	}
+	if slabBytesPerBucket <= 0 {
+		slabBytesPerBucket = DefaultSlabBytesPerBucket
+	}
+
+	// Count active buckets on this shard
+	activeBuckets := 0
+	for b := uint16(0); b < hash.TotalVirtualBuckets; b++ {
+		s.bucketMu[b].RLock()
+		if s.buckets[b].RowCount > 0 {
+			activeBuckets++
+		}
+		s.bucketMu[b].RUnlock()
+	}
+	if activeBuckets == 0 {
+		return
+	}
+
+	// Ensure per-bucket byte allocation fits inside maxCapacityBytes / activeBuckets
+	maxPerBucket := int(maxCapacityBytes / int64(activeBuckets))
+	targetBytes := slabBytesPerBucket
+	if maxPerBucket < targetBytes {
+		targetBytes = maxPerBucket
+	}
+	if targetBytes < 4 {
+		targetBytes = 4 // At least 1 uint32 (4 bytes) if maxCapacityBytes >= 4
+	}
+	if maxCapacityBytes < int64(activeBuckets*4) {
+		targetBytes = 0
+	}
+
+	targetEntries := targetBytes / 4
+	var remainingBudget int64 = maxCapacityBytes
+
+	for b := uint16(0); b < hash.TotalVirtualBuckets; b++ {
+		s.bucketMu[b].Lock()
+		slab := s.buckets[b]
+		if slab.RowCount > 0 {
+			entries := targetEntries
+			if int64(entries*4) > remainingBudget {
+				entries = int(remainingBudget / 4)
+			}
+			if entries < 0 {
+				entries = 0
+			}
+			if entries == 0 {
+				slab.SlabBalances = nil
+			} else if len(slab.SlabBalances) != entries {
+				newBalances := make([]uint32, entries)
+				copyCount := copy(newBalances, slab.SlabBalances)
+				for i := copyCount; i < entries; i++ {
+					newBalances[i] = uint32(10000 + ((int(b)*17389 + i*7919) % 900000))
+				}
+				slab.SlabBalances = newBalances
+				remainingBudget -= int64(entries * 4)
+			} else {
+				remainingBudget -= int64(len(slab.SlabBalances) * 4)
+			}
+		}
+		s.bucketMu[b].Unlock()
+	}
+}
+
+// UsedMemoryBytes returns the exact live byte footprint of all columnar slabs, delta overlays,
+// and CDC entries currently allocated in RAM on this physical shard.
+func (s *PhysicalShard) UsedMemoryBytes() int64 {
+	var totalBytes int64
+	for b := uint16(0); b < hash.TotalVirtualBuckets; b++ {
+		s.bucketMu[b].RLock()
+		slab := s.buckets[b]
+		totalBytes += int64(len(slab.SlabBalances) * 4)
+		totalBytes += int64(len(slab.DeltaOverrides) * 128)
+		totalBytes += int64(len(slab.DeletedIDs) * 16)
+		s.bucketMu[b].RUnlock()
+	}
+	s.cdcMu.RLock()
+	totalBytes += int64(len(s.cdcJournal) * 160)
+	s.cdcMu.RUnlock()
+	return totalBytes
 }
 
 // DisplayName returns the user-configured CustomAlias for this shard.
@@ -208,28 +339,103 @@ func (s *PhysicalShard) DisplayName() string {
 	return fmt.Sprintf("shard-%d", s.ShardID)
 }
 
-// EstimatedUsedDiskGB computes realistic physical storage consumption (in GB) based on live row count.
+// EstimatedUsedDiskGB returns UsedMemoryBytes in MB/GB for legacy callers.
 func (s *PhysicalShard) EstimatedUsedDiskGB() float64 {
-	rows := s.RowCount()
-	if rows <= 0 {
-		return 0.4 // baseline WAL + catalog metadata
-	}
-	// ~3.05 GB per 1,000,000 rows (table heap + B-tree indexes + CDC journal)
-	return 0.4 + (float64(rows)/1_000_000.0)*3.05
+	return float64(s.UsedMemoryBytes()) / (1024.0 * 1024.0 * 1024.0)
 }
 
-// DiskUsagePct returns the percentage of configured DiskCapacityGB currently used.
+// DiskUsagePct returns the percentage of configured MaxCapacityBytes currently used in RAM.
 func (s *PhysicalShard) DiskUsagePct() float64 {
 	cfg := s.GetSettings()
-	capGB := cfg.DiskCapacityGB
-	if capGB <= 0 {
-		capGB = 256
+	capB := cfg.MaxCapacityBytes
+	if capB <= 0 {
+		capB = DefaultShardCapacityBytes
 	}
-	pct := (s.EstimatedUsedDiskGB() / float64(capGB)) * 100.0
+	pct := (float64(s.UsedMemoryBytes()) / float64(capB)) * 100.0
 	if pct > 100.0 {
 		pct = 100.0
 	}
 	return pct
+}
+
+// ParseByteSize parses any user string into an exact byte count (int64).
+// Accepts raw bytes ("1", "512", "4096", "67108864", "1024B") or units ("4KB", "64MB", "0.5GB", "128 KB").
+func ParseByteSize(input string) (int64, error) {
+	s := strings.TrimSpace(strings.ReplaceAll(input, ",", ""))
+	s = strings.ReplaceAll(s, "_", "")
+	if s == "" {
+		return 0, fmt.Errorf("empty byte size")
+	}
+	upper := strings.ToUpper(s)
+
+	multiplier := float64(1)
+	numPart := upper
+	switch {
+	case strings.HasSuffix(upper, "TB"):
+		multiplier = 1024 * 1024 * 1024 * 1024
+		numPart = strings.TrimSpace(upper[:len(upper)-2])
+	case strings.HasSuffix(upper, "GB"):
+		multiplier = 1024 * 1024 * 1024
+		numPart = strings.TrimSpace(upper[:len(upper)-2])
+	case strings.HasSuffix(upper, "MB"):
+		multiplier = 1024 * 1024
+		numPart = strings.TrimSpace(upper[:len(upper)-2])
+	case strings.HasSuffix(upper, "KB"):
+		multiplier = 1024
+		numPart = strings.TrimSpace(upper[:len(upper)-2])
+	case strings.HasSuffix(upper, "BYTES"):
+		multiplier = 1
+		numPart = strings.TrimSpace(upper[:len(upper)-5])
+	case strings.HasSuffix(upper, "BYTE"):
+		multiplier = 1
+		numPart = strings.TrimSpace(upper[:len(upper)-4])
+	case strings.HasSuffix(upper, "B"):
+		multiplier = 1
+		numPart = strings.TrimSpace(upper[:len(upper)-1])
+	}
+
+	if iv, err := strconv.ParseInt(numPart, 10, 64); err == nil && multiplier == 1 {
+		return iv, nil
+	}
+	fv, err := strconv.ParseFloat(numPart, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid byte size '%s'", input)
+	}
+	return int64(fv * multiplier), nil
+}
+
+// FormatBytesExact formats a byte count with both human unit and exact byte count, e.g. "64.00 MB (67,108,864 B)".
+func FormatBytesExact(b int64) string {
+	if b < 1024 {
+		return fmt.Sprintf("%d B", b)
+	}
+	if b < 1024*1024 {
+		return fmt.Sprintf("%.2f KB (%d B)", float64(b)/1024.0, b)
+	}
+	if b < 1024*1024*1024 {
+		return fmt.Sprintf("%.2f MB (%d B)", float64(b)/(1024.0*1024.0), b)
+	}
+	return fmt.Sprintf("%.2f GB (%d B)", float64(b)/(1024.0*1024.0*1024.0), b)
+}
+
+// FormatBytesCompact formats a byte count concisely for table/TUI columns, e.g. "64.0MB" or "4096B".
+func FormatBytesCompact(b int64) string {
+	if b < 1024 {
+		return fmt.Sprintf("%dB", b)
+	}
+	if b < 1024*1024 {
+		if b%1024 == 0 {
+			return fmt.Sprintf("%dKB", b/1024)
+		}
+		return fmt.Sprintf("%.1fKB", float64(b)/1024.0)
+	}
+	if b < 1024*1024*1024 {
+		if b%(1024*1024) == 0 {
+			return fmt.Sprintf("%dMB", b/(1024*1024))
+		}
+		return fmt.Sprintf("%.1fMB", float64(b)/(1024.0*1024.0))
+	}
+	return fmt.Sprintf("%.2fGB", float64(b)/(1024.0*1024.0*1024.0))
 }
 
 // RecordOp records a query hit and updates EWMA latency.

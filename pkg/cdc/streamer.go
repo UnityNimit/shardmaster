@@ -401,6 +401,7 @@ func (e *Engine) syncTargetBucketMetadata() {
 		cfg := s.GetSettings()
 		cfg.TargetBuckets = counts[s.ShardID]
 		s.UpdateSettings(cfg)
+		s.ResizeMemorySlabs(cfg.MaxCapacityBytes, cfg.SlabBytesPerBucket)
 	}
 }
 

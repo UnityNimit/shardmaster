@@ -711,9 +711,9 @@ func runSQLAction(qr *router.QueryRouter, sql string) {
 
 func runShardCustomizerMenu(qr *router.QueryRouter, reader *bufio.Reader) {
 	PrintStaticDashboard(qr, false)
-	RenderSectionHeader("SHARD CUSTOMIZER, LIVE RESIZER & SHARD-PINNED SQL MANAGER")
-	fmt.Printf("   %s %-34s %s\n", okStyle.Render("[1]"), whiteBold.Render("Create Custom Physical Shard"), dimStyle.Render("Custom Name, Disk GB, Tier, Weight & Target Buckets"))
-	fmt.Printf("   %s %-34s %s\n", cyanStyle.Render("[2]"), whiteBold.Render("Edit & Live Resize Existing Shard"), dimStyle.Render("Rename, resize Disk GB / Virtual Buckets while running"))
+	RenderSectionHeader("100% FREE-FORM SHARD & BYTE CUSTOMIZER, LIVE RESIZER & PINNED SQL")
+	fmt.Printf("   %s %-34s %s\n", okStyle.Render("[1]"), whiteBold.Render("Create Custom Physical Shard"), dimStyle.Render("Customize every byte, slab size, port, name & buckets"))
+	fmt.Printf("   %s %-34s %s\n", cyanStyle.Render("[2]"), whiteBold.Render("Edit & Live Resize Existing Shard"), dimStyle.Render("Change exact bytes, slab bytes, name or buckets live"))
 	fmt.Printf("   %s %-34s %s\n", hotStyle.Render("[3]"), whiteBold.Render("Drain / Evacuate a Shard (0ms)"), dimStyle.Render("Migrate 100% of shard buckets out via CDC + VDiff"))
 	fmt.Printf("   %s %-34s %s\n", warnStyle.Render("[4]"), whiteBold.Render("Rebalance All Shards by Weight"), dimStyle.Render("Distribute 1,024 Buckets proportional to Shard Weight"))
 	fmt.Printf("   %s %-34s %s\n", okStyle.Render("[5]"), whiteBold.Render("Pin & Query Specific Shard (SQL)"), dimStyle.Render("Choose a shard and run SELECT / SQL directly on it"))
@@ -726,48 +726,65 @@ func runShardCustomizerMenu(qr *router.QueryRouter, reader *bufio.Reader) {
 	switch strings.TrimSpace(sub) {
 	case "1":
 		nextID := len(shards)
-		defAlias := fmt.Sprintf("custom-nvme-%d", nextID)
-		alias := promptDefault(reader, fmt.Sprintf("Custom Shard Name / Alias [default: %s]", defAlias), defAlias)
-		region := promptDefault(reader, "Region / Availability Zone [default: us-west-2a]", "us-west-2a")
-		diskStr := promptDefault(reader, "Disk Capacity in GB (64, 128, 256, 512, 1024, 2048) [default: 512]", "512")
-		tier := promptDefault(reader, "Hardware Tier [default: Enterprise-XL 64vCPU/256GB]", "Enterprise-XL 64vCPU/256GB")
-		wtStr := promptDefault(reader, "Routing Weight % (50, 100, 150, 200, 400) [default: 150]", "150")
-		bktStr := promptDefault(reader, "Target Virtual Buckets (0..1024) to stream live [default: 256]", "256")
-		repl := promptDefault(reader, "Replication Policy (SYNC_QUORUM, SEMI_SYNC, ASYNC_FAST) [default: SYNC_QUORUM]", "SYNC_QUORUM")
+		defAlias := fmt.Sprintf("custom-shard-%d", nextID)
+		defPort := strconv.Itoa(5432 + nextID)
+		alias := promptDefault(reader, fmt.Sprintf("Custom Shard Name / Alias (any text) [default: %s]", defAlias), defAlias)
+		portStr := promptDefault(reader, fmt.Sprintf("TCP Port (any port) [default: %s]", defPort), defPort)
+		region := promptDefault(reader, "Region / Location (any text) [default: local-nvme]", "local-nvme")
+		bytesStr := promptDefault(reader, "Max Shard Capacity in Bytes (e.g. 4096, 65536, 16MB, 67108864) [default: 67108864]", "67108864")
+		slabStr := promptDefault(reader, "Slab Bytes Per Bucket (e.g. 64, 1024, 4096, 262144) [default: 262144]", "262144")
+		tier := promptDefault(reader, "Hardware / Profile Label (any text) [default: 16GB-PC-RAM-Slab]", "16GB-PC-RAM-Slab")
+		wtStr := promptDefault(reader, "Routing Weight % (any integer) [default: 100]", "100")
+		bktStr := promptDefault(reader, "Target Virtual Buckets (0..1024) to stream live [default: 128]", "128")
+		repl := promptDefault(reader, "Replication Policy (any text) [default: SYNC_QUORUM]", "SYNC_QUORUM")
 
-		diskGB, _ := strconv.Atoi(diskStr)
-		if diskGB <= 0 {
-			diskGB = 512
+		customPort, _ := strconv.Atoi(portStr)
+		if customPort <= 0 {
+			customPort = 5432 + nextID
+		}
+		maxB, err := storage.ParseByteSize(bytesStr)
+		if err != nil || maxB <= 0 {
+			maxB = storage.DefaultShardCapacityBytes
+		}
+		slabB, err := storage.ParseByteSize(slabStr)
+		if err != nil || slabB <= 0 {
+			slabB = int64(storage.DefaultSlabBytesPerBucket)
 		}
 		wt, _ := strconv.Atoi(strings.TrimSuffix(wtStr, "%"))
-		if wt <= 0 {
-			wt = 150
+		if wt < 0 {
+			wt = 100
 		}
 		bkts, err := strconv.Atoi(bktStr)
 		if err != nil || bkts < 0 || bkts > 1024 {
-			bkts = 256
+			bkts = 128
 		}
 
 		cfg := storage.ShardSettings{
-			CustomAlias:     alias,
-			Region:          region,
-			DiskCapacityGB:  diskGB,
-			HardwareTier:    tier,
-			Weight:          wt,
-			TargetBuckets:   bkts,
-			AccessMode:      "READ_WRITE",
-			ReplicationMode: strings.ToUpper(repl),
-			MaxConnections:  2500,
-			BufferPoolMB:    32768,
+			CustomAlias:        alias,
+			CustomPort:         customPort,
+			Region:             region,
+			MaxCapacityBytes:   maxB,
+			SlabBytesPerBucket: int(slabB),
+			HardwareTier:       tier,
+			Weight:             wt,
+			TargetBuckets:      bkts,
+			AccessMode:         "READ_WRITE",
+			ReplicationMode:    strings.ToUpper(repl),
+			MaxConnections:     1000,
+			BufferPoolBytes:    16 * 1024 * 1024,
 		}
 		var newShard *storage.PhysicalShard
 		var snap *cdc.WorkflowSnapshot
-		RunSpinnerWhile(fmt.Sprintf("Provisioning [%s] (%d GB, %s) & Streaming %d Buckets via CDC...", alias, diskGB, tier, bkts), func() {
+		RunSpinnerWhile(fmt.Sprintf("Provisioning [%s] (Max: %s, Slab: %d B/bkt) & Streaming %d Buckets...", alias, storage.FormatBytesExact(maxB), slabB, bkts), func() {
 			newShard, snap, _ = qr.CDC.ProvisionCustomShard(cfg, 12*time.Millisecond)
+			if newShard != nil {
+				newShard.ResizeMemorySlabs(maxB, int(slabB))
+			}
 		})
-		fmt.Printf("  %s Provisioned Shard %d [%s] (:%d) | Migrated %s rows across %d ranges (0.00ms Downtime)\n",
+		fmt.Printf("  %s Provisioned Shard %d [%s] (:%d) | Live RAM: %s | Migrated %s rows (0.00ms Downtime)\n",
 			okStyle.Render("[OK]"), newShard.ShardID, newShard.DisplayName(), newShard.Port,
-			FormatCommas(uint64(snap.RowsMigrated)), snap.RangesCompleted)
+			storage.FormatBytesExact(newShard.UsedMemoryBytes()),
+			FormatCommas(uint64(snap.RowsMigrated)))
 		PrintStaticDashboard(qr, false)
 
 	case "2":
@@ -782,20 +799,26 @@ func runShardCustomizerMenu(qr *router.QueryRouter, reader *bufio.Reader) {
 		curB := counts[s.ShardID]
 
 		alias := promptDefault(reader, fmt.Sprintf("Custom Shard Name [current: %s]", cfg.CustomAlias), cfg.CustomAlias)
-		region := promptDefault(reader, fmt.Sprintf("Region / AZ [current: %s]", cfg.Region), cfg.Region)
-		diskStr := promptDefault(reader, fmt.Sprintf("Disk Size in GB [current: %d]", cfg.DiskCapacityGB), strconv.Itoa(cfg.DiskCapacityGB))
-		tier := promptDefault(reader, fmt.Sprintf("Hardware Tier [current: %s]", cfg.HardwareTier), cfg.HardwareTier)
+		portStr := promptDefault(reader, fmt.Sprintf("TCP Port [current: %d]", s.Port), strconv.Itoa(s.Port))
+		region := promptDefault(reader, fmt.Sprintf("Region / Location [current: %s]", cfg.Region), cfg.Region)
+		bytesStr := promptDefault(reader, fmt.Sprintf("Max Shard Capacity in Bytes (or KB/MB/GB) [current: %d]", cfg.MaxCapacityBytes), strconv.FormatInt(cfg.MaxCapacityBytes, 10))
+		slabStr := promptDefault(reader, fmt.Sprintf("Slab Bytes Per Bucket [current: %d]", cfg.SlabBytesPerBucket), strconv.Itoa(cfg.SlabBytesPerBucket))
+		tier := promptDefault(reader, fmt.Sprintf("Hardware / Profile Label [current: %s]", cfg.HardwareTier), cfg.HardwareTier)
 		wtStr := promptDefault(reader, fmt.Sprintf("Routing Weight %% [current: %d]", cfg.Weight), strconv.Itoa(cfg.Weight))
 		bktStr := promptDefault(reader, fmt.Sprintf("Target Virtual Buckets (0..1024) [current: %d]", curB), strconv.Itoa(curB))
-		mode := promptDefault(reader, fmt.Sprintf("Operational Mode (READ_WRITE, READ_ONLY, DRAINING) [current: %s]", cfg.AccessMode), cfg.AccessMode)
-		repl := promptDefault(reader, fmt.Sprintf("Replication Mode (SYNC_QUORUM, SEMI_SYNC, ASYNC_FAST) [current: %s]", cfg.ReplicationMode), cfg.ReplicationMode)
+		mode := promptDefault(reader, fmt.Sprintf("Operational Mode (READ_WRITE, READ_ONLY, DRAINING, etc.) [current: %s]", cfg.AccessMode), cfg.AccessMode)
+		repl := promptDefault(reader, fmt.Sprintf("Replication Mode [current: %s]", cfg.ReplicationMode), cfg.ReplicationMode)
 
-		diskGB, _ := strconv.Atoi(diskStr)
-		if diskGB > 0 {
-			cfg.DiskCapacityGB = diskGB
+		if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
+			cfg.CustomPort = p
 		}
-		wt, _ := strconv.Atoi(strings.TrimSuffix(wtStr, "%"))
-		if wt >= 0 {
+		if maxB, err := storage.ParseByteSize(bytesStr); err == nil && maxB > 0 {
+			cfg.MaxCapacityBytes = maxB
+		}
+		if slabB, err := storage.ParseByteSize(slabStr); err == nil && slabB > 0 {
+			cfg.SlabBytesPerBucket = int(slabB)
+		}
+		if wt, err := strconv.Atoi(strings.TrimSuffix(wtStr, "%")); err == nil && wt >= 0 {
 			cfg.Weight = wt
 		}
 		newB, err := strconv.Atoi(bktStr)
@@ -809,6 +832,7 @@ func runShardCustomizerMenu(qr *router.QueryRouter, reader *bufio.Reader) {
 		cfg.AccessMode = strings.ToUpper(mode)
 		cfg.ReplicationMode = strings.ToUpper(repl)
 		s.UpdateSettings(cfg)
+		s.ResizeMemorySlabs(cfg.MaxCapacityBytes, cfg.SlabBytesPerBucket)
 
 		var snap *cdc.WorkflowSnapshot
 		if cfg.AccessMode == "DRAINING" || newB == 0 {
@@ -818,14 +842,17 @@ func runShardCustomizerMenu(qr *router.QueryRouter, reader *bufio.Reader) {
 		} else if newB != curB {
 			RunSpinnerWhile(fmt.Sprintf("Live Resizing Shard %d [%s]: %d -> %d Buckets via CDC VReplication...", s.ShardID, s.DisplayName(), curB, newB), func() {
 				snap, _ = qr.CDC.ResizeShardBuckets(s.ShardID, newB, 12*time.Millisecond)
+				s.ResizeMemorySlabs(cfg.MaxCapacityBytes, cfg.SlabBytesPerBucket)
 			})
 		}
 		if snap != nil {
-			fmt.Printf("  %s Live Resize Complete: %s rows migrated (0.00ms Downtime, VDiff Verified)\n",
-				okStyle.Render("[OK]"), FormatCommas(uint64(snap.RowsMigrated)))
+			fmt.Printf("  %s Live Resize Complete: %s rows migrated | Live RAM: %s (0.00ms Downtime)\n",
+				okStyle.Render("[OK]"), FormatCommas(uint64(snap.RowsMigrated)), storage.FormatBytesExact(s.UsedMemoryBytes()))
 		} else {
 			qr.Cluster.SaveStateFile(qr.Dir.SnapshotBuckets())
-			fmt.Printf("  %s Updated Shard %d [%s] live settings.\n", okStyle.Render("[OK]"), s.ShardID, s.DisplayName())
+			fmt.Printf("  %s Updated Shard %d [%s] | Live RAM: %s / %s.\n",
+				okStyle.Render("[OK]"), s.ShardID, s.DisplayName(),
+				storage.FormatBytesExact(s.UsedMemoryBytes()), storage.FormatBytesExact(cfg.MaxCapacityBytes))
 		}
 		PrintStaticDashboard(qr, false)
 
@@ -1097,7 +1124,7 @@ func PrintStaticDashboard(qr *router.QueryRouter, showReshardingExample bool) {
 			fmt.Sprintf("Shard %d (:%d)", s.ShardID, s.Port),
 			s.DisplayName(),
 			s.Region,
-			fmt.Sprintf("%.1f/%d GB", s.EstimatedUsedDiskGB(), cfg.DiskCapacityGB),
+			fmt.Sprintf("%s / %s (%d B)", storage.FormatBytesCompact(s.UsedMemoryBytes()), storage.FormatBytesCompact(cfg.MaxCapacityBytes), s.UsedMemoryBytes()),
 			bar,
 			fmt.Sprintf("%d Buckets", bCount),
 			FormatCommas(uint64(s.RowCount())) + " rows",
@@ -1106,8 +1133,8 @@ func PrintStaticDashboard(qr *router.QueryRouter, showReshardingExample bool) {
 	}
 
 	RenderTypedTable(
-		[]string{"shard_node", "custom_name", "region", "disk_size", "load_distribution", "virtual_buckets", "row_count", "mode"},
-		[]string{"PHYSICAL NODE", "SHARD ALIAS", "ZONE", "USED / CAP GB", "BUCKET CAPACITY BAR", "INT4 [0..1024]", "INT8 SLAB", "STATE"},
+		[]string{"shard_node", "custom_name", "region", "used_vs_max_bytes", "load_distribution", "virtual_buckets", "row_count", "mode"},
+		[]string{"PHYSICAL NODE", "SHARD ALIAS", "ZONE", "EXACT RAM BYTES", "BUCKET CAPACITY BAR", "INT4 [0..1024]", "INT8 SLAB", "STATE"},
 		rows,
 	)
 

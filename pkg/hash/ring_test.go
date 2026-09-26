@@ -379,14 +379,18 @@ func TestCustomShardResizeDrainAndPinnedSQL(t *testing.T) {
 		t.Fatalf("expected 12 profile rows for /*+ SHARD(0) */ SHOW SHARDS, got err=%v rows=%d", err, len(hintRes.Rows))
 	}
 
-	// 5. Execute SQL Control Plane ALTER SHARD
-	_, err = qr.ExecuteSQL("ALTER SHARD 0 SET NAME='us-west-ultra', SIZE=2048, WEIGHT=300, MODE='READ_WRITE';")
+	// 5. Execute SQL Control Plane ALTER SHARD with exact byte sizing
+	_, err = qr.ExecuteSQL("ALTER SHARD 0 SET NAME='us-west-ultra', BYTES=4096, SLAB_BYTES=8, PORT=6500, WEIGHT=300, MODE='READ_WRITE';")
 	if err != nil {
 		t.Fatalf("ALTER SHARD 0 failed: %v", err)
 	}
 	s0, _ := cluster.GetShard(0)
-	if s0.DisplayName() != "us-west-ultra" || s0.GetSettings().DiskCapacityGB != 2048 {
-		t.Fatalf("expected Shard 0 alias=us-west-ultra and size=2048, got %s and %d", s0.DisplayName(), s0.GetSettings().DiskCapacityGB)
+	if s0.DisplayName() != "us-west-ultra" || s0.GetSettings().MaxCapacityBytes != 4096 || s0.Port != 6500 {
+		t.Fatalf("expected Shard 0 alias=us-west-ultra, max_bytes=4096, port=6500, got %s, %d, %d",
+			s0.DisplayName(), s0.GetSettings().MaxCapacityBytes, s0.Port)
+	}
+	if s0.UsedMemoryBytes() > 4096 {
+		t.Fatalf("expected Shard 0 real RAM usage <= 4096 bytes after ResizeMemorySlabs, got %d bytes", s0.UsedMemoryBytes())
 	}
 }
 

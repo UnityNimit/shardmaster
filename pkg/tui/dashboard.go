@@ -26,28 +26,11 @@ const (
 	modalSQLInput    = 3
 )
 
-var (
-	aliasPresets  = []string{"us-west-nvme-01", "us-east-payments", "eu-gdpr-vault", "ap-tokyo-edge", "vip-enterprise-xl", "analytics-warehouse", "fintech-ledger-01"}
-	regionPresets = []string{"us-west-2a", "us-east-1b", "eu-central-1a", "eu-west-2a", "ap-south-1a", "ap-tokyo-1a", "sa-east-1a"}
-	diskPresets   = []int{64, 128, 256, 512, 1024, 2048, 4096}
-	weightPresets = []int{25, 50, 100, 150, 200, 300, 400}
-	tierPresets   = []string{
-		"NVMe-Nano 2vCPU/8GB",
-		"NVMe-Small 4vCPU/16GB",
-		"NVMe-Pro 16vCPU/64GB",
-		"Enterprise-XL 64vCPU/256GB",
-		"Extreme-Metal 128vCPU/512GB",
-	}
-	modePresets = []string{"READ_WRITE", "READ_ONLY", "DRAINING", "MAINTENANCE"}
-	replPresets = []string{"SYNC_QUORUM", "SEMI_SYNC", "ASYNC_FAST"}
-	connPresets = []int{500, 1000, 2500, 5000, 10000}
-)
-
 var presetQueries = []struct {
 	title string
 	sql   string
 }{
-	{"Physical Shards & Settings", "SHOW SHARDS;"},
+	{"Physical Shards & Bytes", "SHOW SHARDS;"},
 	{"Point Read #42", "SELECT * FROM users WHERE user_id = 42;"},
 	{"K-Way Merge Top 5", "SELECT * FROM users WHERE email LIKE '%@gmail.com' ORDER BY created_at DESC LIMIT 5;"},
 	{"Count & Balance Stats", "SELECT COUNT(*), SUM(balance_usd), AVG(balance_usd), MIN(balance_usd), MAX(balance_usd) FROM users;"},
@@ -62,7 +45,7 @@ var presetQueries = []struct {
 	{"Explain Route #42", "EXPLAIN ANALYZE SELECT * FROM users WHERE user_id = 42;"},
 }
 
-// DashboardModel is a clean, minimalist 4-Tab TUI with an interactive Shard Customizer,
+// DashboardModel is a clean, minimalist 4-Tab TUI with a 100% free-form, byte-exact Shard Customizer,
 // Live Resizer, Custom Shard Creator, and Shard-Pinned SQL Explorer that fits inside 80x24 terminals.
 type DashboardModel struct {
 	qr            *router.QueryRouter
@@ -77,12 +60,12 @@ type DashboardModel struct {
 	activeTab    int
 	scrollOffset int
 
-	// Tab 0 (Topology & Shards) interactive selection & modal editor state
+	// Tab 0 (Topology & Shards) interactive selection & 100% free-form modal editor state
 	selectedShardIdx int
 	modalMode        int
 	formFieldIdx     int
 	formShardID      uint32
-	formCfg          storage.ShardSettings
+	formInputs       [8]string // 8 completely free-form editable text inputs (0 hardcoded restrictions!)
 
 	// Tab 3 (SQL Explorer) state & shard pinning
 	queryIdx       int
@@ -100,7 +83,7 @@ func NewDashboardModel(qr *router.QueryRouter) *DashboardModel {
 		stopLoadFlag:  stop,
 		activeTab:     0,
 		pinnedShardID: -1,
-		statusBanner:  "Select shard [Up/Dn] | [e] Edit/Resize  [n] New Shard  [f] Query Shard  [+/-] Size",
+		statusBanner:  "Select shard [Up/Dn] | [e] Customize Every Byte  [n] New Shard  [f] Pin SQL",
 	}
 	m.refreshActiveQuery()
 	m.startBackgroundLoad()
@@ -163,34 +146,41 @@ func (m *DashboardModel) openEditShardModal() {
 	s := shards[m.selectedShardIdx]
 	counts := m.qr.Dir.BucketCountsByShard()
 	cfg := s.GetSettings()
-	cfg.TargetBuckets = counts[s.ShardID]
 
 	m.modalMode = modalEditShard
 	m.formFieldIdx = 0
 	m.formShardID = s.ShardID
-	m.formCfg = cfg
-	m.statusBanner = fmt.Sprintf("Editing Shard %d [%s] | [Up/Dn] Field  [Left/Right] Value  [Enter] Apply", s.ShardID, s.DisplayName())
+	m.formInputs = [8]string{
+		cfg.CustomAlias,
+		strconv.FormatInt(cfg.MaxCapacityBytes, 10),
+		strconv.Itoa(cfg.SlabBytesPerBucket),
+		strconv.Itoa(counts[s.ShardID]),
+		fmt.Sprintf("%d:%d", cfg.Weight, s.Port),
+		cfg.Region,
+		cfg.HardwareTier,
+		fmt.Sprintf("%s/%s/%d", cfg.AccessMode, cfg.ReplicationMode, cfg.MaxConnections),
+	}
+	m.statusBanner = fmt.Sprintf("Editing S%d | Type ANY value on ANY field ([Ctrl+U] Clear, [Enter] Apply)", s.ShardID)
 }
 
 func (m *DashboardModel) openCreateShardModal() {
 	shards := m.qr.Cluster.GetAllShards()
 	nextID := uint32(len(shards))
+	port := 5432 + int(nextID)
 	m.modalMode = modalCreateShard
 	m.formFieldIdx = 0
 	m.formShardID = nextID
-	m.formCfg = storage.ShardSettings{
-		CustomAlias:     fmt.Sprintf("custom-shard-%d", nextID),
-		Region:          regionPresets[int(nextID)%len(regionPresets)],
-		DiskCapacityGB:  512,
-		HardwareTier:    "NVMe-Pro 16vCPU/64GB",
-		Weight:          100,
-		TargetBuckets:   192,
-		AccessMode:      "READ_WRITE",
-		ReplicationMode: "SYNC_QUORUM",
-		MaxConnections:  2500,
-		BufferPoolMB:    32768,
+	m.formInputs = [8]string{
+		fmt.Sprintf("custom-shard-%d", nextID),
+		strconv.FormatInt(storage.DefaultShardCapacityBytes, 10), // 67108864 B (64 MB)
+		strconv.Itoa(storage.DefaultSlabBytesPerBucket),          // 262144 B (256 KB)
+		"128",
+		fmt.Sprintf("100:%d", port),
+		"local-nvme",
+		"16GB-PC-RAM-Slab",
+		"READ_WRITE/SYNC_QUORUM/1000",
 	}
-	m.statusBanner = fmt.Sprintf("Create Custom Shard %d | Customize Name, Size, Buckets, Tier & press [Enter]", nextID)
+	m.statusBanner = fmt.Sprintf("Create Shard %d | Type ANY custom bytes, name, buckets or region & press [Enter]", nextID)
 }
 
 func (m *DashboardModel) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -230,14 +220,14 @@ func (m *DashboardModel) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// Shard Edit / Create Modal (8 customizable fields: 0..7)
+	// 100% Free-Form Shard Editor / Creator Modal (8 fields: 0..7)
 	switch key {
 	case "esc":
 		m.modalMode = modalNone
 		m.statusBanner = "Shard customization cancelled."
 		return m, nil
 
-	case "up":
+	case "up", "shift+tab":
 		m.formFieldIdx = (m.formFieldIdx + 7) % 8
 		return m, nil
 
@@ -246,138 +236,221 @@ func (m *DashboardModel) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "left":
-		m.adjustFormField(-1)
+		m.nudgeFreeFormField(-1)
 		return m, nil
 
 	case "right":
-		m.adjustFormField(1)
+		m.nudgeFreeFormField(1)
+		return m, nil
+
+	case "ctrl+u":
+		m.formInputs[m.formFieldIdx] = ""
 		return m, nil
 
 	case "backspace":
-		if m.formFieldIdx == 0 && len(m.formCfg.CustomAlias) > 0 {
-			m.formCfg.CustomAlias = m.formCfg.CustomAlias[:len(m.formCfg.CustomAlias)-1]
-		} else if m.formFieldIdx == 1 {
-			m.formCfg.TargetBuckets /= 10
-		} else if m.formFieldIdx == 2 {
-			m.formCfg.DiskCapacityGB /= 10
-		} else if m.formFieldIdx == 4 && len(m.formCfg.Region) > 0 {
-			m.formCfg.Region = m.formCfg.Region[:len(m.formCfg.Region)-1]
+		cur := m.formInputs[m.formFieldIdx]
+		if len(cur) > 0 {
+			m.formInputs[m.formFieldIdx] = cur[:len(cur)-1]
 		}
 		return m, nil
 
 	case "enter":
-		if strings.TrimSpace(m.formCfg.CustomAlias) == "" {
-			m.formCfg.CustomAlias = fmt.Sprintf("shard-%d", m.formShardID)
-		}
-		if m.formCfg.DiskCapacityGB <= 0 {
-			m.formCfg.DiskCapacityGB = 256
-		}
-		cfgCopy := m.formCfg
-		sid := m.formShardID
-		mode := m.modalMode
-		m.modalMode = modalNone
-
-		if mode == modalCreateShard {
-			newShard := m.qr.Cluster.CreateCustomShard(cfgCopy)
-			m.qr.Dir.RegisterShard(newShard.ShardID)
-			m.selectedShardIdx = int(newShard.ShardID)
-			m.statusBanner = fmt.Sprintf("Provisioned S%d [%s] (%dGB) -> Streaming %d Buckets via CDC...", newShard.ShardID, newShard.DisplayName(), cfgCopy.DiskCapacityGB, cfgCopy.TargetBuckets)
-			go func(id uint32, b int) {
-				_, _ = m.qr.CDC.ResizeShardBuckets(id, b, 20*time.Millisecond)
-			}(newShard.ShardID, cfgCopy.TargetBuckets)
-		} else {
-			if s, ok := m.qr.Cluster.GetShard(sid); ok {
-				s.UpdateSettings(cfgCopy)
-				counts := m.qr.Dir.BucketCountsByShard()
-				curB := counts[sid]
-				if cfgCopy.AccessMode == "DRAINING" || cfgCopy.TargetBuckets == 0 {
-					m.statusBanner = fmt.Sprintf("Draining S%d [%s] (0 Buckets) via Zero-Downtime CDC...", sid, s.DisplayName())
-					go func(id uint32) {
-						_, _ = m.qr.CDC.DrainShard(id, 20*time.Millisecond)
-					}(sid)
-				} else if cfgCopy.TargetBuckets != curB {
-					m.statusBanner = fmt.Sprintf("Updated S%d [%s] (%dGB) & Resizing %d -> %d Buckets via CDC...", sid, s.DisplayName(), cfgCopy.DiskCapacityGB, curB, cfgCopy.TargetBuckets)
-					go func(id uint32, b int) {
-						_, _ = m.qr.CDC.ResizeShardBuckets(id, b, 20*time.Millisecond)
-					}(sid, cfgCopy.TargetBuckets)
-				} else {
-					m.qr.Cluster.SaveStateFile(m.qr.Dir.SnapshotBuckets())
-					m.statusBanner = fmt.Sprintf("Saved S%d [%s] (%dGB, %s, %s, Wt %d%%).", sid, s.DisplayName(), cfgCopy.DiskCapacityGB, cfgCopy.Region, cfgCopy.AccessMode, cfgCopy.Weight)
-				}
-			}
-		}
-		return m, nil
+		return m.applyFreeFormShardModal()
 	}
 
-	// Direct typing on Name (field 0), Target Buckets (field 1), Disk GB (field 2), or Region (field 4)
+	// Free-form typing on ANY of the 8 fields!
 	if len(key) == 1 && key[0] >= 32 && key[0] <= 126 {
-		ch := key[0]
-		switch m.formFieldIdx {
-		case 0:
-			if len(m.formCfg.CustomAlias) < 22 {
-				m.formCfg.CustomAlias += string(ch)
-			}
-		case 1:
-			if ch >= '0' && ch <= '9' {
-				val := m.formCfg.TargetBuckets*10 + int(ch-'0')
-				if val <= 1024 {
-					m.formCfg.TargetBuckets = val
-				}
-			}
-		case 2:
-			if ch >= '0' && ch <= '9' {
-				val := m.formCfg.DiskCapacityGB*10 + int(ch-'0')
-				if val <= 16384 {
-					m.formCfg.DiskCapacityGB = val
-				}
-			}
-		case 4:
-			if len(m.formCfg.Region) < 18 {
-				m.formCfg.Region += string(ch)
-			}
+		if len(m.formInputs[m.formFieldIdx]) < 36 {
+			m.formInputs[m.formFieldIdx] += key
+		}
+	} else if key == "space" {
+		if len(m.formInputs[m.formFieldIdx]) < 36 {
+			m.formInputs[m.formFieldIdx] += " "
 		}
 	}
 	return m, nil
 }
 
-func (m *DashboardModel) adjustFormField(delta int) {
+// nudgeFreeFormField lets [Left]/[Right] increment or decrement numeric fields by fine-grained steps
+// while keeping every field 100% editable as free-form text.
+func (m *DashboardModel) nudgeFreeFormField(delta int) {
 	switch m.formFieldIdx {
-	case 0: // CustomAlias presets
-		idx := indexOfStr(aliasPresets, m.formCfg.CustomAlias)
-		m.formCfg.CustomAlias = aliasPresets[(idx+delta+len(aliasPresets))%len(aliasPresets)]
-	case 1: // Target Virtual Buckets (step by 32)
-		b := m.formCfg.TargetBuckets + delta*32
-		if b < 0 {
-			b = 0
+	case 1: // Max Capacity Bytes: nudge by 1,024 bytes (1 KB) or 1 byte if < 1024
+		b, err := storage.ParseByteSize(m.formInputs[1])
+		if err != nil {
+			b = storage.DefaultShardCapacityBytes
 		}
-		if b > 1024 {
-			b = 1024
+		step := int64(1024)
+		if b <= 4096 {
+			step = 64
 		}
-		m.formCfg.TargetBuckets = b
-	case 2: // Disk Capacity GB
-		idx := indexOfInt(diskPresets, m.formCfg.DiskCapacityGB)
-		m.formCfg.DiskCapacityGB = diskPresets[(idx+delta+len(diskPresets))%len(diskPresets)]
-	case 3: // Routing Weight
-		idx := indexOfInt(weightPresets, m.formCfg.Weight)
-		m.formCfg.Weight = weightPresets[(idx+delta+len(weightPresets))%len(weightPresets)]
-	case 4: // Region / AZ
-		idx := indexOfStr(regionPresets, m.formCfg.Region)
-		m.formCfg.Region = regionPresets[(idx+delta+len(regionPresets))%len(regionPresets)]
-	case 5: // Hardware Tier
-		idx := indexOfStr(tierPresets, m.formCfg.HardwareTier)
-		m.formCfg.HardwareTier = tierPresets[(idx+delta+len(tierPresets))%len(tierPresets)]
-	case 6: // Operational Mode
-		idx := indexOfStr(modePresets, m.formCfg.AccessMode)
-		m.formCfg.AccessMode = modePresets[(idx+delta+len(modePresets))%len(modePresets)]
-		if m.formCfg.AccessMode == "DRAINING" {
-			m.formCfg.TargetBuckets = 0
+		b += int64(delta) * step
+		if b < 4 {
+			b = 4
 		}
-	case 7: // Replication & Max Connections
-		idx := indexOfStr(replPresets, m.formCfg.ReplicationMode)
-		nextIdx := (idx + delta + len(replPresets)) % len(replPresets)
-		m.formCfg.ReplicationMode = replPresets[nextIdx]
-		m.formCfg.MaxConnections = connPresets[nextIdx%len(connPresets)]
+		m.formInputs[1] = strconv.FormatInt(b, 10)
+
+	case 2: // Slab Bytes Per Bucket: nudge by 64 bytes
+		b, err := storage.ParseByteSize(m.formInputs[2])
+		if err != nil {
+			b = int64(storage.DefaultSlabBytesPerBucket)
+		}
+		b += int64(delta) * 64
+		if b < 4 {
+			b = 4
+		}
+		m.formInputs[2] = strconv.FormatInt(b, 10)
+
+	case 3: // Target Virtual Buckets (0..1024): nudge by 1 bucket
+		n, _ := strconv.Atoi(strings.TrimSpace(m.formInputs[3]))
+		n += delta
+		if n < 0 {
+			n = 0
+		}
+		if n > 1024 {
+			n = 1024
+		}
+		m.formInputs[3] = strconv.Itoa(n)
+
+	case 4: // Weight:Port
+		parts := strings.Split(m.formInputs[4], ":")
+		w, _ := strconv.Atoi(strings.TrimSpace(parts[0]))
+		port := 5432 + int(m.formShardID)
+		if len(parts) > 1 {
+			if p, err := strconv.Atoi(strings.TrimSpace(parts[1])); err == nil && p > 0 {
+				port = p
+			}
+		}
+		w += delta * 5
+		if w < 0 {
+			w = 0
+		}
+		m.formInputs[4] = fmt.Sprintf("%d:%d", w, port)
 	}
+}
+
+func (m *DashboardModel) applyFreeFormShardModal() (tea.Model, tea.Cmd) {
+	alias := strings.TrimSpace(m.formInputs[0])
+	if alias == "" {
+		alias = fmt.Sprintf("shard-%d", m.formShardID)
+	}
+
+	maxBytes, err := storage.ParseByteSize(m.formInputs[1])
+	if err != nil || maxBytes <= 0 {
+		maxBytes = storage.DefaultShardCapacityBytes
+	}
+
+	slabBytes64, err := storage.ParseByteSize(m.formInputs[2])
+	if err != nil || slabBytes64 <= 0 {
+		slabBytes64 = int64(storage.DefaultSlabBytesPerBucket)
+	}
+	slabBytes := int(slabBytes64)
+
+	targetBuckets, err := strconv.Atoi(strings.TrimSpace(m.formInputs[3]))
+	if err != nil {
+		targetBuckets = 256
+	}
+	if targetBuckets < 0 {
+		targetBuckets = 0
+	}
+	if targetBuckets > 1024 {
+		targetBuckets = 1024
+	}
+
+	weight := 100
+	customPort := 5432 + int(m.formShardID)
+	wpParts := strings.Split(m.formInputs[4], ":")
+	if w, err := strconv.Atoi(strings.TrimSuffix(strings.TrimSpace(wpParts[0]), "%")); err == nil && w >= 0 {
+		weight = w
+	}
+	if len(wpParts) > 1 {
+		if p, err := strconv.Atoi(strings.TrimSpace(wpParts[1])); err == nil && p > 0 {
+			customPort = p
+		}
+	}
+
+	region := strings.TrimSpace(m.formInputs[5])
+	if region == "" {
+		region = "local"
+	}
+
+	tier := strings.TrimSpace(m.formInputs[6])
+	if tier == "" {
+		tier = "Custom-RAM-Slab"
+	}
+
+	accessMode := "READ_WRITE"
+	replMode := "SYNC_QUORUM"
+	maxConns := 1000
+	mrParts := strings.Split(m.formInputs[7], "/")
+	if len(mrParts) > 0 && strings.TrimSpace(mrParts[0]) != "" {
+		accessMode = strings.ToUpper(strings.TrimSpace(mrParts[0]))
+	}
+	if len(mrParts) > 1 && strings.TrimSpace(mrParts[1]) != "" {
+		replMode = strings.ToUpper(strings.TrimSpace(mrParts[1]))
+	}
+	if len(mrParts) > 2 {
+		if c, err := strconv.Atoi(strings.TrimSpace(mrParts[2])); err == nil && c > 0 {
+			maxConns = c
+		}
+	}
+
+	cfg := storage.ShardSettings{
+		CustomAlias:        alias,
+		CustomPort:         customPort,
+		Region:             region,
+		MaxCapacityBytes:   maxBytes,
+		SlabBytesPerBucket: slabBytes,
+		HardwareTier:       tier,
+		Weight:             weight,
+		TargetBuckets:      targetBuckets,
+		AccessMode:         accessMode,
+		ReplicationMode:    replMode,
+		MaxConnections:     maxConns,
+		BufferPoolBytes:    16 * 1024 * 1024,
+	}
+
+	sid := m.formShardID
+	mode := m.modalMode
+	m.modalMode = modalNone
+
+	if mode == modalCreateShard {
+		newShard := m.qr.Cluster.CreateCustomShard(cfg)
+		m.qr.Dir.RegisterShard(newShard.ShardID)
+		m.selectedShardIdx = int(newShard.ShardID)
+		m.statusBanner = fmt.Sprintf("Created S%d [%s] (Max: %s) -> Streaming %d Buckets...", newShard.ShardID, newShard.DisplayName(), storage.FormatBytesExact(maxBytes), targetBuckets)
+		go func(id uint32, b int, maxB int64, slabB int) {
+			_, _ = m.qr.CDC.ResizeShardBuckets(id, b, 18*time.Millisecond)
+			if s, ok := m.qr.Cluster.GetShard(id); ok {
+				s.ResizeMemorySlabs(maxB, slabB)
+			}
+		}(newShard.ShardID, targetBuckets, maxBytes, slabBytes)
+	} else {
+		if s, ok := m.qr.Cluster.GetShard(sid); ok {
+			s.UpdateSettings(cfg)
+			s.ResizeMemorySlabs(maxBytes, slabBytes)
+			counts := m.qr.Dir.BucketCountsByShard()
+			curB := counts[sid]
+			if cfg.AccessMode == "DRAINING" || targetBuckets == 0 {
+				m.statusBanner = fmt.Sprintf("Draining S%d [%s] -> 0 Buckets via Zero-Downtime CDC...", sid, s.DisplayName())
+				go func(id uint32) {
+					_, _ = m.qr.CDC.DrainShard(id, 18*time.Millisecond)
+				}(sid)
+			} else if targetBuckets != curB {
+				m.statusBanner = fmt.Sprintf("Updated S%d [%s] (%s) & Resizing %d -> %d Buckets...", sid, s.DisplayName(), storage.FormatBytesCompact(s.UsedMemoryBytes()), curB, targetBuckets)
+				go func(id uint32, b int, maxB int64, slabB int) {
+					_, _ = m.qr.CDC.ResizeShardBuckets(id, b, 18*time.Millisecond)
+					if sh, ok := m.qr.Cluster.GetShard(id); ok {
+						sh.ResizeMemorySlabs(maxB, slabB)
+					}
+				}(sid, targetBuckets, maxBytes, slabBytes)
+			} else {
+				m.qr.Cluster.SaveStateFile(m.qr.Dir.SnapshotBuckets())
+				m.statusBanner = fmt.Sprintf("Saved S%d [%s] | Live RAM: %s / %s", sid, s.DisplayName(), storage.FormatBytesExact(s.UsedMemoryBytes()), storage.FormatBytesExact(maxBytes))
+			}
+		}
+	}
+	return m, nil
 }
 
 func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -466,7 +539,7 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.activeTab == 0 && len(shards) > 0 {
 				s := shards[m.selectedShardIdx%len(shards)]
 				counts := m.qr.Dir.BucketCountsByShard()
-				newB := counts[s.ShardID] + 32
+				newB := counts[s.ShardID] + 16
 				if newB > 1024 {
 					newB = 1024
 				}
@@ -480,7 +553,7 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.activeTab == 0 && len(shards) > 0 {
 				s := shards[m.selectedShardIdx%len(shards)]
 				counts := m.qr.Dir.BucketCountsByShard()
-				newB := counts[s.ShardID] - 32
+				newB := counts[s.ShardID] - 16
 				if newB < 0 {
 					newB = 0
 				}
@@ -561,7 +634,6 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.refreshActiveQuery()
 				m.statusBanner = fmt.Sprintf("SQL Explorer pinned to S%d [%s] | Press [f] to cycle target shard", s.ShardID, s.DisplayName())
 			} else {
-				// Cycle pinnedShardID: -1 (All Shards) -> 0 -> 1 -> ... -> N-1 -> -1
 				if m.pinnedShardID < 0 {
 					m.pinnedShardID = 0
 				} else if m.pinnedShardID+1 < len(shards) {
@@ -711,7 +783,7 @@ func (m *DashboardModel) View() string {
 	))
 
 	// 2. Clean Navigation Tabs
-	tabNames := []string{"[1] Shards & Size", "[2] CDC & VDiff", "[3] Hotspots", "[4] SQL Explorer"}
+	tabNames := []string{"[1] Shards & Bytes", "[2] CDC & VDiff", "[3] Hotspots", "[4] SQL Explorer"}
 	var renderedTabs []string
 	for i, name := range tabNames {
 		if i == m.activeTab {
@@ -723,111 +795,107 @@ func (m *DashboardModel) View() string {
 	b.WriteString(strings.Join(renderedTabs, " ") + "\n")
 	b.WriteString(dimStyle.Render(strings.Repeat("-", 72)) + "\n")
 
-	// 3. Focused Tab Content or Interactive Customizer Modal (Strictly 9 lines!)
+	// 3. Focused Tab Content or 100% Free-Form Byte-Exact Customizer Modal (Strictly 9 lines!)
 	var lines []string
 	perNodeQPS := displayQPS / uint64(maxInt(1, len(shards)))
 
 	if m.modalMode == modalEditShard || m.modalMode == modalCreateShard {
-		hdr := fmt.Sprintf("CUSTOMIZE SHARD %d SETTINGS & LIVE SIZE ([Enter] Apply  [Esc] Cancel)", m.formShardID)
+		hdr := fmt.Sprintf("FREE-FORM BYTE CUSTOMIZER: SHARD %d ([Enter] Apply  [Ctrl+U] Clear  [Esc] Back)", m.formShardID)
 		if m.modalMode == modalCreateShard {
-			hdr = fmt.Sprintf("CREATE NEW CUSTOM SHARD %d ([Enter] Provision & Stream  [Esc] Cancel)", m.formShardID)
+			hdr = fmt.Sprintf("CREATE CUSTOM SHARD %d ([Enter] Provision  [Ctrl+U] Clear  [Esc] Back)", m.formShardID)
 		}
 		lines = append(lines, titleStyle.Render(hdr))
 
-		estRows := float64(m.formCfg.TargetBuckets) / 1024.0 * 50.0
+		parsedMaxB, _ := storage.ParseByteSize(m.formInputs[1])
+		parsedSlabB, _ := storage.ParseByteSize(m.formInputs[2])
 		fields := []struct {
 			label string
 			val   string
 			hint  string
 		}{
-			{"1. Custom Shard Name", m.formCfg.CustomAlias, "(Type name or Left/Right preset)"},
-			{"2. Target Buckets   ", fmt.Sprintf("%d / 1024 (~%.1fM rows)", m.formCfg.TargetBuckets, estRows), "(Left/Right -/+32 or type 0..1024)"},
-			{"3. Disk Size (GB)   ", fmt.Sprintf("%d GB", m.formCfg.DiskCapacityGB), "(Left/Right 64..4096 GB or type)"},
-			{"4. Routing Weight   ", fmt.Sprintf("%d%%", m.formCfg.Weight), "(Left/Right 25%..400% weight)"},
-			{"5. Region / Zone    ", m.formCfg.Region, "(Left/Right AZ or type custom)"},
-			{"6. Hardware Tier    ", m.formCfg.HardwareTier, "(Left/Right NVMe / Enterprise)"},
-			{"7. Operational Mode ", m.formCfg.AccessMode, "(READ_WRITE / READ_ONLY / DRAINING)"},
-			{"8. Durability & Conn", fmt.Sprintf("%s (%d conns)", m.formCfg.ReplicationMode, m.formCfg.MaxConnections), "(SYNC_QUORUM / SEMI_SYNC / ASYNC)"},
+			{"1. Custom Shard Name", m.formInputs[0], "(Type ANY alias)"},
+			{"2. Max Size (Bytes) ", m.formInputs[1], fmt.Sprintf("(= %s)", storage.FormatBytesCompact(parsedMaxB))},
+			{"3. Slab Bytes/Bucket", m.formInputs[2], fmt.Sprintf("(= %s/bkt)", storage.FormatBytesCompact(parsedSlabB))},
+			{"4. Virtual Buckets  ", m.formInputs[3], "(Type 0..1024 buckets)"},
+			{"5. Weight % : Port  ", m.formInputs[4], "(e.g. 100:5432)"},
+			{"6. Region / Zone    ", m.formInputs[5], "(Type ANY region)"},
+			{"7. Hardware Profile ", m.formInputs[6], "(Type ANY profile)"},
+			{"8. Mode/Repl/Conns  ", m.formInputs[7], "(RW/SYNC_QUORUM/1000)"},
 		}
 		for idx, f := range fields {
 			cursor := "  "
-			valRendered := okStyle.Render("< " + f.val + " >")
+			valRendered := okStyle.Render(f.val)
 			if idx == m.formFieldIdx {
 				cursor = "> "
-				valRendered = selStyle.Render("[ " + f.val + " ]")
+				valRendered = selStyle.Render("[" + f.val + "_]")
 			}
 			line := fmt.Sprintf("%s%-20s: %-28s %s", cursor, f.label, valRendered, dimStyle.Render(truncateStr(f.hint, 22)))
 			lines = append(lines, line)
 		}
 	} else {
 		switch m.activeTab {
-		case 0: // TAB 1: TOPOLOGY, HETEROGENEOUS SIZES & SHARD INSPECTOR
-			lines = append(lines, titleStyle.Render("SHARD TOPOLOGY ([Up/Dn] Select  [e] Edit/Resize  [n] New  [f] Query)"))
+		case 0: // TAB 1: TOPOLOGY, EXACT BYTE FOOTPRINT & SHARD INSPECTOR
+			lines = append(lines, titleStyle.Render("SHARD TOPOLOGY ([Up/Dn] Select  [e] Edit Every Byte  [n] New  [f] Query)"))
 			if m.selectedShardIdx >= len(shards) && len(shards) > 0 {
 				m.selectedShardIdx = len(shards) - 1
 			}
 			for idx, s := range shards {
 				cfg := s.GetSettings()
 				bCount := bucketCounts[s.ShardID]
-				barLen := (bCount * 10) / 256
-				if barLen > 10 {
-					barLen = 10
+				barLen := (bCount * 8) / 256
+				if barLen > 8 {
+					barLen = 8
 				}
 				if barLen < 1 && bCount > 0 {
 					barLen = 1
 				}
-				bar := barFillStyle.Render(strings.Repeat("#", barLen)) + dimStyle.Render(strings.Repeat(".", 10-barLen))
+				bar := barFillStyle.Render(strings.Repeat("#", barLen)) + dimStyle.Render(strings.Repeat(".", 8-barLen))
 				shardQPS := s.CurrentQPS()
 				if m.loadGenActive && shardQPS < 1000 && bCount > 0 {
 					shardQPS = perNodeQPS + uint64((int(s.ShardID)*37+m.ticks*19)%180)
 				}
 				prefix := "  "
-				alias := fmt.Sprintf("%-15s", truncateStr(s.DisplayName(), 15))
+				alias := fmt.Sprintf("%-14s", truncateStr(s.DisplayName(), 14))
 				if idx == m.selectedShardIdx {
 					prefix = "> "
 					alias = selStyle.Render(alias)
 				}
-				modeTag := ""
-				if cfg.AccessMode == "DRAINING" || bCount == 0 {
-					modeTag = hotStyle.Render(" [DRAIN]")
-				} else if cfg.AccessMode == "READ_ONLY" {
-					modeTag = warnStyle.Render(" [RO]")
-				}
+				usedB := s.UsedMemoryBytes()
+				maxB := cfg.MaxCapacityBytes
 				lines = append(lines, fmt.Sprintf(
-					"%sS%d [%s] [%s] %3dB | %4.0f/%-4dGB | %5.1fM | %4s/s%s",
+					"%sS%d [%s] [%s] %3dB | %7s/%-7s | %5.1fM | %4s/s",
 					prefix,
 					s.ShardID,
 					alias,
 					bar,
 					bCount,
-					s.EstimatedUsedDiskGB(),
-					cfg.DiskCapacityGB,
+					storage.FormatBytesCompact(usedB),
+					storage.FormatBytesCompact(maxB),
 					float64(s.RowCount())/1e6,
 					formatCompactUint(shardQPS),
-					modeTag,
 				))
 			}
 
-			// Selected Shard Live Inspector Card at bottom of Topology
+			// Selected Shard Exact Byte Inspector Card at bottom of Topology
 			if len(shards) > 0 {
 				sel := shards[m.selectedShardIdx%len(shards)]
 				scfg := sel.GetSettings()
+				usedB := sel.UsedMemoryBytes()
 				lines = append(lines, dimStyle.Render(strings.Repeat(".", 72)))
 				lines = append(lines, fmt.Sprintf(
-					" %s | Region: %s | Tier: %s",
-					selStyle.Render(fmt.Sprintf("Selected S%d [%s]", sel.ShardID, sel.DisplayName())),
+					" %s (:%d) | Region: %s | Profile: %s",
+					selStyle.Render(fmt.Sprintf("S%d [%s]", sel.ShardID, sel.DisplayName())),
+					sel.Port,
 					okStyle.Render(sel.Region),
 					warnStyle.Render(scfg.HardwareTier),
 				))
 				lines = append(lines, fmt.Sprintf(
-					" Disk: %.1f/%d GB (%.0f%%) | Wt: %d%% | Mode: %s | Repl: %s | Conns: %d",
-					sel.EstimatedUsedDiskGB(),
-					scfg.DiskCapacityGB,
-					sel.DiskUsagePct(),
-					scfg.Weight,
-					scfg.AccessMode,
-					scfg.ReplicationMode,
-					scfg.MaxConnections,
+					" Live RAM: %d B (%s) / Max: %d B (%s) | Slab: %d B/bkt",
+					usedB,
+					storage.FormatBytesCompact(usedB),
+					scfg.MaxCapacityBytes,
+					storage.FormatBytesCompact(scfg.MaxCapacityBytes),
+					scfg.SlabBytesPerBucket,
 				))
 			}
 
@@ -952,32 +1020,14 @@ func (m *DashboardModel) View() string {
 	}
 	b.WriteString(" " + warnStyle.Render(truncateStr(m.statusBanner, 60)) + dimStyle.Render(scrollHint) + "\n")
 	if m.modalMode == modalEditShard || m.modalMode == modalCreateShard {
-		b.WriteString(dimStyle.Render(" [Up/Dn] Field  [Left/Right] Adjust  [Type] Name/Size  [Enter] Apply  [Esc] Back"))
+		b.WriteString(dimStyle.Render(" [Up/Dn] Field  [Type] Any Value/Bytes  [Left/Right] Nudge  [Enter] Save  [Esc]"))
 	} else if m.activeTab == 3 {
 		b.WriteString(dimStyle.Render(" [Left/Right] Preset  [f] Pin Shard  [/] Type SQL  [Up/Dn] Scroll  [q] Back"))
 	} else {
-		b.WriteString(dimStyle.Render(" [e] Edit Shard  [n] New Shard  [+/-] Size  [d] Drain  [f] Query Shard  [q] Back"))
+		b.WriteString(dimStyle.Render(" [e] Edit Bytes  [n] New Shard  [+/-] Buckets  [d] Drain  [f] Pin SQL  [q] Back"))
 	}
 
 	return borderStyle.Render(b.String())
-}
-
-func indexOfStr(list []string, target string) int {
-	for i, v := range list {
-		if strings.EqualFold(v, target) {
-			return i
-		}
-	}
-	return 0
-}
-
-func indexOfInt(list []int, target int) int {
-	for i, v := range list {
-		if v == target {
-			return i
-		}
-	}
-	return 0
 }
 
 func formatCompactUint(n uint64) string {
