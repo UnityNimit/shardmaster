@@ -297,14 +297,17 @@ func (m *DashboardModel) View() string {
 
 	var b strings.Builder
 
-	// 1. Minimalist 2-Line Header
+	// 1. Minimalist Animated Header with -/|\- Live Pulse
+	spinFrames := []byte{'-', '\\', '|', '/'}
+	spinChar := spinFrames[m.ticks%len(spinFrames)]
 	peakText := ""
 	if m.peakBurstQPS > 0 {
 		peakText = " | PEAK: " + okStyle.Render(formatUintComma(m.peakBurstQPS)+"/s")
 	}
 	b.WriteString(fmt.Sprintf(
-		"%s  |  %d Shards  |  50M Rows  |  QPS: %s%s\n",
-		titleStyle.Render("SHARDMASTER v2.0"),
+		"%s %s  |  %d Shards  |  50M Rows  |  QPS: %s%s\n",
+		barFillStyle.Render(fmt.Sprintf("[%c]", spinChar)),
+		titleStyle.Render("SHARDMASTER"),
 		len(shards),
 		warnStyle.Render(formatUintComma(displayQPS)),
 		peakText,

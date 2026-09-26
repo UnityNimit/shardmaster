@@ -70,7 +70,7 @@ func (qr *QueryRouter) ExecuteSQL(sql string) (*ResultSet, error) {
 	case QuerySystemCatalog:
 		return &ResultSet{
 			Columns:     []string{"version"},
-			Rows:        [][]string{{"PostgreSQL 15.0 (ShardMaster Distributed PGWire Proxy v2.0 - 1024 Virtual Buckets)"}},
+			Rows:        [][]string{{"PostgreSQL 15.0 (ShardMaster Distributed PGWire Proxy - 1024 Virtual Buckets)"}},
 			CommandTag:  "SELECT 1",
 			LatencyUs:   time.Since(start).Microseconds(),
 			RoutedShard: "CONTROL_PLANE",

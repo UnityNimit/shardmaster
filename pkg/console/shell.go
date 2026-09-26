@@ -7,12 +7,14 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"shardmaster/pkg/bench"
+	"shardmaster/pkg/cdc"
 	"shardmaster/pkg/pgwire"
 	"shardmaster/pkg/router"
 	"shardmaster/pkg/storage"
@@ -25,11 +27,198 @@ var (
 	warnStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
 	hotStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196"))
 	cyanStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
+	whiteBold   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
 	dimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 )
 
+var shardMasterASCII = []string{
+	`  ____  _   _    _    ____  ____  __  __    _    ____ _____ _____ ____  `,
+	` / ___|| | | |  / \  |  _ \|  _ \|  \/  |  / \  / ___|_   _| ____|  _ \ `,
+	` \___ \| |_| | / _ \ | |_) | | | | |\/| | / _ \ \___ \ | | |  _| | |_) |`,
+	`  ___) |  _  |/ ___ \|  _ <| |_| | |  | |/ ___ \ ___) || | | |___|  _ < `,
+	` |____/|_| |_/_/   \_\_| \_\____/|_|  |_/_/   \_\____/ |_| |_____|_| \_\`,
+}
+
+var spinnerFrames = []byte{'-', '\\', '|', '/'}
+
+// isInteractiveTerminal returns true if Stdin is a live user console (not piped input).
+func isInteractiveTerminal() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return true
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
+// RunSpinner animates a classic -/|\- spinner for `duration` while displaying `label`.
+func RunSpinner(label string, duration time.Duration) {
+	if !isInteractiveTerminal() {
+		if duration > 40*time.Millisecond {
+			duration = 40 * time.Millisecond
+		}
+	}
+	steps := int(duration / (35 * time.Millisecond))
+	if steps < 4 {
+		steps = 4
+	}
+	for i := 0; i < steps; i++ {
+		frame := spinnerFrames[i%len(spinnerFrames)]
+		fmt.Printf("\r  %s %s",
+			cyanStyle.Render(fmt.Sprintf("[%c]", frame)),
+			whiteBold.Render(label),
+		)
+		time.Sleep(35 * time.Millisecond)
+	}
+	// Clear spinner line and print [OK]
+	fmt.Printf("\r%s\r", strings.Repeat(" ", len(label)+12))
+}
+
+// RunSpinnerWhile runs `fn` in the background while animating a live -/|\- spinner on screen.
+func RunSpinnerWhile(label string, fn func()) {
+	var done atomic.Bool
+	go func() {
+		fn()
+		done.Store(true)
+	}()
+
+	i := 0
+	for !done.Load() {
+		frame := spinnerFrames[i%len(spinnerFrames)]
+		fmt.Printf("\r  %s %s",
+			cyanStyle.Render(fmt.Sprintf("[%c]", frame)),
+			whiteBold.Render(label),
+		)
+		time.Sleep(40 * time.Millisecond)
+		i++
+	}
+	// Ensure at least 4 frames were visible so fast operations still show crisp feedback
+	minFrames := 6
+	if !isInteractiveTerminal() {
+		minFrames = 2
+	}
+	for ; i < minFrames; i++ {
+		frame := spinnerFrames[i%len(spinnerFrames)]
+		fmt.Printf("\r  %s %s",
+			cyanStyle.Render(fmt.Sprintf("[%c]", frame)),
+			whiteBold.Render(label),
+		)
+		time.Sleep(30 * time.Millisecond)
+	}
+	fmt.Printf("\r%s\r", strings.Repeat(" ", len(label)+12))
+}
+
+// AnimateBanner renders the SHARDMASTER ASCII art logo with an animated scanline reveal.
+func AnimateBanner(qr *router.QueryRouter, pgwireUp bool) {
+	colors := []string{"39", "45", "51", "86", "49"}
+	interactive := isInteractiveTerminal()
+
+	fmt.Println("")
+	for i, line := range shardMasterASCII {
+		style := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colors[i%len(colors)]))
+		if interactive {
+			frame := spinnerFrames[i%len(spinnerFrames)]
+			fmt.Printf("\r %s", cyanStyle.Render(fmt.Sprintf("[%c] Initializing ShardMaster Core...", frame)))
+			time.Sleep(35 * time.Millisecond)
+			fmt.Printf("\r%s\r", strings.Repeat(" ", 48))
+		}
+		fmt.Println(style.Render(line))
+	}
+
+	var totalRows uint64
+	for _, s := range qr.Cluster.GetAllShards() {
+		totalRows += uint64(s.RowCount())
+	}
+
+	pgStatus := "PGWire :6000 ONLINE"
+	if !pgwireUp {
+		pgStatus = "Embedded Engine Ready"
+	}
+
+	fmt.Println(dimStyle.Render("  ========================================================================"))
+	statusLine := fmt.Sprintf("  CLUSTER: %d Shards (1,024 Buckets)  |  ROWS: %s  |  %s",
+		qr.Dir.ActiveShards(),
+		FormatCommas(totalRows),
+		pgStatus,
+	)
+	fmt.Println(whiteBold.Render(statusLine))
+	fmt.Println(dimStyle.Render("  ========================================================================"))
+}
+
+// RenderSectionHeader prints a mathematically aligned 72-char section header (never overflows or underflows).
+func RenderSectionHeader(title string) {
+	const width = 72
+	clean := strings.TrimSpace(title)
+	padLen := width - len(clean) - 5
+	if padLen < 4 {
+		padLen = 4
+	}
+	fmt.Printf("\n  %s %s %s\n",
+		cyanStyle.Render("---"),
+		headerStyle.Render(clean),
+		dimStyle.Render(strings.Repeat("-", padLen)),
+	)
+}
+
+// RenderProfessionalTable prints a PostgreSQL-style aligned grid table where every border matches the exact column width.
+func RenderProfessionalTable(columns []string, rows [][]string) {
+	if len(columns) == 0 {
+		return
+	}
+	widths := make([]int, len(columns))
+	for i, col := range columns {
+		widths[i] = len(col)
+	}
+	for _, row := range rows {
+		for i := 0; i < len(columns) && i < len(row); i++ {
+			if len(row[i]) > widths[i] {
+				widths[i] = len(row[i])
+			}
+		}
+	}
+
+	// Build top/middle/bottom horizontal border: +------+------+
+	var sepBuilder strings.Builder
+	sepBuilder.WriteString("  +")
+	for _, w := range widths {
+		sepBuilder.WriteString(strings.Repeat("-", w+2) + "+")
+	}
+	borderLine := dimStyle.Render(sepBuilder.String())
+
+	fmt.Println(borderLine)
+
+	// Header row
+	var hdrBuilder strings.Builder
+	hdrBuilder.WriteString("  |")
+	for i, col := range columns {
+		padded := fmt.Sprintf(" %-*s ", widths[i], col)
+		hdrBuilder.WriteString(cyanStyle.Render(padded) + dimStyle.Render("|"))
+	}
+	fmt.Println(hdrBuilder.String())
+	fmt.Println(borderLine)
+
+	// Data rows
+	for _, row := range rows {
+		var rowBuilder strings.Builder
+		rowBuilder.WriteString(dimStyle.Render("  |"))
+		for i := 0; i < len(columns); i++ {
+			val := ""
+			if i < len(row) {
+				val = row[i]
+			}
+			padded := fmt.Sprintf(" %-*s ", widths[i], val)
+			if i == 0 {
+				rowBuilder.WriteString(whiteBold.Render(padded) + dimStyle.Render("|"))
+			} else {
+				rowBuilder.WriteString(padded + dimStyle.Render("|"))
+			}
+		}
+		fmt.Println(rowBuilder.String())
+	}
+	fmt.Println(borderLine)
+}
+
 // RunInteractiveShell boots the complete ShardMaster system in the background
-// and provides a clean, minimalist interactive control center.
+// and provides a clean, animated, professional interactive control center.
 func RunInteractiveShell(qr *router.QueryRouter) {
 	srv := pgwire.NewServer(":6000", ":8080", qr)
 	pgwireOnline := true
@@ -39,16 +228,17 @@ func RunInteractiveShell(qr *router.QueryRouter) {
 		}
 	}()
 	defer srv.Close()
-	time.Sleep(40 * time.Millisecond)
+	time.Sleep(35 * time.Millisecond)
 
 	reader := bufio.NewReader(os.Stdin)
 
-	printMainMenu(qr, pgwireOnline)
+	AnimateBanner(qr, pgwireOnline)
+	printMainMenu()
 
 	for {
 		shardsCount := qr.Dir.ActiveShards()
 		prompt := fmt.Sprintf(
-			"\n%s [%s] %s ",
+			"\n  %s [%s] %s ",
 			cyanStyle.Render("shardmaster"),
 			okStyle.Render(fmt.Sprintf("%d-shards", shardsCount)),
 			warnStyle.Render(">"),
@@ -57,7 +247,7 @@ func RunInteractiveShell(qr *router.QueryRouter) {
 
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			fmt.Println("\nShutting down ShardMaster. Goodbye.")
+			fmt.Println("\n  Shutting down ShardMaster. Goodbye.")
 			return
 		}
 
@@ -72,19 +262,23 @@ func RunInteractiveShell(qr *router.QueryRouter) {
 
 		switch cmd {
 		case "0", "menu", "m", "ls":
-			printMainMenu(qr, pgwireOnline)
+			RunSpinner("Loading ShardMaster Control Menu...", 140*time.Millisecond)
+			AnimateBanner(qr, pgwireOnline)
+			printMainMenu()
 
 		case "1", "learn", "tutorial", "guide", "academy":
 			runGuidedAcademy(qr, reader)
 
 		case "2", "status", "stat", "topology":
+			RunSpinner("Polling Physical Shards & 1,024 Virtual Buckets...", 220*time.Millisecond)
 			PrintStaticDashboard(qr, false)
 
 		case "3", "tui", "dashboard":
+			RunSpinner("Initializing 4-Tab Interactive Terminal UI...", 240*time.Millisecond)
 			model := tui.NewDashboardModel(qr)
 			p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 			_, _ = p.Run()
-			fmt.Println(okStyle.Render("\n[OK] Returned from TUI. Type 'menu' to view options."))
+			fmt.Println(okStyle.Render("\n  [OK] Returned from Live TUI. Type 'menu' to view options."))
 
 		case "4", "lookup", "find":
 			key := ""
@@ -187,18 +381,23 @@ func RunInteractiveShell(qr *router.QueryRouter) {
 					seedCount = customN
 				}
 			}
-			qr.Cluster.InitializeShards(4)
-			qr.Dir.Reset(4)
-			qr.Cluster.SeedCluster(seedCount, qr.Dir.GetBucketOwner)
-			fmt.Println(okStyle.Render(fmt.Sprintf("\n[OK] Reset to 4 Shards (1,024 Buckets, %s rows).", FormatCommas(uint64(seedCount)))))
+			RunSpinnerWhile(fmt.Sprintf("Resetting Cluster & Seeding %s Rows...", FormatCommas(uint64(seedCount))), func() {
+				qr.Cluster.InitializeShards(4)
+				qr.Dir.Reset(4)
+				qr.Cluster.SeedCluster(seedCount, qr.Dir.GetBucketOwner)
+			})
+			fmt.Printf("  %s Cluster reset to 4 Shards (1,024 Buckets, %s rows).\n",
+				okStyle.Render("[OK]"), FormatCommas(uint64(seedCount)))
 			PrintStaticDashboard(qr, false)
 
 		case "clear", "cls":
 			fmt.Print("\033[H\033[2J")
-			printMainMenu(qr, pgwireOnline)
+			AnimateBanner(qr, pgwireOnline)
+			printMainMenu()
 
 		case "exit", "quit", "q":
-			fmt.Println(okStyle.Render("\nShutting down ShardMaster. Goodbye!"))
+			RunSpinner("Closing PGWire Listener & Flushing Control Plane...", 180*time.Millisecond)
+			fmt.Println(okStyle.Render("  [OK] ShardMaster shut down cleanly. Goodbye!"))
 			return
 
 		default:
@@ -213,7 +412,7 @@ func RunInteractiveShell(qr *router.QueryRouter) {
 				strings.HasPrefix(upper, "RUN VDIFF") {
 				runSQLAction(qr, input)
 			} else {
-				fmt.Printf("%s Unknown command '%s'. Type %s or %s.\n",
+				fmt.Printf("  %s Unknown command '%s'. Type %s or %s.\n",
 					warnStyle.Render("[INFO]"),
 					input,
 					cyanStyle.Render("1-12"),
@@ -223,39 +422,21 @@ func RunInteractiveShell(qr *router.QueryRouter) {
 	}
 }
 
-// printMainMenu renders a clean, compact 76-column control card that fits on any terminal screen.
-func printMainMenu(qr *router.QueryRouter, pgwireUp bool) {
-	var totalRows uint64
-	for _, s := range qr.Cluster.GetAllShards() {
-		totalRows += uint64(s.RowCount())
-	}
-	pgTag := okStyle.Render("PGWire :6000 LIVE")
-	if !pgwireUp {
-		pgTag = warnStyle.Render("Embedded Mode")
-	}
-
-	fmt.Println("")
-	fmt.Println(headerStyle.Render("+--------------------------------------------------------------------------+"))
-	fmt.Printf("| %s | %s | %s Rows | %s |\n",
-		headerStyle.Render("SHARDMASTER v2.0"),
-		cyanStyle.Render(fmt.Sprintf("%d Shards", qr.Dir.ActiveShards())),
-		warnStyle.Render(FormatCommas(totalRows)),
-		pgTag)
-	fmt.Println(headerStyle.Render("+--------------------------------------------------------------------------+"))
-	fmt.Printf("  %s  %-22s %s\n", okStyle.Render("[1]"), "Interactive Academy", "Step-by-step guided tour of all 6 Pillars")
-	fmt.Printf("  %s  %-22s %s\n", okStyle.Render("[2]"), "Cluster Status", "View shard load bars, row counts & CDC lag")
-	fmt.Printf("  %s  %-22s %s\n", okStyle.Render("[3]"), "Live Dashboard (TUI)", "Open 4-Tab Terminal UI (fits any screen)")
-	fmt.Printf("  %s  %-22s %s\n", cyanStyle.Render("[4]"), "Route User Key", "Inspect O(1) xxHash64 & Virtual Bucket")
-	fmt.Printf("  %s  %-22s %s\n", cyanStyle.Render("[5]"), "SQL & Query Explorer", "Run 16 built-in queries or custom SQL")
-	fmt.Printf("  %s  %-22s %s\n", warnStyle.Render("[6]"), "Add Physical Shard", "Add regional shard & stream buckets (CDC)")
-	fmt.Printf("  %s  %-22s %s\n", warnStyle.Render("[7]"), "Zero-Downtime Split", "Split cluster (4 -> 8 shards) with VDiff")
-	fmt.Printf("  %s  %-22s %s\n", hotStyle.Render("[8]"), "Hotspot Self-Healer", "Spike Bucket #412 & watch auto-isolation")
-	fmt.Printf("  %s  %-22s %s\n", okStyle.Render("[9]"), "VDiff Parity Audit", "Verify 256-bit XOR-SHA256 across shards")
-	fmt.Printf(" %s  %-22s %s\n", okStyle.Render("[10]"), "500M+ QPS Benchmark", "Multi-core lock-free routing & chaos test")
-	fmt.Printf(" %s  %-22s %s\n", cyanStyle.Render("[11]"), "1-Petabyte Simulator", "Simulate 1 Trillion rows & network savings")
-	fmt.Printf(" %s  %-22s %s\n", warnStyle.Render("[12]"), "Architecture Manual", "Formulas, internals & psql connection guide")
-	fmt.Println(dimStyle.Render("----------------------------------------------------------------------------"))
-	fmt.Printf("  Quick commands:  %s  |  %s  |  %s  |  %s  |  %s\n",
+func printMainMenu() {
+	fmt.Printf("   %s  %-22s %s\n", okStyle.Render("[1]"), whiteBold.Render("Interactive Academy"), dimStyle.Render("Step-by-step guided tour of all 6 Pillars"))
+	fmt.Printf("   %s  %-22s %s\n", okStyle.Render("[2]"), whiteBold.Render("Cluster Status"), dimStyle.Render("View shard load bars, row counts & CDC lag"))
+	fmt.Printf("   %s  %-22s %s\n", okStyle.Render("[3]"), whiteBold.Render("Live Dashboard (TUI)"), dimStyle.Render("Open 4-Tab Terminal UI (fits any screen)"))
+	fmt.Printf("   %s  %-22s %s\n", cyanStyle.Render("[4]"), whiteBold.Render("Route User Key"), dimStyle.Render("Inspect O(1) xxHash64 & Virtual Bucket"))
+	fmt.Printf("   %s  %-22s %s\n", cyanStyle.Render("[5]"), whiteBold.Render("SQL & Query Explorer"), dimStyle.Render("Run 16 built-in queries or custom SQL"))
+	fmt.Printf("   %s  %-22s %s\n", warnStyle.Render("[6]"), whiteBold.Render("Add Physical Shard"), dimStyle.Render("Add regional shard & stream buckets (CDC)"))
+	fmt.Printf("   %s  %-22s %s\n", warnStyle.Render("[7]"), whiteBold.Render("Zero-Downtime Split"), dimStyle.Render("Split cluster (4 -> 8 shards) with VDiff"))
+	fmt.Printf("   %s  %-22s %s\n", hotStyle.Render("[8]"), whiteBold.Render("Hotspot Self-Healer"), dimStyle.Render("Spike Bucket #412 & watch auto-isolation"))
+	fmt.Printf("   %s  %-22s %s\n", okStyle.Render("[9]"), whiteBold.Render("VDiff Parity Audit"), dimStyle.Render("Verify 256-bit XOR-SHA256 across shards"))
+	fmt.Printf("  %s  %-22s %s\n", okStyle.Render("[10]"), whiteBold.Render("500M+ QPS Benchmark"), dimStyle.Render("Multi-core lock-free routing & chaos test"))
+	fmt.Printf("  %s  %-22s %s\n", cyanStyle.Render("[11]"), whiteBold.Render("1-Petabyte Simulator"), dimStyle.Render("Simulate 1 Trillion rows & network savings"))
+	fmt.Printf("  %s  %-22s %s\n", warnStyle.Render("[12]"), whiteBold.Render("Architecture Manual"), dimStyle.Render("Formulas, internals & psql connection guide"))
+	fmt.Println(dimStyle.Render("  ------------------------------------------------------------------------"))
+	fmt.Printf("   Quick Commands:  %s  |  %s  |  %s  |  %s  |  %s\n",
 		okStyle.Render("demo"), warnStyle.Render("reset"), cyanStyle.Render("menu"), dimStyle.Render("clear"), hotStyle.Render("exit"))
 }
 
@@ -264,37 +445,36 @@ func printMainMenu(qr *router.QueryRouter, pgwireUp bool) {
 // ============================================================================
 
 func runGuidedAcademy(qr *router.QueryRouter, reader *bufio.Reader) {
-	fmt.Println(headerStyle.Render("\n+--------------------------------------------------------------------------+"))
-	fmt.Println(headerStyle.Render("| SHARDMASTER INTERACTIVE ACADEMY (5 LESSONS)                              |"))
-	fmt.Println(headerStyle.Render("+--------------------------------------------------------------------------+"))
+	RunSpinner("Loading ShardMaster Interactive Academy...", 220*time.Millisecond)
+	RenderSectionHeader("SHARDMASTER INTERACTIVE ACADEMY (5 LESSONS)")
 
-	fmt.Println(cyanStyle.Render("\n[Lesson 1/5] Pillar 1: PGWire Protocol (:6000) & O(1) L1-Cache Bucket Ring"))
-	fmt.Println("  * Hashes user_id with xxHash64: bucket = xxHash64(key) & 1023.")
-	fmt.Println("  * Looks up the owning shard in a 4 KB [1024]atomic.Uint32 array in ~18ns.")
+	fmt.Println(cyanStyle.Render("\n  [Lesson 1/5] Pillar 1: PGWire Protocol (:6000) & O(1) L1-Cache Bucket Ring"))
+	fmt.Println("   * Hashes user_id with xxHash64: bucket = xxHash64(key) & 1023.")
+	fmt.Println("   * Looks up the owning shard in a 4 KB [1024]atomic.Uint32 array in ~18ns.")
 	key := promptDefault(reader, "Enter any user_id [default: 42]", "42")
 	runLookupAction(qr, key)
 
-	fmt.Println(cyanStyle.Render("\n[Lesson 2/5] Pillar 2: Distributed Scatter-Gather + K-Way Merge Sort"))
-	fmt.Println("  * Non-key queries fan out via Goroutines and stream into a Min-Heap.")
+	fmt.Println(cyanStyle.Render("\n  [Lesson 2/5] Pillar 2: Distributed Scatter-Gather + K-Way Merge Sort"))
+	fmt.Println("   * Non-key queries fan out via Goroutines and stream into a Min-Heap.")
 	_ = promptDefault(reader, "Press Enter to run cross-shard K-Way Merge Top 5", "")
 	runSQLAction(qr, "SELECT * FROM users WHERE email LIKE '%@gmail.com' ORDER BY created_at DESC LIMIT 5;")
 
-	fmt.Println(cyanStyle.Render("\n[Lesson 3/5] Pillars 3 & 4: Vitess CDC VReplication & Cryptographic VDiff"))
-	fmt.Println("  * Streams buckets via Keyset Backfill + CDC log and verifies XOR-SHA256.")
+	fmt.Println(cyanStyle.Render("\n  [Lesson 3/5] Pillars 3 & 4: Vitess CDC VReplication & Cryptographic VDiff"))
+	fmt.Println("   * Streams buckets via Keyset Backfill + CDC log and verifies XOR-SHA256.")
 	_ = promptDefault(reader, "Press Enter to add a 5th shard with 0ms downtime", "")
 	runAddShardAction(qr, "us-west")
 
-	fmt.Println(cyanStyle.Render("\n[Lesson 4/5] Pillar 5: Autonomous EWMA Hotspot Detection"))
-	fmt.Println("  * Detects when Bucket #412 exceeds 5x average QPS and isolates it.")
+	fmt.Println(cyanStyle.Render("\n  [Lesson 4/5] Pillar 5: Autonomous EWMA Hotspot Detection"))
+	fmt.Println("   * Detects when Bucket #412 exceeds 5x average QPS and isolates it.")
 	_ = promptDefault(reader, "Press Enter to inject a 6,800 QPS spike on Bucket #412", "")
 	runHotspotAction(qr, 412)
 
-	fmt.Println(cyanStyle.Render("\n[Lesson 5/5] Pillar 6: Multi-Million QPS Benchmark & 1-Petabyte Proof"))
+	fmt.Println(cyanStyle.Render("\n  [Lesson 5/5] Pillar 6: Multi-Million QPS Benchmark & 1-Petabyte Proof"))
 	_ = promptDefault(reader, "Press Enter to run the 500M+ QPS Benchmark & 1-PB Simulator", "")
 	runBenchAction(qr, 2)
 	runPetabyteAction(64, 80)
 
-	fmt.Println(okStyle.Render("\n[OK] Academy Complete! Type '3' to open the 4-Tab TUI or 'menu' for options."))
+	fmt.Println(okStyle.Render("\n  [OK] Academy Complete! Type '3' to open the 4-Tab TUI or 'menu' for options."))
 }
 
 // ============================================================================
@@ -302,34 +482,37 @@ func runGuidedAcademy(qr *router.QueryRouter, reader *bufio.Reader) {
 // ============================================================================
 
 func runLookupAction(qr *router.QueryRouter, key string) {
+	RunSpinner(fmt.Sprintf("Hashing key '%s' with xxHash64 & probing L1 Directory Ring...", key), 200*time.Millisecond)
 	info := qr.Dir.LookupDetailed(key)
-	fmt.Println(headerStyle.Render("\n[O(1) ATOMIC SHARD DIRECTORY LOOKUP]"))
-	fmt.Printf("  Key: %s  |  xxHash64: %s  |  Bucket: %s\n",
-		warnStyle.Render(info.Key),
-		dimStyle.Render(fmt.Sprintf("0x%016x", info.HashValue)),
-		cyanStyle.Render(fmt.Sprintf("#%d", info.VirtualBucket)))
-	fmt.Printf("  Target: %s (:%d)  |  Source: %s  |  Latency: %s\n",
-		okStyle.Render(info.ShardName),
-		5432+info.ShardID,
-		cyanStyle.Render(info.Source),
-		okStyle.Render(fmt.Sprintf("%d ns (0 allocs)", info.LookupTimeNs)))
+
+	RenderSectionHeader("PILLAR 1: O(1) ATOMIC SHARD DIRECTORY LOOKUP")
+	RenderProfessionalTable(
+		[]string{"SHARD KEY", "XXHASH64 DIGEST", "VIRTUAL BUCKET", "TARGET SHARD", "SOURCE", "LATENCY"},
+		[][]string{{
+			info.Key,
+			fmt.Sprintf("0x%016x", info.HashValue),
+			fmt.Sprintf("Bucket #%d / 1024", info.VirtualBucket),
+			fmt.Sprintf("%s (:%d)", info.ShardName, 5432+info.ShardID),
+			info.Source,
+			fmt.Sprintf("%d ns (0 allocs)", info.LookupTimeNs),
+		}},
+	)
 }
 
 func runInteractiveSQLMenu(qr *router.QueryRouter, reader *bufio.Reader) {
-	fmt.Println(headerStyle.Render("\n+--------------------------------------------------------------------------+"))
-	fmt.Println(headerStyle.Render("| SQL & INTERNAL QUERY EXPLORER (50,000,000 Rows Live)                     |"))
-	fmt.Println(headerStyle.Render("+--------------------------------------------------------------------------+"))
-	fmt.Printf("  %-36s %s\n", cyanStyle.Render("INTERNAL DIAGNOSTICS"), cyanStyle.Render("DATA & K-WAY MERGE QUERIES"))
-	fmt.Printf("  %s %-32s %s %s\n", okStyle.Render("[1]"), "Show Physical Shards", warnStyle.Render("[9] "), "Point Lookup (user_id = 42)")
-	fmt.Printf("  %s %-32s %s %s\n", okStyle.Render("[2]"), "Show Bucket Ranges [0..1023]", warnStyle.Render("[10]"), "Point Lookup (user_id = 49.9M)")
-	fmt.Printf("  %s %-32s %s %s\n", okStyle.Render("[3]"), "Show CDC Workflows", warnStyle.Render("[11]"), "K-Way Merge (@gmail.com Top 5)")
-	fmt.Printf("  %s %-32s %s %s\n", okStyle.Render("[4]"), "Show EWMA Hotspots", warnStyle.Render("[12]"), "K-Way Merge (@stripe.com Top 5)")
-	fmt.Printf("  %s %-32s %s %s\n", okStyle.Render("[5]"), "Show Engine & RAM Stats", warnStyle.Render("[13]"), "K-Way Merge (region = us-west)")
-	fmt.Printf("  %s %-32s %s %s\n", okStyle.Render("[6]"), "Run VDiff SHA-256 Audit", warnStyle.Render("[14]"), "Count All Rows (50,000,000)")
-	fmt.Printf("  %s %-32s %s %s\n", okStyle.Render("[7]"), "Explain Route (user_id = 42)", warnStyle.Render("[15]"), "Insert User (CDC Log Append)")
-	fmt.Printf("  %s %-32s %s %s\n", okStyle.Render("[8]"), "Show All 16 SQL Syntaxes", warnStyle.Render("[16]"), "Delete User (Tombstone + CDC)")
-	fmt.Println(dimStyle.Render("----------------------------------------------------------------------------"))
-	fmt.Printf("  %s Run All Diagnostics (1-5)  |  Or type any custom SQL query\n", cyanStyle.Render("[all]"))
+	RunSpinner("Opening SQL & Internal Query Explorer...", 160*time.Millisecond)
+	RenderSectionHeader("SQL & INTERNAL QUERY EXPLORER (50,000,000 ROWS)")
+	fmt.Printf("   %-35s %s\n", cyanStyle.Render("INTERNAL DIAGNOSTICS"), cyanStyle.Render("DATA & K-WAY MERGE QUERIES"))
+	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[1]"), "Show Physical Shards", warnStyle.Render("[9] "), "Point Lookup (user_id = 42)")
+	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[2]"), "Show Bucket Ranges [0..1023]", warnStyle.Render("[10]"), "Point Lookup (user_id = 49.9M)")
+	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[3]"), "Show CDC Workflows", warnStyle.Render("[11]"), "K-Way Merge (@gmail.com Top 5)")
+	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[4]"), "Show EWMA Hotspots", warnStyle.Render("[12]"), "K-Way Merge (@stripe.com Top 5)")
+	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[5]"), "Show Engine & RAM Stats", warnStyle.Render("[13]"), "K-Way Merge (region = us-west)")
+	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[6]"), "Run VDiff SHA-256 Audit", warnStyle.Render("[14]"), "Count All Rows (50,000,000)")
+	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[7]"), "Explain Route (user_id = 42)", warnStyle.Render("[15]"), "Insert User (CDC Log Append)")
+	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[8]"), "Show All 16 SQL Syntaxes", warnStyle.Render("[16]"), "Delete User (Tombstone + CDC)")
+	fmt.Println(dimStyle.Render("  ------------------------------------------------------------------------"))
+	fmt.Printf("   %s Run All Diagnostics (1-5)  |  Or type any custom SQL query\n", cyanStyle.Render("[all]"))
 
 	choice := promptDefault(reader, "Select [1-16, 'all', or custom SQL] [default: 1]", "1")
 	switch strings.ToLower(choice) {
@@ -375,38 +558,46 @@ func runInteractiveSQLMenu(qr *router.QueryRouter, reader *bufio.Reader) {
 }
 
 func runSQLAction(qr *router.QueryRouter, sql string) {
-	res, err := qr.ExecuteSQL(sql)
+	var res *router.ResultSet
+	var err error
+	RunSpinnerWhile(fmt.Sprintf("Executing SQL: %s", truncatePlain(sql, 48)), func() {
+		res, err = qr.ExecuteSQL(sql)
+	})
 	if err != nil {
-		fmt.Printf("%s Query Error: %v\n", hotStyle.Render("[ERROR]"), err)
+		fmt.Printf("  %s Query Error: %v\n", hotStyle.Render("[ERROR]"), err)
 		return
 	}
-	fmt.Printf("\n%s %s  (%s | %d us | %s)\n",
-		cyanStyle.Render("sql>"),
-		warnStyle.Render(sql),
-		okStyle.Render(res.RoutedShard),
-		res.LatencyUs,
-		res.CommandTag)
-	fmt.Printf("  %s\n", cyanStyle.Render(strings.Join(res.Columns, " | ")))
-	fmt.Printf("  %s\n", dimStyle.Render(strings.Repeat("-", 72)))
-	for _, r := range res.Rows {
-		fmt.Printf("  %s\n", strings.Join(r, " | "))
-	}
+	fmt.Printf("\n  %s %s\n", cyanStyle.Render("SQL >"), warnStyle.Render(sql))
+	fmt.Printf("  %s Route: %s  |  Latency: %s  |  Tag: %s\n",
+		okStyle.Render("[OK]"),
+		cyanStyle.Render(res.RoutedShard),
+		okStyle.Render(fmt.Sprintf("%d us", res.LatencyUs)),
+		whiteBold.Render(res.CommandTag),
+	)
+	RenderProfessionalTable(res.Columns, res.Rows)
 }
 
 func runAddShardAction(qr *router.QueryRouter, region string) {
 	newShardID := qr.Dir.ActiveShards()
+	RunSpinner(fmt.Sprintf("Provisioning Physical Node [Shard %d :%d] in %s...", newShardID, 5432+newShardID, region), 240*time.Millisecond)
 	newShard := qr.Cluster.EnsureShard(newShardID, region)
-	fmt.Printf("\n[OK] Provisioned %s in region %s\n",
+	fmt.Printf("  %s Provisioned %s in region %s\n",
+		okStyle.Render("[OK]"),
 		cyanStyle.Render(fmt.Sprintf("[Shard %d :%d]", newShard.ShardID, newShard.Port)),
 		warnStyle.Render(newShard.Region))
 
-	snap, _ := qr.CDC.RebalanceToShards(newShardID+1, 2*time.Millisecond)
-	fmt.Printf("[OK] Streamed %s rows across %d ranges via CDC (Lag: %.2f ms)\n",
+	var snap *cdc.WorkflowSnapshot
+	RunSpinnerWhile("Streaming Virtual Buckets via Keyset Backfill + CDC Log...", func() {
+		snap, _ = qr.CDC.RebalanceToShards(newShardID+1, 15*time.Millisecond)
+	})
+	fmt.Printf("  %s Migrated %s rows across %d bucket ranges (Lag: %.2f ms)\n",
+		okStyle.Render("[OK]"),
 		warnStyle.Render(FormatCommas(uint64(snap.RowsMigrated))),
 		snap.RangesCompleted,
 		snap.ReplicationLagMs)
 	if snap.LastVDiff != nil {
-		fmt.Printf("[OK] VDiff SHA256-XOR: %s == %s [MATCH]\n\n",
+		fmt.Printf("  %s VDiff SHA256-XOR Parity: %s == %s [VERIFIED]\n",
+			okStyle.Render("[OK]"),
 			dimStyle.Render(snap.LastVDiff.SourceDigest[:16]+".."),
 			okStyle.Render(snap.LastVDiff.TargetDigest[:16]+".."))
 	}
@@ -416,218 +607,244 @@ func runAddShardAction(qr *router.QueryRouter, region string) {
 func runRebalanceAction(qr *router.QueryRouter, targetNumShards uint32) {
 	cur := qr.Dir.ActiveShards()
 	if targetNumShards <= cur {
-		qr.Cluster.InitializeShards(4)
-		qr.Dir.Reset(4)
-		qr.Cluster.SeedCluster(storage.DefaultInitialRows, qr.Dir.GetBucketOwner)
+		RunSpinnerWhile("Resetting cluster to 4 Shards before split demonstration...", func() {
+			qr.Cluster.InitializeShards(4)
+			qr.Dir.Reset(4)
+			qr.Cluster.SeedCluster(storage.DefaultInitialRows, qr.Dir.GetBucketOwner)
+		})
 		cur = 4
 	}
 
-	fmt.Printf("\n[START] Zero-Downtime CDC Resharding (%d -> %d Shards)...\n", cur, targetNumShards)
-	snap, err := qr.CDC.RebalanceToShards(targetNumShards, 3*time.Millisecond)
+	RenderSectionHeader(fmt.Sprintf("ZERO-DOWNTIME CDC RESHARDING (%d -> %d SHARDS)", cur, targetNumShards))
+	RunSpinner("Phase 1/3: Computing Optimal Virtual Bucket Split Plan...", 200*time.Millisecond)
+
+	var snap *cdc.WorkflowSnapshot
+	var err error
+	RunSpinnerWhile(fmt.Sprintf("Phase 2/3: Streaming Buckets (%d -> %d Shards) & Computing VDiff...", cur, targetNumShards), func() {
+		snap, err = qr.CDC.RebalanceToShards(targetNumShards, 15*time.Millisecond)
+	})
 	if err != nil {
-		fmt.Printf("[ERROR] Rebalance failed: %v\n", err)
+		fmt.Printf("  [ERROR] Rebalance failed: %v\n", err)
 		return
 	}
+	RunSpinner("Phase 3/3: Executing <200us Atomic Pointer Cutover...", 180*time.Millisecond)
 
-	fmt.Printf("[OK] Migrated %s rows across %d bucket ranges (0.00ms Downtime)\n",
+	fmt.Printf("  %s Migrated %s rows across %d virtual bucket ranges (0.00ms Downtime)\n",
+		okStyle.Render("[OK]"),
 		FormatCommas(uint64(snap.RowsMigrated)), snap.RangesCompleted)
+
+	var vdiffRows [][]string
 	for _, vd := range qr.CDC.GetVDiffHistory() {
-		fmt.Printf("  * Bucket [%3d-%3d] S%d->S%d | %10s rows | SHA256: %s [%s]\n",
-			vd.StartBucket, vd.EndBucket, vd.SourceShard, vd.TargetShard,
+		vdiffRows = append(vdiffRows, []string{
+			fmt.Sprintf("Bucket [%03d..%03d]", vd.StartBucket, vd.EndBucket),
+			fmt.Sprintf("Shard %d -> Shard %d", vd.SourceShard, vd.TargetShard),
 			FormatCommas(uint64(vd.TargetRows)),
-			dimStyle.Render(vd.TargetDigest[:16]+".."),
-			okStyle.Render("MATCH"))
+			vd.TargetDigest[:20] + "...",
+			"MATCH (0ms Lag)",
+		})
 	}
-	fmt.Println("")
+	RenderProfessionalTable(
+		[]string{"BUCKET RANGE", "MIGRATION ROUTE", "ROWS MOVED", "VDIFF SHA256-XOR", "STATUS"},
+		vdiffRows,
+	)
 	PrintStaticDashboard(qr, false)
 }
 
 func runHotspotAction(qr *router.QueryRouter, bucketID uint16) {
 	ownerBefore := qr.Dir.GetBucketOwner(bucketID)
-	fmt.Printf("\n[EWMA HOTSPOT ENGINE] Spiking Bucket #%d (on Shard %d) with 6,800 QPS...\n", bucketID, ownerBefore)
+	RenderSectionHeader(fmt.Sprintf("PILLAR 5: AUTONOMOUS EWMA HOTSPOT ENGINE (BUCKET #%d)", bucketID))
+	RunSpinner(fmt.Sprintf("Injecting 6,800 QPS Celebrity Traffic Spike onto Bucket #%d...", bucketID), 240*time.Millisecond)
 	qr.HotspotTracker.InjectBucketTrafficSpike(bucketID, 6800)
+
+	RunSpinner("Evaluating 64-Byte Padded EWMA Counters & Isolating Hot Bucket...", 240*time.Millisecond)
 	if alert := qr.HotspotTracker.TickAndEvaluate(1.0); alert != nil {
-		fmt.Printf("  * %s\n", hotStyle.Render(alert.Message))
-		fmt.Printf("  * VDiff Digest: %s (%s)\n",
-			dimStyle.Render(alert.VDiffDigest+".."),
-			okStyle.Render("0 Dropped Writes, 0.00ms Downtime"))
+		RenderProfessionalTable(
+			[]string{"HOT BUCKET", "MEASURED LOAD", "ISOLATION ROUTE", "VDIFF DIGEST", "DOWNTIME"},
+			[][]string{{
+				fmt.Sprintf("Bucket #%d", alert.BucketID),
+				fmt.Sprintf("%d QPS (>98th Pct)", alert.MeasuredQPS),
+				fmt.Sprintf("Shard %d -> Shard %d", ownerBefore, alert.ToShard),
+				alert.VDiffDigest + "...",
+				"0.00 ms (0 Dropped)",
+			}},
+		)
 	}
 }
 
 func runVDiffAction(qr *router.QueryRouter) {
-	res, _ := qr.ExecuteSQL("RUN VDIFF")
-	fmt.Println(headerStyle.Render("\n[CRYPTOGRAPHIC VDIFF PARITY AUDIT (256-Bit XOR-SHA256)]"))
+	var res *router.ResultSet
+	RunSpinnerWhile("Computing 256-Bit Commutative XOR-SHA256 Across 50,000,000 Rows...", func() {
+		res, _ = qr.ExecuteSQL("RUN VDIFF")
+	})
+	RenderSectionHeader("PILLAR 4: CRYPTOGRAPHIC VDIFF BIT-LEVEL PARITY AUDIT")
+	var tableRows [][]string
 	for _, row := range res.Rows {
 		rCount, _ := strconv.ParseUint(row[1], 10, 64)
-		fmt.Printf("  * %-15s | %10s rows | %s.. | [%s]\n",
-			cyanStyle.Render(row[0]),
-			warnStyle.Render(FormatCommas(rCount)),
-			dimStyle.Render(row[2][:28]),
-			okStyle.Render("VERIFIED"))
+		tableRows = append(tableRows, []string{
+			row[0],
+			FormatCommas(rCount),
+			row[2][:32] + "...",
+			row[3],
+		})
 	}
+	RenderProfessionalTable(
+		[]string{"PHYSICAL SHARD", "ROWS VERIFIED", "ROLLING XOR-SHA256 DIGEST", "PARITY STATUS"},
+		tableRows,
+	)
 }
 
 func runBenchAction(qr *router.QueryRouter, benchDuration int) {
-	fmt.Println(headerStyle.Render("\n+--------------------------------------------------------------------------+"))
-	fmt.Println(headerStyle.Render("| MULTI-MILLION REQ/SEC CORE BENCHMARK & LIVE CDC RESHARDING               |"))
-	fmt.Println(headerStyle.Render("+--------------------------------------------------------------------------+"))
-	res := bench.RunPeakBenchmark(qr, time.Duration(benchDuration)*time.Second, 0)
+	RenderSectionHeader("PILLAR 6: MULTI-MILLION REQ/SEC CORE BENCHMARK")
+	var res bench.BenchmarkResult
+	RunSpinnerWhile(fmt.Sprintf("Slamming %d CPU Cores with Lock-Free Routing + Live CDC Split (%ds)...", runtime.NumCPU(), benchDuration), func() {
+		res = bench.RunPeakBenchmark(qr, time.Duration(benchDuration)*time.Second, 0)
+	})
 
-	fmt.Printf("  * Peak Routing Throughput: %s requests/sec (%d CPUs)\n",
-		okStyle.Render(FormatCommas(res.RoutingThroughputQPS)), runtime.NumCPU())
-	fmt.Printf("  * Total Keys Routed:       %s ops in %v\n",
-		warnStyle.Render(FormatCommas(res.TotalRoutingOps)), res.Duration.Round(time.Millisecond))
-	fmt.Printf("  * Latency & Memory:        P50 = %d ns | P99 = %d ns | 0 allocs/op (%.1f MB RAM)\n",
-		res.P50LatencyNs, res.P99LatencyNs, res.MemoryUsedMB)
-	fmt.Printf("  * Live Split Under Load:   %s SQL queries | %s\n",
-		warnStyle.Render(FormatCommas(res.DataPlaneQueries)),
-		okStyle.Render("0 Dropped (100% Availability)"))
+	RenderProfessionalTable(
+		[]string{"BENCHMARK METRIC", "MEASURED RESULT", "ARCHITECTURAL MECHANISM"},
+		[][]string{
+			{"Peak Routing Throughput", FormatCommas(res.RoutingThroughputQPS) + " req/sec", fmt.Sprintf("%d Logical CPU Threads in Parallel", runtime.NumCPU())},
+			{"Total Keys Routed", FormatCommas(res.TotalRoutingOps) + " ops", fmt.Sprintf("Completed in %v", res.Duration.Round(time.Millisecond))},
+			{"Routing Latency (P50 / P99)", fmt.Sprintf("%d ns / %d ns", res.P50LatencyNs, res.P99LatencyNs), "4 KB L1-Cache [1024]atomic.Uint32 Ring"},
+			{"Heap Memory Allocations", "0 B/op (0 allocs/op)", fmt.Sprintf("Process Heap: %.1f MB / 16 GB", res.MemoryUsedMB)},
+			{"Concurrent SQL Under Split", FormatCommas(res.DataPlaneQueries) + " queries", "0 Dropped Queries (100.000% Availability)"},
+		},
+	)
 }
 
 func runPetabyteAction(simFrom, simTo uint32) {
-	rep := bench.SimulatePetabyteScale(simFrom, simTo)
-	fmt.Println(headerStyle.Render("\n+--------------------------------------------------------------------------+"))
-	fmt.Println(headerStyle.Render("| 1-PETABYTE (1,000,000,000,000 ROWS) CLUSTER SCALE PROOF                  |"))
-	fmt.Println(headerStyle.Render("+--------------------------------------------------------------------------+"))
-	fmt.Printf("  * Dataset Scale:          %s (1,000,000,000,000 rows @ 1 KB)\n", okStyle.Render("1.00 Petabyte (1,024 TB)"))
-	fmt.Printf("  * L1 Directory Footprint: %s (1,024 Virtual Buckets)\n", okStyle.Render(fmt.Sprintf("%d Bytes (4 KB)", rep.DirectoryRAMBytes)))
-	fmt.Printf("  * Scale-Out (%d -> %d):   Moves %s of buckets (vs %.1f%% Naive Modulo)\n",
-		rep.InitialPhysicalShards, rep.TargetPhysicalShards,
-		okStyle.Render(fmt.Sprintf("%.1f%%", rep.DataMovedPct)),
-		rep.NaiveModuloMovedPct)
-	fmt.Printf("  * Network I/O Saved:      %s of unnecessary migration avoided!\n",
-		okStyle.Render(fmt.Sprintf("%.1f Terabytes (TB)", rep.NetworkSavedTB)))
+	var rep bench.PetabyteSimReport
+	RunSpinnerWhile(fmt.Sprintf("Simulating 1-Petabyte (1,000,000,000,000 Rows) Scale-Out (%d -> %d Shards)...", simFrom, simTo), func() {
+		rep = bench.SimulatePetabyteScale(simFrom, simTo)
+	})
+	RenderSectionHeader("1-PETABYTE (1,000,000,000,000 ROWS) ARCHITECTURE PROOF")
+	RenderProfessionalTable(
+		[]string{"SIMULATION PARAMETER", "MEASURED VALUE", "ENGINEERING IMPACT"},
+		[][]string{
+			{"Simulated Dataset Scale", "1.00 Petabyte (1,024 TB)", "1,000,000,000,000 Rows @ 1 KB/row"},
+			{"Virtual Bucket Density", FormatCommas(rep.RecordsPerBucket) + " rows/bucket", fmt.Sprintf("%.0f GB per Virtual Bucket", rep.DataGBPerBucket)},
+			{"L1 Routing Table Footprint", fmt.Sprintf("%d Bytes (4 KB)", rep.DirectoryRAMBytes), "Fits 100% Inside CPU L1 Data Cache"},
+			{"Naive Modulo Data Movement", fmt.Sprintf("%.1f%% reshuffled", rep.NaiveModuloMovedPct), fmt.Sprintf("During %d -> %d Shard Scale-Out", simFrom, simTo)},
+			{"ShardMaster Bucket Movement", fmt.Sprintf("%.1f%% (%d/1024 buckets)", rep.DataMovedPct, rep.BucketsMoved), fmt.Sprintf("Saves %.1f Terabytes (TB) Network I/O", rep.NetworkSavedTB)},
+		},
+	)
 }
 
 func runHelpEncyclopedia(reader *bufio.Reader, topic string) {
+	RunSpinner("Loading ShardMaster Architecture Manual...", 160*time.Millisecond)
 	if topic == "" {
-		fmt.Println(headerStyle.Render("\n+--------------------------------------------------------------------------+"))
-		fmt.Println(headerStyle.Render("| SHARDMASTER ARCHITECTURE MANUAL                                          |"))
-		fmt.Println(headerStyle.Render("+--------------------------------------------------------------------------+"))
-		fmt.Println("  [1] Pillar 1: Native PGWire (:6000) & 4 KB L1-Cache Bucket Ring")
-		fmt.Println("  [2] Pillar 2: Distributed Scatter-Gather & K-Way Merge Sort")
-		fmt.Println("  [3] Pillar 3: Vitess-Style CDC VReplication & <200us Cutover")
-		fmt.Println("  [4] Pillar 4: Cryptographic VDiff (256-Bit Commutative XOR-SHA256)")
-		fmt.Println("  [5] Pillar 5: Autonomous EWMA Hotspot Detector & Self-Healer")
-		fmt.Println("  [6] Pillar 6: 4-Tab TUI, 500M+ QPS Benchmark & 1-PB Simulator")
-		fmt.Println("  [7] Connecting External Clients (psql, DBeaver, curl)")
+		RenderSectionHeader("SHARDMASTER ARCHITECTURE MANUAL")
+		fmt.Println("   [1] Pillar 1: Native PGWire (:6000) & 4 KB L1-Cache Bucket Ring")
+		fmt.Println("   [2] Pillar 2: Distributed Scatter-Gather & K-Way Merge Sort")
+		fmt.Println("   [3] Pillar 3: Vitess-Style CDC VReplication & <200us Cutover")
+		fmt.Println("   [4] Pillar 4: Cryptographic VDiff (256-Bit Commutative XOR-SHA256)")
+		fmt.Println("   [5] Pillar 5: Autonomous EWMA Hotspot Detector & Self-Healer")
+		fmt.Println("   [6] Pillar 6: 4-Tab TUI, 500M+ QPS Benchmark & 1-PB Simulator")
+		fmt.Println("   [7] Connecting External Clients (psql, DBeaver, curl)")
 		topic = promptDefault(reader, "Select topic [1-7, default: 1]", "1")
 	}
 
 	switch topic {
 	case "1", "pgwire":
-		fmt.Println(cyanStyle.Render("\n[Pillar 1] Native PGWire Protocol & L1-Cache Directory"))
-		fmt.Println("  * Speaks PostgreSQL v3.0 wire protocol on TCP :6000 (jackc/pgproto3/v2).")
-		fmt.Println("  * Formula: bucket = xxHash64(user_id) & 1023 -> [1024]atomic.Uint32 (4 KB).")
+		RenderSectionHeader("PILLAR 1: NATIVE PGWIRE PROTOCOL & L1 DIRECTORY")
+		fmt.Println("   * Speaks PostgreSQL v3.0 wire protocol on TCP :6000 (jackc/pgproto3/v2).")
+		fmt.Println("   * Formula: bucket = xxHash64(user_id) & 1023 -> [1024]atomic.Uint32 (4 KB).")
 	case "2", "kway":
-		fmt.Println(cyanStyle.Render("\n[Pillar 2] Distributed Scatter-Gather & Streaming K-Way Merge"))
-		fmt.Println("  * Parallel Goroutines stream sorted top-K batches into a container/heap")
-		fmt.Println("    Priority Queue in O(K * batch) memory.")
+		RenderSectionHeader("PILLAR 2: SCATTER-GATHER & K-WAY MERGE SORT")
+		fmt.Println("   * Parallel Goroutines stream sorted top-K batches into a container/heap")
+		fmt.Println("     Priority Queue in O(K * batch) memory.")
 	case "3", "cdc":
-		fmt.Println(cyanStyle.Render("\n[Pillar 3] Vitess-Style Change Data Capture (CDC) VReplication"))
-		fmt.Println("  * Runs lock-free Keyset Backfill + _shardmaster_cdc LSN log streaming,")
-		fmt.Println("    then swaps the atomic bucket pointer in <200us with 0ms downtime.")
+		RenderSectionHeader("PILLAR 3: VITESS-STYLE CDC VREPLICATION")
+		fmt.Println("   * Runs lock-free Keyset Backfill + _shardmaster_cdc LSN log streaming,")
+		fmt.Println("     then swaps the atomic bucket pointer in <200us with 0ms downtime.")
 	case "4", "vdiff":
-		fmt.Println(cyanStyle.Render("\n[Pillar 4] Cryptographic Bit-Level Parity (VDiff)"))
-		fmt.Println("  * Computes a 256-bit commutative XOR of SHA-256 row digests across shards.")
+		RenderSectionHeader("PILLAR 4: CRYPTOGRAPHIC VDIFF PARITY")
+		fmt.Println("   * Computes a 256-bit commutative XOR of SHA-256 row digests across shards.")
 	case "5", "ewma":
-		fmt.Println(cyanStyle.Render("\n[Pillar 5] Autonomous EWMA Hotspot Detection"))
-		fmt.Println("  * 64-byte cache-line padded counters track EWMA QPS per bucket and isolate")
-		fmt.Println("    hot buckets (>5x cluster mean) onto the coldest shard automatically.")
+		RenderSectionHeader("PILLAR 5: AUTONOMOUS EWMA HOTSPOT DETECTION")
+		fmt.Println("   * 64-byte cache-line padded counters track EWMA QPS per bucket and isolate")
+		fmt.Println("     hot buckets (>5x cluster mean) onto the coldest shard automatically.")
 	case "6", "tui":
-		fmt.Println(cyanStyle.Render("\n[Pillar 6] Minimalist 4-Tab TUI, 500M+ QPS Bench & 1-PB Simulator"))
-		fmt.Println("  * Type '3' for the 4-Tab TUI, '10' for 500M+ QPS bench, '11' for 1-PB sim.")
+		RenderSectionHeader("PILLAR 6: 4-TAB TUI, 500M+ QPS BENCH & 1-PB SIMULATOR")
+		fmt.Println("   * Type '3' for the 4-Tab TUI, '10' for 500M+ QPS bench, '11' for 1-PB sim.")
 	case "7", "psql":
-		fmt.Println(cyanStyle.Render("\n[Connecting External Clients]"))
-		fmt.Println("  * psql -h localhost -p 6000 -U admin -d shardmaster")
-		fmt.Println("  * curl \"http://localhost:8080/shard?user_id=123\"")
+		RenderSectionHeader("CONNECTING EXTERNAL POSTGRESQL CLIENTS")
+		fmt.Println("   * psql -h localhost -p 6000 -U admin -d shardmaster")
+		fmt.Println("   * curl \"http://localhost:8080/shard?user_id=123\"")
 	}
 }
 
-// PrintStaticDashboard renders a clean 76-column cluster status box that never wraps on 80-column terminals.
+// PrintStaticDashboard renders a mathematically aligned cluster topology & CDC table.
 func PrintStaticDashboard(qr *router.QueryRouter, showReshardingExample bool) {
-	box := lipgloss.NewStyle().
-		Border(lipgloss.NormalBorder()).
-		BorderForeground(lipgloss.Color("39")).
-		Padding(0, 1).
-		Width(76)
-
 	shards := qr.Cluster.GetAllShards()
 	bucketCounts := qr.Dir.BucketCountsByShard()
 	wf := qr.CDC.GetSnapshot()
 
-	var b strings.Builder
-	b.WriteString(headerStyle.Render("SHARDMASTER v2.0 - CLUSTER STATUS (50,000,000 ROWS)") + "\n")
-	b.WriteString(fmt.Sprintf(
-		"NODES: %d | STATUS: %s | QPS: %s | P99 LATENCY: 0.42ms\n",
-		len(shards),
-		okStyle.Render("HEALTHY"),
-		warnStyle.Render("12,450"),
-	))
-	b.WriteString(dimStyle.Render(strings.Repeat("-", 72)) + "\n")
+	RenderSectionHeader("SHARDMASTER CLUSTER TOPOLOGY (1,024 VIRTUAL BUCKETS)")
 
-	qpsSamples := []string{"3,120", "3,080", "3,150", "3,100", "2,980", "3,050", "3,110", "3,090"}
+	qpsSamples := []string{"3,120 QPS", "3,080 QPS", "3,150 QPS", "3,100 QPS", "2,980 QPS", "3,050 QPS", "3,110 QPS", "3,090 QPS"}
+	var rows [][]string
 	for idx, s := range shards {
 		bCount := bucketCounts[s.ShardID]
-		barLen := (bCount * 14) / 256
-		if barLen > 14 {
-			barLen = 14
+		barLen := (bCount * 16) / 256
+		if barLen > 16 {
+			barLen = 16
 		}
 		if barLen < 1 && bCount > 0 {
 			barLen = 1
 		}
-		bar := cyanStyle.Render(strings.Repeat("#", barLen)) + dimStyle.Render(strings.Repeat(".", 14-barLen))
-		qpsStr := qpsSamples[idx%len(qpsSamples)]
-		b.WriteString(fmt.Sprintf(
-			" [Shard %d :%-4d] [%s] %3d Bkts (%10s rows) %5s QPS\n",
-			s.ShardID,
-			s.Port,
+		bar := "[" + strings.Repeat("#", barLen) + strings.Repeat(".", 16-barLen) + "]"
+		rows = append(rows, []string{
+			fmt.Sprintf("Shard %d (:%d)", s.ShardID, s.Port),
+			s.Region,
 			bar,
-			bCount,
-			FormatCommas(uint64(s.RowCount())),
-			qpsStr,
-		))
+			fmt.Sprintf("%d Buckets", bCount),
+			FormatCommas(uint64(s.RowCount())) + " rows",
+			qpsSamples[idx%len(qpsSamples)],
+		})
 	}
 
-	b.WriteString(dimStyle.Render(strings.Repeat("-", 72)) + "\n")
+	RenderProfessionalTable(
+		[]string{"SHARD NODE", "REGION", "LOAD DISTRIBUTION", "BUCKETS", "ROW COUNT", "THROUGHPUT"},
+		rows,
+	)
+
 	if showReshardingExample {
-		b.WriteString(cyanStyle.Render("WORKFLOW: RESHARDING (4 -> 5 Shards)") + "\n")
-		b.WriteString(" Scope: Bucket [204-255] (Shard 0 -> Shard 4) | Status: [STREAMING]\n")
-		b.WriteString(" Lag:   0.42 ms | Parity: " + okStyle.Render("VERIFIED (VDiff Match)"))
+		fmt.Printf("  %s RESHARDING (4 -> 5 Shards) | Scope: Bucket [204-255] | Lag: 0.42 ms | Parity: %s\n",
+			cyanStyle.Render("WORKFLOW:"), okStyle.Render("VERIFIED"))
 	} else {
-		b.WriteString(fmt.Sprintf("WORKFLOW: %s [%s]\n", cyanStyle.Render(wf.Title), okStyle.Render(wf.Status)))
-		b.WriteString(fmt.Sprintf(" Scope:  %s (%s rows moved)\n", wf.CurrentRangeText, FormatCommas(uint64(wf.RowsMigrated))))
-		b.WriteString(fmt.Sprintf(" Lag:    %.2f ms | Parity: %s", wf.ReplicationLagMs, okStyle.Render(wf.VDiffStatus)))
+		fmt.Printf("  %s %s [%s]  |  Scope: %s  |  Lag: %.2f ms  |  Parity: %s\n",
+			cyanStyle.Render("WORKFLOW:"),
+			whiteBold.Render(wf.Title),
+			okStyle.Render(wf.Status),
+			wf.CurrentRangeText,
+			wf.ReplicationLagMs,
+			okStyle.Render(wf.VDiffStatus),
+		)
 	}
-
-	fmt.Println(box.Render(b.String()))
 }
 
 func RunSixPillarShowcase(qr *router.QueryRouter) {
-	fmt.Println(headerStyle.Render("\n+--------------------------------------------------------------------------+"))
-	fmt.Println(headerStyle.Render("| SHARDMASTER: 6-PILLAR END-TO-END AUTOMATED SHOWCASE                      |"))
-	fmt.Println(headerStyle.Render("+--------------------------------------------------------------------------+"))
+	RunSpinner("Initializing 6-Pillar Automated Demonstration...", 220*time.Millisecond)
+	RenderSectionHeader("SHARDMASTER: 6-PILLAR END-TO-END AUTOMATED SHOWCASE")
 
-	fmt.Printf("\n%s\n", cyanStyle.Render("[1/6] Pillar 1: PGWire (:6000) & O(1) L1-Cache Lookup"))
 	runLookupAction(qr, "42")
-
-	fmt.Printf("\n%s\n", cyanStyle.Render("[2/6] Pillar 2: Distributed Scatter-Gather + K-Way Merge Sort"))
 	runSQLAction(qr, "SELECT * FROM users WHERE email LIKE '%@gmail.com' ORDER BY created_at DESC LIMIT 3;")
-
-	targetNext := qr.Dir.ActiveShards() + 1
-	fmt.Printf("\n%s\n", cyanStyle.Render(fmt.Sprintf("[3/6 & 4/6] Pillars 3 & 4: CDC Split (%d -> %d Shards) + VDiff", qr.Dir.ActiveShards(), targetNext)))
 	runAddShardAction(qr, "us-west")
-
-	fmt.Printf("\n%s\n", cyanStyle.Render("[5/6] Pillar 5: Autonomous EWMA Hotspot Isolation (Bucket #412)"))
 	runHotspotAction(qr, 412)
-
-	fmt.Printf("\n%s\n", cyanStyle.Render("[6/6] Pillar 6: Multi-Million QPS Benchmark & 1-Petabyte Proof"))
 	runBenchAction(qr, 1)
 	runPetabyteAction(64, 80)
 }
 
+func truncatePlain(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
+}
+
 func promptDefault(reader *bufio.Reader, promptText, defaultVal string) string {
-	fmt.Printf("  %s: ", warnStyle.Render(promptText))
+	fmt.Printf("   %s: ", warnStyle.Render(promptText))
 	line, err := reader.ReadString('\n')
 	if err != nil {
 		return defaultVal

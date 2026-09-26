@@ -92,7 +92,7 @@ func (s *Server) handlePGClient(conn net.Conn) {
 	case *pgproto3.StartupMessage:
 		// Send AuthenticationOk, ParameterStatus headers, BackendKeyData, ReadyForQuery
 		_ = backend.Send(&pgproto3.AuthenticationOk{})
-		_ = backend.Send(&pgproto3.ParameterStatus{Name: "server_version", Value: "15.0-ShardMaster-PGWire-v2.0"})
+		_ = backend.Send(&pgproto3.ParameterStatus{Name: "server_version", Value: "15.0-ShardMaster-PGWire"})
 		_ = backend.Send(&pgproto3.ParameterStatus{Name: "client_encoding", Value: "UTF8"})
 		_ = backend.Send(&pgproto3.ParameterStatus{Name: "DateStyle", Value: "ISO, MDY"})
 		_ = backend.Send(&pgproto3.BackendKeyData{ProcessID: 6000, SecretKey: 424242})

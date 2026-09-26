@@ -1,4 +1,4 @@
-# SHARDMASTER v2.0: Distributed PostgreSQL Wire Proxy, CDC VReplication Engine, and Autonomous Resharding Control Plane
+# SHARDMASTER: Distributed PostgreSQL Wire Proxy, CDC VReplication Engine, and Autonomous Resharding Control Plane
 
 ShardMaster is a high-throughput distributed database sharding proxy, Change Data Capture (CDC) replication engine, and interactive terminal control plane written in Pure Go (Golang 1.22+). Modeled after production cloud-native sharding architectures such as Vitess (PlanetScale) and Citus, ShardMaster presents a cluster of isolated physical PostgreSQL nodes as a single logical database listening on port `6000` via the native PostgreSQL Frontend/Backend Wire Protocol v3.0 (`PGWire`).
 
