@@ -505,15 +505,24 @@ func RunInteractiveShell(qr *router.QueryRouter) {
 			upper := strings.ToUpper(input)
 			if strings.HasPrefix(input, `\`) ||
 				strings.HasPrefix(upper, "SELECT ") ||
+				strings.HasPrefix(upper, "WITH ") ||
 				strings.HasPrefix(upper, "INSERT ") ||
+				strings.HasPrefix(upper, "REPLACE ") ||
 				strings.HasPrefix(upper, "UPDATE ") ||
 				strings.HasPrefix(upper, "DELETE ") ||
+				strings.HasPrefix(upper, "TRUNCATE ") ||
 				strings.HasPrefix(upper, "SHOW ") ||
 				strings.HasPrefix(upper, "DESCRIBE") ||
 				strings.HasPrefix(upper, "DESC ") ||
 				upper == "DESC" ||
 				strings.HasPrefix(upper, "CREATE ") ||
+				strings.HasPrefix(upper, "ALTER ") ||
 				strings.HasPrefix(upper, "DROP ") ||
+				strings.HasPrefix(upper, "PRAGMA ") ||
+				strings.HasPrefix(upper, "VALUES ") ||
+				strings.HasPrefix(upper, "BEGIN") ||
+				strings.HasPrefix(upper, "COMMIT") ||
+				strings.HasPrefix(upper, "ROLLBACK") ||
 				strings.HasPrefix(upper, "EXPLAIN") ||
 				strings.HasPrefix(upper, "REBALANCE") ||
 				strings.HasPrefix(upper, "RUN VDIFF") {
@@ -535,7 +544,7 @@ func printMainMenu() {
 	fmt.Printf("   %s  %-22s %s\n", okStyle.Render("[2]"), whiteBold.Render("Cluster Status"), dimStyle.Render("View shard load bars, row counts & CDC lag"))
 	fmt.Printf("   %s  %-22s %s\n", okStyle.Render("[3]"), whiteBold.Render("Live Dashboard (TUI)"), dimStyle.Render("Open 4-Tab Terminal UI (fits any screen)"))
 	fmt.Printf("   %s  %-22s %s\n", cyanStyle.Render("[4]"), whiteBold.Render("Route User Key"), dimStyle.Render("Inspect O(1) xxHash64 & Virtual Bucket"))
-	fmt.Printf("   %s  %-22s %s\n", cyanStyle.Render("[5]"), whiteBold.Render("SQL & Schema Engine"), dimStyle.Render("Inspect table schemas, DDL & run 22 SQL presets"))
+	fmt.Printf("   %s  %-22s %s\n", cyanStyle.Render("[5]"), whiteBold.Render("100% Full SQL Engine"), dimStyle.Render("Schemas, DDL, JOINs, CTEs, Window Funcs & 26 Presets"))
 	fmt.Printf("   %s  %-22s %s\n", warnStyle.Render("[6]"), whiteBold.Render("Add Physical Shard"), dimStyle.Render("Add regional shard & stream buckets (CDC)"))
 	fmt.Printf("   %s  %-22s %s\n", warnStyle.Render("[7]"), whiteBold.Render("Zero-Downtime Split"), dimStyle.Render("Split cluster (4 -> 8 shards) with VDiff"))
 	fmt.Printf("   %s  %-22s %s\n", hotStyle.Render("[8]"), whiteBold.Render("Hotspot Self-Healer"), dimStyle.Render("Spike Bucket #412 & watch auto-isolation"))
@@ -611,7 +620,7 @@ func runLookupAction(qr *router.QueryRouter, key string) {
 var sqlPresets = map[string]string{
 	"1":  "SHOW TABLES;",
 	"2":  "DESCRIBE users;",
-	"3":  "DESCRIBE _shardmaster_cdc;",
+	"3":  "DESCRIBE orders;",
 	"4":  "SHOW CREATE TABLE users;",
 	"5":  "SHOW INDEXES;",
 	"6":  "SHOW SHARDS;",
@@ -631,16 +640,20 @@ var sqlPresets = map[string]string{
 	"20": "UPDATE users SET name = 'Grace Hopper', balance_usd = 12500.00 WHERE user_id = 42;",
 	"21": "DELETE FROM users WHERE user_id = 100;",
 	"22": "SELECT * FROM _shardmaster_cdc LIMIT 6;",
+	"23": "SELECT u.shard_id, u.user_id, u.name, o.order_id, o.product_name, o.amount_usd, p.payment_method FROM users u INNER JOIN orders o ON u.user_id = o.user_id INNER JOIN payments p ON o.order_id = p.order_id ORDER BY o.amount_usd DESC LIMIT 6;",
+	"24": "SELECT shard_id, user_id, name, region, balance_usd, RANK() OVER (PARTITION BY region ORDER BY balance_cents DESC) AS regional_rank FROM users LIMIT 8;",
+	"25": "WITH high_value AS (SELECT * FROM users WHERE balance_cents >= 500000) SELECT region, COUNT(*) AS vip_users, ROUND(AVG(balance_usd), 2) AS avg_vip_usd, MAX(balance_usd) AS max_vip_usd FROM high_value GROUP BY region HAVING COUNT(*) >= 5 ORDER BY avg_vip_usd DESC;",
+	"26": "SELECT user_id, name, balance_usd, xxhash64(user_id) AS xxhash64_hex, virtual_bucket(user_id) AS bucket_id, target_shard(user_id) AS routed_shard FROM users WHERE balance_cents > (SELECT AVG(balance_cents) FROM users) ORDER BY balance_cents DESC LIMIT 6;",
 }
 
 func runInteractiveSQLMenu(qr *router.QueryRouter, reader *bufio.Reader) {
-	RunSpinner("Opening Distributed SQL & Schema Explorer...", 160*time.Millisecond)
-	RenderSectionHeader("DISTRIBUTED SQL & SCHEMA ENGINE (50,000,000 ROWS)")
+	RunSpinner("Opening 100% Full Distributed SQL & Schema Engine...", 160*time.Millisecond)
+	RenderSectionHeader("100% FULL DISTRIBUTED SQL & SCHEMA ENGINE (26 PRESETS)")
 
 	fmt.Printf("   %-36s %s\n", cyanStyle.Render("SCHEMA & DDL CATALOG"), cyanStyle.Render("POINT, BATCH & K-WAY MERGE"))
-	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[1] "), "SHOW TABLES (All 5 Tables)", warnStyle.Render("[13]"), "Point Lookup (user_id = 42)")
+	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[1] "), "SHOW TABLES (All 8 Tables/Views)", warnStyle.Render("[13]"), "Point Lookup (user_id = 42)")
 	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[2] "), "DESCRIBE users (Full Schema)", warnStyle.Render("[14]"), "Multi-Key IN (42, 100, 777..)")
-	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[3] "), "DESCRIBE _shardmaster_cdc", warnStyle.Render("[15]"), "K-Way Merge (@gmail.com Top 5)")
+	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[3] "), "DESCRIBE orders (Co-Located)", warnStyle.Render("[15]"), "K-Way Merge (@gmail.com Top 5)")
 	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[4] "), "SHOW CREATE TABLE users (DDL)", warnStyle.Render("[16]"), "K-Way Merge (region = us-west)")
 	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[5] "), "SHOW INDEXES (Global & Local)", warnStyle.Render("[17]"), "GROUP BY region (Map-Reduce)")
 	fmt.Println(dimStyle.Render("  ------------------------------------------------------------------------"))
@@ -653,11 +666,13 @@ func runInteractiveSQLMenu(qr *router.QueryRouter, reader *bufio.Reader) {
 	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[11]"), "RUN VDIFF (XOR-SHA256 Audit)", cyanStyle.Render("[schema]"), "Run All Schema Views (1-5)")
 	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[12]"), "EXPLAIN ANALYZE Query Plan", cyanStyle.Render("[all]   "), "Run Full Diagnostic Suite")
 	fmt.Println(dimStyle.Render("  ------------------------------------------------------------------------"))
-	fmt.Printf("   Or type any custom SQL (e.g. %s or %s)\n",
-		warnStyle.Render("CREATE TABLE orders (order_id BIGINT PRIMARY KEY, amount INT);"),
-		warnStyle.Render("DESCRIBE _shardmaster_buckets;"))
+	fmt.Printf("   %-36s %s\n", cyanStyle.Render("ADVANCED RELATIONAL SQL (JOINs, WINDOW, CTEs)"), cyanStyle.Render("SUBQUERIES & HASH FUNCTIONS"))
+	fmt.Printf("   %s %-31s %s %s\n", hotStyle.Render("[23]"), "3-Table Co-Located INNER JOIN", hotStyle.Render("[25]"), "WITH CTE + GROUP BY + HAVING")
+	fmt.Printf("   %s %-31s %s %s\n", hotStyle.Render("[24]"), "Window RANK() OVER (PARTITION)", hotStyle.Render("[26]"), "Subquery + xxhash64() Funcs")
+	fmt.Println(dimStyle.Render("  ------------------------------------------------------------------------"))
+	fmt.Printf("   Or type ANY valid SQL statement (JOIN, CTE, Window, View, Trigger, ALTER, etc.)\n")
 
-	choice := promptDefault(reader, "Select [1-22, 'schema', 'all', or custom SQL] [default: 2]", "2")
+	choice := promptDefault(reader, "Select [1-26, 'schema', 'all', or ANY SQL] [default: 23]", "23")
 	runSQLPresetOrQuery(qr, choice)
 }
 
@@ -675,7 +690,7 @@ func runSQLPresetOrQuery(qr *router.QueryRouter, choice string) {
 			runSQLAction(qr, sqlPresets[id])
 		}
 	case "all", "0":
-		for _, id := range []string{"1", "2", "6", "7", "12", "13", "15", "17"} {
+		for _, id := range []string{"1", "2", "6", "12", "13", "15", "23", "24", "25", "26"} {
 			runSQLAction(qr, sqlPresets[id])
 		}
 	default:

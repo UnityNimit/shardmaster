@@ -36,6 +36,7 @@ type QueryRouter struct {
 	CDC            *cdc.Engine
 	HotspotTracker *hotspot.Tracker
 	Schema         *SchemaCatalog
+	SQL            *RelationalEngine
 
 	TotalQueries   atomic.Uint64
 	PointQueries   atomic.Uint64
@@ -48,12 +49,14 @@ func NewQueryRouter(
 	cdcEngine *cdc.Engine,
 	tracker *hotspot.Tracker,
 ) *QueryRouter {
+	schema := NewSchemaCatalog()
 	return &QueryRouter{
 		Dir:            dir,
 		Cluster:        cluster,
 		CDC:            cdcEngine,
 		HotspotTracker: tracker,
-		Schema:         NewSchemaCatalog(),
+		Schema:         schema,
+		SQL:            NewRelationalEngine(dir, cluster, schema),
 	}
 }
 
@@ -159,6 +162,9 @@ func (qr *QueryRouter) ExecuteSQL(sql string) (*ResultSet, error) {
 
 	case QueryDescribeTable:
 		t, ok := qr.Schema.GetTable(cq.TableName)
+		if !ok && qr.SQL != nil {
+			t, ok = qr.SQL.IntrospectDynamicTable(cq.TableName)
+		}
 		if !ok {
 			return nil, fmt.Errorf("table '%s' not found in catalog (run 'SHOW TABLES;' to list all tables)", cq.TableName)
 		}
@@ -197,6 +203,9 @@ func (qr *QueryRouter) ExecuteSQL(sql string) (*ResultSet, error) {
 
 	case QueryShowCreateTable:
 		t, ok := qr.Schema.GetTable(cq.TableName)
+		if !ok && qr.SQL != nil {
+			t, ok = qr.SQL.IntrospectDynamicTable(cq.TableName)
+		}
 		if !ok {
 			return nil, fmt.Errorf("table '%s' not found in catalog", cq.TableName)
 		}
@@ -259,6 +268,9 @@ func (qr *QueryRouter) ExecuteSQL(sql string) (*ResultSet, error) {
 		if err != nil {
 			return nil, err
 		}
+		if qr.SQL != nil {
+			_, _ = qr.SQL.ExecuteFullSQL(cq.RawSQL)
+		}
 		return &ResultSet{
 			Title:       fmt.Sprintf("CREATED SHARDED TABLE: %s.%s", strings.ToUpper(t.SchemaName), strings.ToUpper(t.TableName)),
 			Columns:     []string{"schema", "table_name", "shard_key", "sharding_strategy", "virtual_buckets", "columns", "status"},
@@ -277,7 +289,7 @@ func (qr *QueryRouter) ExecuteSQL(sql string) (*ResultSet, error) {
 			RoutedShard:   "ALL_SHARDS_DDL",
 			ExecutionPlan: fmt.Sprintf("2-Phase Distributed DDL Broadcast -> %d Physical Shards (%d Virtual Buckets)", qr.Dir.ActiveShards(), t.VirtualBuckets),
 			FooterNotes: []string{
-				fmt.Sprintf("Run 'DESCRIBE %s;' or 'SHOW CREATE TABLE %s;' to inspect the newly created table schema.", t.TableName, t.TableName),
+				fmt.Sprintf("Run 'DESCRIBE %s;' or 'INSERT INTO %s ...' to query the newly created sharded table.", t.TableName, t.TableName),
 			},
 		}, nil
 
@@ -285,6 +297,9 @@ func (qr *QueryRouter) ExecuteSQL(sql string) (*ResultSet, error) {
 		dropped, err := qr.Schema.DropCustomTable(cq.TableName)
 		if err != nil {
 			return nil, err
+		}
+		if qr.SQL != nil {
+			_, _ = qr.SQL.ExecuteFullSQL(cq.RawSQL)
 		}
 		return &ResultSet{
 			Title:         "DROP DISTRIBUTED TABLE",
@@ -769,6 +784,9 @@ func (qr *QueryRouter) ExecuteSQL(sql string) (*ResultSet, error) {
 			BalanceCents: cq.BalanceCents,
 			BucketID:     bucket,
 		}, true)
+		if qr.SQL != nil {
+			qr.SQL.SyncUserUpsert(shard.ShardID, saved)
+		}
 
 		return &ResultSet{
 			Title:         fmt.Sprintf("POINT INSERT / UPSERT + CDC APPEND (user_id = %d)", cq.UserID),
@@ -827,6 +845,9 @@ func (qr *QueryRouter) ExecuteSQL(sql string) (*ResultSet, error) {
 		existing.UpdatedAt = time.Now().UTC()
 
 		saved := shard.UpsertUser(existing, true)
+		if qr.SQL != nil {
+			qr.SQL.SyncUserUpsert(shard.ShardID, saved)
+		}
 		return &ResultSet{
 			Title:         fmt.Sprintf("POINT UPDATE + CDC LOG APPEND (user_id = %d)", cq.UserID),
 			Columns:       userTableColumns(),
@@ -848,6 +869,9 @@ func (qr *QueryRouter) ExecuteSQL(sql string) (*ResultSet, error) {
 		if ok && shard.DeleteUser(cq.UserID, true) {
 			deleted = 1
 		}
+		if qr.SQL != nil {
+			qr.SQL.SyncUserDelete(cq.UserID)
+		}
 		return &ResultSet{
 			Title:         fmt.Sprintf("POINT TOMBSTONE DELETE + CDC APPEND (user_id = %d)", cq.UserID),
 			Columns:       []string{"deleted", "user_id", "bucket_id", "shard_id", "cdc_lsn_appended"},
@@ -858,6 +882,10 @@ func (qr *QueryRouter) ExecuteSQL(sql string) (*ResultSet, error) {
 			RoutedShard:   fmt.Sprintf("Shard %d (Bucket #%d)", shardID, bucket),
 			ExecutionPlan: fmt.Sprintf("O(1) Tombstone Marker on Bucket #%d + _shardmaster_cdc LSN #%d", bucket, shard.CurrentLSN()),
 		}, nil
+
+	case QueryFullRelationalSQL:
+		qr.ScatterQueries.Add(1)
+		return qr.SQL.ExecuteFullSQL(sql)
 
 	case QueryCountAggregate:
 		qr.ScatterQueries.Add(1)

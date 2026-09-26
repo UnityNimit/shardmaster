@@ -177,30 +177,50 @@ func TestSQLEngineSchemasAndQueries(t *testing.T) {
 	tracker := hotspot.NewTracker(dir, cluster, cdcEngine)
 	qr := router.NewQueryRouter(dir, cluster, cdcEngine, tracker)
 
-	// 1. SHOW TABLES
+	// 1. SHOW TABLES (users, orders, payments, vip_users_view + _shardmaster_* tables)
 	res, err := qr.ExecuteSQL("SHOW TABLES;")
-	if err != nil || len(res.Rows) < 5 {
-		t.Fatalf("expected >= 5 tables from SHOW TABLES, got err=%v rows=%d", err, len(res.Rows))
+	if err != nil || len(res.Rows) < 8 {
+		t.Fatalf("expected >= 8 tables from SHOW TABLES, got err=%v rows=%d", err, len(res.Rows))
 	}
 
-	// 2. DESCRIBE users
+	// 2. DESCRIBE users (11 cols), DESCRIBE orders (11 cols), DESCRIBE payments (9 cols)
 	res, err = qr.ExecuteSQL("DESCRIBE users;")
 	if err != nil || len(res.Rows) != 11 {
 		t.Fatalf("expected 11 columns from DESCRIBE users, got err=%v rows=%d", err, len(res.Rows))
 	}
-
-	// 3. CREATE TABLE + DESCRIBE + DROP TABLE
-	_, err = qr.ExecuteSQL("CREATE TABLE orders (order_id BIGINT PRIMARY KEY, user_id BIGINT, amount_cents BIGINT);")
-	if err != nil {
-		t.Fatalf("CREATE TABLE orders failed: %v", err)
-	}
 	res, err = qr.ExecuteSQL("DESCRIBE orders;")
-	if err != nil || len(res.Rows) != 3 {
-		t.Fatalf("expected 3 columns from DESCRIBE orders, got err=%v rows=%d", err, len(res.Rows))
+	if err != nil || len(res.Rows) != 11 {
+		t.Fatalf("expected 11 columns from DESCRIBE orders, got err=%v rows=%d", err, len(res.Rows))
 	}
-	_, err = qr.ExecuteSQL("DROP TABLE orders;")
+	res, err = qr.ExecuteSQL("DESCRIBE payments;")
+	if err != nil || len(res.Rows) != 9 {
+		t.Fatalf("expected 9 columns from DESCRIBE payments, got err=%v rows=%d", err, len(res.Rows))
+	}
+
+	// 3. Full Custom DDL + DML: CREATE TABLE + INSERT + ALTER TABLE + SELECT + DESCRIBE + DROP TABLE
+	_, err = qr.ExecuteSQL("CREATE TABLE invoices (invoice_id BIGINT PRIMARY KEY, user_id BIGINT NOT NULL, amount_usd NUMERIC(12,2) DEFAULT 99.50);")
 	if err != nil {
-		t.Fatalf("DROP TABLE orders failed: %v", err)
+		t.Fatalf("CREATE TABLE invoices failed: %v", err)
+	}
+	_, err = qr.ExecuteSQL("INSERT INTO invoices (invoice_id, user_id, amount_usd) VALUES (9001, 42, 1450.75), (9002, 777, 3200.00);")
+	if err != nil {
+		t.Fatalf("INSERT INTO invoices failed: %v", err)
+	}
+	_, err = qr.ExecuteSQL("ALTER TABLE invoices ADD COLUMN status VARCHAR(32) DEFAULT 'PAID';")
+	if err != nil {
+		t.Fatalf("ALTER TABLE invoices failed: %v", err)
+	}
+	res, err = qr.ExecuteSQL("DESCRIBE invoices;")
+	if err != nil || len(res.Rows) != 4 {
+		t.Fatalf("expected 4 columns from DESCRIBE invoices after ALTER TABLE, got err=%v rows=%d", err, len(res.Rows))
+	}
+	res, err = qr.ExecuteSQL("SELECT i.invoice_id, u.name, i.amount_usd, i.status FROM invoices i INNER JOIN users u ON u.user_id = i.user_id ORDER BY i.invoice_id;")
+	if err != nil || len(res.Rows) != 2 {
+		t.Fatalf("expected 2 joined rows from invoices JOIN users, got err=%v rows=%d", err, len(res.Rows))
+	}
+	_, err = qr.ExecuteSQL("DROP TABLE invoices;")
+	if err != nil {
+		t.Fatalf("DROP TABLE invoices failed: %v", err)
 	}
 
 	// 4. Column projection + Multi-Key Batch IN (...)
@@ -215,7 +235,31 @@ func TestSQLEngineSchemasAndQueries(t *testing.T) {
 		t.Fatalf("expected 4 regional groups, got err=%v rows=%d", err, len(res.Rows))
 	}
 
-	// 6. UPDATE + CDC Journal Query
+	// 6. 3-Table Co-Located INNER JOIN (users + orders + payments)
+	res, err = qr.ExecuteSQL("SELECT u.shard_id, u.user_id, u.name, o.order_id, o.product_name, o.amount_usd, p.payment_method FROM users u INNER JOIN orders o ON u.user_id = o.user_id INNER JOIN payments p ON o.order_id = p.order_id ORDER BY o.amount_usd DESC LIMIT 5;")
+	if err != nil || len(res.Rows) != 5 {
+		t.Fatalf("expected 5 rows from 3-table INNER JOIN, got err=%v rows=%d", err, len(res.Rows))
+	}
+
+	// 7. Window Function RANK() OVER (PARTITION BY region ORDER BY balance_cents DESC)
+	res, err = qr.ExecuteSQL("SELECT shard_id, user_id, name, region, balance_usd, RANK() OVER (PARTITION BY region ORDER BY balance_cents DESC) AS regional_rank FROM users LIMIT 8;")
+	if err != nil || len(res.Rows) != 8 {
+		t.Fatalf("expected 8 rows from Window Function query, got err=%v rows=%d", err, len(res.Rows))
+	}
+
+	// 8. Common Table Expression (WITH CTE + GROUP BY + HAVING)
+	res, err = qr.ExecuteSQL("WITH high_value AS (SELECT * FROM users WHERE balance_cents >= 500000) SELECT region, COUNT(*) AS vip_users, ROUND(AVG(balance_usd), 2) AS avg_vip_usd, MAX(balance_usd) AS max_vip_usd FROM high_value GROUP BY region HAVING COUNT(*) >= 5 ORDER BY avg_vip_usd DESC;")
+	if err != nil || len(res.Rows) == 0 {
+		t.Fatalf("expected rows from WITH CTE + HAVING query, got err=%v rows=%d", err, len(res.Rows))
+	}
+
+	// 9. Subquery + Custom Scalar Functions xxhash64(), virtual_bucket(), target_shard()
+	res, err = qr.ExecuteSQL("SELECT user_id, name, balance_usd, xxhash64(user_id) AS xxhash64_hex, virtual_bucket(user_id) AS bucket_id, target_shard(user_id) AS routed_shard FROM users WHERE balance_cents > (SELECT AVG(balance_cents) FROM users) ORDER BY balance_cents DESC LIMIT 6;")
+	if err != nil || len(res.Rows) != 6 {
+		t.Fatalf("expected 6 rows from Subquery + custom hash functions, got err=%v rows=%d", err, len(res.Rows))
+	}
+
+	// 10. UPDATE + CDC Journal Query
 	_, err = qr.ExecuteSQL("UPDATE users SET name = 'Grace Hopper', balance_usd = 12500.00 WHERE user_id = 42;")
 	if err != nil {
 		t.Fatalf("UPDATE users failed: %v", err)

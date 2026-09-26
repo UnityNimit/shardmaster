@@ -34,6 +34,7 @@ const (
 	QueryExplainAnalyze
 	QueryAdminRebalance
 	QueryAdminVDiff
+	QueryFullRelationalSQL
 	QuerySystemCatalog
 )
 
@@ -216,6 +217,12 @@ func ClassifySQL(sql string) ClassifiedQuery {
 		strings.HasPrefix(upper, "SHOW VDIFF") ||
 		strings.Contains(upper, "_SHARDMASTER_VDIFF") {
 		return ClassifiedQuery{Kind: QueryAdminVDiff, RawSQL: trimmed}
+	}
+
+	// 4b. Route any general / complex relational SQL (JOINs, CTEs, Window Functions, Subqueries,
+	// Views, Indexes, ALTER TABLE, custom tables, functions, or complex predicates) to the 100% Full SQL Engine
+	if shouldUseFullRelationalEngine(trimmed, upper) {
+		return ClassifiedQuery{Kind: QueryFullRelationalSQL, RawSQL: trimmed}
 	}
 
 	// 5. Data Mutations: INSERT, UPDATE, DELETE
@@ -572,3 +579,70 @@ func readToken(s string) string {
 	}
 	return b.String()
 }
+
+// shouldUseFullRelationalEngine returns true if the SQL statement uses relational constructs
+// beyond the single-table `users` fast-path (such as JOINs, CTEs, Window Functions, Subqueries,
+// Views, Indexes, ALTER TABLE, custom tables, scalar functions, HAVING, CASE WHEN, or complex WHERE predicates).
+func shouldUseFullRelationalEngine(trimmed string, upper string) bool {
+	for _, prefix := range []string{
+		"WITH ", "PRAGMA ", "VALUES ", "ALTER ", "CREATE VIEW", "CREATE OR REPLACE VIEW",
+		"DROP VIEW", "CREATE INDEX", "CREATE UNIQUE INDEX", "DROP INDEX",
+		"CREATE TRIGGER", "DROP TRIGGER", "TRUNCATE ", "REPLACE INTO", "SAVEPOINT ", "RELEASE ",
+	} {
+		if strings.HasPrefix(upper, prefix) {
+			return true
+		}
+	}
+
+	// SELECT without FROM (e.g. SELECT 1+1, xxhash64('42'), now())
+	if strings.HasPrefix(upper, "SELECT ") && !strings.Contains(upper, " FROM ") {
+		return true
+	}
+
+	// Check if query contains advanced SQL keywords/functions
+	for _, kw := range []string{
+		" JOIN ", " OVER (", " OVER(", "(SELECT ", " UNION ", " INTERSECT ", " EXCEPT ",
+		" HAVING ", " DISTINCT ", " OFFSET ", " CASE ", " COALESCE(", " IFNULL(", " NULLIF(", " IIF(",
+		" ROUND(", " ABS(", " UPPER(", " LOWER(", " SUBSTR(", " LENGTH(", " REPLACE(", " TRIM(",
+		" PRINTF(", " CAST(", " GROUP_CONCAT(", " JSON_", " STRFTIME(", " DATETIME(", " DATE(",
+		" XXHASH64(", " VIRTUAL_BUCKET(", " TARGET_SHARD(", " NOW(", " ON CONFLICT", " RETURNING ",
+		" IS NULL", " IS NOT NULL", " NOT IN", " NOT LIKE", " OR ", " != ", " <> ", " >= ", " <= ", " > ", " < ",
+	} {
+		if strings.Contains(upper, kw) {
+			return true
+		}
+	}
+
+	// Check if target table in FROM / INSERT INTO / UPDATE / DELETE FROM is a table other than `users`
+	targetTbl := extractPrimaryTableName(trimmed, upper)
+	if targetTbl != "" && targetTbl != "users" && !strings.HasPrefix(targetTbl, "_shardmaster_") {
+		return true
+	}
+
+	return false
+}
+
+func extractPrimaryTableName(trimmed string, upper string) string {
+	var rest string
+	switch {
+	case strings.HasPrefix(upper, "INSERT INTO "):
+		rest = strings.TrimSpace(trimmed[len("INSERT INTO "):])
+	case strings.HasPrefix(upper, "UPDATE "):
+		rest = strings.TrimSpace(trimmed[len("UPDATE "):])
+	case strings.HasPrefix(upper, "DELETE FROM "):
+		rest = strings.TrimSpace(trimmed[len("DELETE FROM "):])
+	default:
+		if idx := strings.Index(upper, " FROM "); idx != -1 {
+			rest = strings.TrimSpace(trimmed[idx+6:])
+		}
+	}
+	if rest == "" {
+		return ""
+	}
+	tok := strings.ToLower(strings.Trim(readToken(rest), "\"'`("))
+	if dot := strings.LastIndexByte(tok, '.'); dot != -1 {
+		tok = tok[dot+1:]
+	}
+	return tok
+}
+

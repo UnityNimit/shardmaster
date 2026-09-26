@@ -677,7 +677,7 @@ func (cs *ClusterStorage) SeedCluster(
 				}
 				balances := make([]uint32, slabSize)
 				for i := 0; i < slabSize; i++ {
-					balances[i] = uint32(10000 + ((int(b)*31 + i*137) % 900000))
+					balances[i] = uint32(10000 + ((int(b)*17389 + i*7919) % 900000))
 				}
 
 				// Compute initial 256-bit cryptographic Merkle/VDiff digest for this bucket slab
