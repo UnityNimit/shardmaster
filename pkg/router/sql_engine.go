@@ -1,8 +1,11 @@
 package router
 
 import (
+	"crypto/md5"
+	"crypto/sha256"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/hex"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -39,6 +42,71 @@ func ensureCustomSQLFunctions(dir *directory.ShardDirectory) {
 		})
 		_ = sqlite.RegisterScalarFunction("now", 0, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
 			return time.Now().UTC().Format("2006-01-02 15:04:05"), nil
+		})
+		_ = sqlite.RegisterDeterministicScalarFunction("concat", -1, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			var b strings.Builder
+			for _, a := range args {
+				if a != nil {
+					b.WriteString(fmt.Sprintf("%v", a))
+				}
+			}
+			return b.String(), nil
+		})
+		_ = sqlite.RegisterDeterministicScalarFunction("left", 2, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			s := fmt.Sprintf("%v", args[0])
+			n, _ := strconv.Atoi(fmt.Sprintf("%v", args[1]))
+			runes := []rune(s)
+			if n <= 0 {
+				return "", nil
+			}
+			if n >= len(runes) {
+				return s, nil
+			}
+			return string(runes[:n]), nil
+		})
+		_ = sqlite.RegisterDeterministicScalarFunction("right", 2, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			s := fmt.Sprintf("%v", args[0])
+			n, _ := strconv.Atoi(fmt.Sprintf("%v", args[1]))
+			runes := []rune(s)
+			if n <= 0 {
+				return "", nil
+			}
+			if n >= len(runes) {
+				return s, nil
+			}
+			return string(runes[len(runes)-n:]), nil
+		})
+		_ = sqlite.RegisterDeterministicScalarFunction("reverse", 1, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			runes := []rune(fmt.Sprintf("%v", args[0]))
+			for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
+				runes[i], runes[j] = runes[j], runes[i]
+			}
+			return string(runes), nil
+		})
+		_ = sqlite.RegisterDeterministicScalarFunction("split_part", 3, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			s := fmt.Sprintf("%v", args[0])
+			sep := fmt.Sprintf("%v", args[1])
+			idx, _ := strconv.Atoi(fmt.Sprintf("%v", args[2]))
+			parts := strings.Split(s, sep)
+			if idx < 1 || idx > len(parts) {
+				return "", nil
+			}
+			return parts[idx-1], nil
+		})
+		_ = sqlite.RegisterDeterministicScalarFunction("md5", 1, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			sum := md5.Sum([]byte(fmt.Sprintf("%v", args[0])))
+			return hex.EncodeToString(sum[:]), nil
+		})
+		_ = sqlite.RegisterDeterministicScalarFunction("sha256", 1, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			sum := sha256.Sum256([]byte(fmt.Sprintf("%v", args[0])))
+			return hex.EncodeToString(sum[:]), nil
+		})
+		_ = sqlite.RegisterScalarFunction("gen_random_uuid", 0, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			ns := time.Now().UnixNano()
+			h1 := hash.HashKey(fmt.Sprintf("uuid_%d", ns))
+			h2 := hash.HashKey(fmt.Sprintf("uuid_salt_%d", ns+1))
+			return fmt.Sprintf("%08x-%04x-4%03x-8%03x-%012x",
+				uint32(h1>>32), uint16(h1>>16), uint16(h1)&0x0fff, uint16(h2>>48)&0x0fff, h2&0xffffffffffff), nil
 		})
 	})
 }
@@ -676,17 +744,39 @@ func (re *RelationalEngine) introspectLocked(tableName string) (*TableSchema, bo
 	}, true
 }
 
-var pgCastRe = regexp.MustCompile(`::[a-zA-Z0-9_]+(\([0-9,]+\))?`)
+var (
+	pgCastRe        = regexp.MustCompile(`::[a-zA-Z0-9_]+(\([0-9,]+\))?`)
+	pgSchemaRe      = regexp.MustCompile(`(?i)\b(public|shardmaster)\.`)
+	pgIlikeRe       = regexp.MustCompile(`(?i)\bILIKE\b`)
+	pgSerialRe      = regexp.MustCompile(`(?i)\b(BIGSERIAL|SMALLSERIAL|SERIAL)\b`)
+	pgStringAggRe   = regexp.MustCompile(`(?i)\bSTRING_AGG\s*\(`)
+	pgGreatestRe    = regexp.MustCompile(`(?i)\bGREATEST\s*\(`)
+	pgLeastRe       = regexp.MustCompile(`(?i)\bLEAST\s*\(`)
+	pgShardByTailRe = regexp.MustCompile(`(?is)\)\s*SHARD\s+BY\b.*$`)
+)
 
 func normalizePostgresSQL(sqlStr string) string {
 	out := sqlStr
+	// Strip PostgreSQL public. / shardmaster. schema prefixes so SQLite resolves tables in main
+	out = pgSchemaRe.ReplaceAllString(out, "")
 	// Replace PostgreSQL ILIKE with case-insensitive LIKE
-	out = regexp.MustCompile(`(?i)\bILIKE\b`).ReplaceAllString(out, "LIKE")
+	out = pgIlikeRe.ReplaceAllString(out, "LIKE")
+	// Replace BIGSERIAL / SERIAL with INTEGER
+	out = pgSerialRe.ReplaceAllString(out, "INTEGER")
+	// Replace STRING_AGG( with GROUP_CONCAT(
+	out = pgStringAggRe.ReplaceAllString(out, "GROUP_CONCAT(")
+	// Replace GREATEST( and LEAST( with MAX( and MIN(
+	out = pgGreatestRe.ReplaceAllString(out, "MAX(")
+	out = pgLeastRe.ReplaceAllString(out, "MIN(")
 	// Strip PostgreSQL ::type casts so standard SQL expressions evaluate cleanly
 	out = pgCastRe.ReplaceAllString(out, "")
+	// Strip trailing ShardMaster DDL extension `) SHARD BY HASH ...` if present on CREATE TABLE
+	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(out)), "CREATE ") && pgShardByTailRe.MatchString(out) {
+		out = pgShardByTailRe.ReplaceAllString(out, ");")
+	}
 	// Handle TRUNCATE TABLE <name>
 	trimmed := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(out), ";"))
-	upper := strings.ToUpper(trimmed)
+	upper := NormalizeSQLWhitespace(strings.ToUpper(trimmed))
 	if strings.HasPrefix(upper, "TRUNCATE TABLE ") {
 		tbl := strings.TrimSpace(trimmed[len("TRUNCATE TABLE "):])
 		return "DELETE FROM " + tbl + ";"

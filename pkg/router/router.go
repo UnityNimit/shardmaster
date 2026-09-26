@@ -71,8 +71,36 @@ func (qr *QueryRouter) RouteFastPoint(userID int64) (shardID uint32, bucket uint
 	return shardID, bucket
 }
 
-// ExecuteSQL parses, routes, and executes any SQL statement coming over PGWire (:6000) or CLI.
+// ExecuteSQL parses, routes, and executes any SQL statement (or multi-statement SQL script)
+// coming over PGWire (:6000) or the interactive CLI.
 func (qr *QueryRouter) ExecuteSQL(sql string) (*ResultSet, error) {
+	stmts := SplitSQLStatements(sql)
+	if len(stmts) > 1 {
+		var batchNotes []string
+		var lastRes *ResultSet
+		for i, stmt := range stmts {
+			res, err := qr.executeSingleSQL(stmt)
+			if err != nil {
+				return nil, fmt.Errorf("statement %d (%s): %v", i+1, stmt, err)
+			}
+			lastRes = res
+			if i < len(stmts)-1 {
+				batchNotes = append(batchNotes, fmt.Sprintf("Batch Step %d/%d [%s]: %s (%d us)",
+					i+1, len(stmts), res.CommandTag, res.Title, res.LatencyUs))
+			}
+		}
+		if lastRes != nil && len(batchNotes) > 0 {
+			lastRes.FooterNotes = append(batchNotes, lastRes.FooterNotes...)
+		}
+		return lastRes, nil
+	}
+	if len(stmts) == 1 {
+		return qr.executeSingleSQL(stmts[0])
+	}
+	return qr.executeSingleSQL(sql)
+}
+
+func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 	start := time.Now()
 	qr.TotalQueries.Add(1)
 	cq := ClassifySQL(sql)
@@ -264,12 +292,14 @@ func (qr *QueryRouter) ExecuteSQL(sql string) (*ResultSet, error) {
 		}, nil
 
 	case QueryCreateTable:
-		t, err := qr.Schema.CreateCustomTable(cq.RawSQL)
+		if qr.SQL != nil {
+			if _, sqlErr := qr.SQL.ExecuteFullSQL(sql); sqlErr != nil {
+				return nil, sqlErr
+			}
+		}
+		t, err := qr.Schema.CreateCustomTable(sql)
 		if err != nil {
 			return nil, err
-		}
-		if qr.SQL != nil {
-			_, _ = qr.SQL.ExecuteFullSQL(cq.RawSQL)
 		}
 		return &ResultSet{
 			Title:       fmt.Sprintf("CREATED SHARDED TABLE: %s.%s", strings.ToUpper(t.SchemaName), strings.ToUpper(t.TableName)),

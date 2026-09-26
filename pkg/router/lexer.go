@@ -60,9 +60,14 @@ type ClassifiedQuery struct {
 	TargetShards   uint32
 }
 
-// ClassifySQL parses a SQL statement with fast zero-regex string scanning.
+// ClassifySQL parses a SQL statement with fast zero-regex string scanning,
+// normalizing multi-line [Shift+Enter] newlines, [Tab] indentation, and SQL comments.
 func ClassifySQL(sql string) ClassifiedQuery {
-	trimmed := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(sql), ";"))
+	rawTrimmed := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(sql), ";"))
+	trimmed := NormalizeSQLWhitespace(rawTrimmed)
+	if trimmed == "" {
+		trimmed = rawTrimmed
+	}
 	upper := strings.ToUpper(trimmed)
 
 	// 1. psql backslash meta-commands (\dt, \d, \di, \dn, \l)
@@ -586,8 +591,9 @@ func readToken(s string) string {
 func shouldUseFullRelationalEngine(trimmed string, upper string) bool {
 	for _, prefix := range []string{
 		"WITH ", "PRAGMA ", "VALUES ", "ALTER ", "CREATE VIEW", "CREATE OR REPLACE VIEW",
-		"DROP VIEW", "CREATE INDEX", "CREATE UNIQUE INDEX", "DROP INDEX",
-		"CREATE TRIGGER", "DROP TRIGGER", "TRUNCATE ", "REPLACE INTO", "SAVEPOINT ", "RELEASE ",
+		"CREATE TEMP ", "CREATE TEMPORARY ", "DROP VIEW", "CREATE INDEX", "CREATE UNIQUE INDEX",
+		"DROP INDEX", "CREATE TRIGGER", "DROP TRIGGER", "TRUNCATE ", "REPLACE INTO",
+		"SAVEPOINT ", "RELEASE ", "ANALYZE", "VACUUM", "REINDEX",
 	} {
 		if strings.HasPrefix(upper, prefix) {
 			return true
@@ -599,16 +605,41 @@ func shouldUseFullRelationalEngine(trimmed string, upper string) bool {
 		return true
 	}
 
-	// Check if query contains advanced SQL keywords/functions
+	// Check if query contains advanced SQL keywords, functions, aliases, or operators
 	for _, kw := range []string{
 		" JOIN ", " OVER (", " OVER(", "(SELECT ", " UNION ", " INTERSECT ", " EXCEPT ",
-		" HAVING ", " DISTINCT ", " OFFSET ", " CASE ", " COALESCE(", " IFNULL(", " NULLIF(", " IIF(",
-		" ROUND(", " ABS(", " UPPER(", " LOWER(", " SUBSTR(", " LENGTH(", " REPLACE(", " TRIM(",
-		" PRINTF(", " CAST(", " GROUP_CONCAT(", " JSON_", " STRFTIME(", " DATETIME(", " DATE(",
+		" HAVING ", " DISTINCT ", " OFFSET ", " CASE ", " WHEN ", " COALESCE(", " IFNULL(", " NULLIF(", " IIF(",
+		" ROUND(", " ABS(", " UPPER(", " LOWER(", " SUBSTR(", " SUBSTRING(", " LENGTH(", " REPLACE(", " TRIM(",
+		" LTRIM(", " RTRIM(", " PRINTF(", " CONCAT(", " LEFT(", " RIGHT(", " SPLIT_PART(", " REVERSE(",
+		" GREATEST(", " LEAST(", " MD5(", " SHA256(", " GEN_RANDOM_UUID(", " UUID(", " RANDOM(",
+		" CAST(", " GROUP_CONCAT(", " STRING_AGG(", " JSON_", " STRFTIME(", " DATETIME(", " DATE(", " TIME(",
 		" XXHASH64(", " VIRTUAL_BUCKET(", " TARGET_SHARD(", " NOW(", " ON CONFLICT", " RETURNING ",
-		" IS NULL", " IS NOT NULL", " NOT IN", " NOT LIKE", " OR ", " != ", " <> ", " >= ", " <= ", " > ", " < ",
+		" IS NULL", " IS NOT NULL", " NOT IN", " NOT LIKE", " EXISTS ", " EXISTS(",
+		" OR ", " != ", " <> ", " >= ", " <= ", " > ", " < ", " || ", " + ", " - ", " / ", " AS ",
 	} {
 		if strings.Contains(upper, kw) {
+			return true
+		}
+	}
+
+	// Multi-row INSERT VALUES (...), (...) or INSERT INTO ... SELECT
+	if strings.HasPrefix(upper, "INSERT ") {
+		if strings.Contains(upper, "), (") || strings.Contains(upper, "),(") || strings.Contains(upper, " SELECT ") {
+			return true
+		}
+	}
+
+	// UPDATE or DELETE without an explicit user_id clause
+	if strings.HasPrefix(upper, "UPDATE ") || strings.HasPrefix(upper, "DELETE ") {
+		if _, _, ok := extractUserIDClause(trimmed); !ok {
+			return true
+		}
+	}
+
+	// ORDER BY on any column other than created_at
+	if obIdx := strings.Index(upper, " ORDER BY "); obIdx != -1 {
+		obRest := strings.TrimSpace(upper[obIdx+10:])
+		if !strings.HasPrefix(obRest, "CREATED_AT") {
 			return true
 		}
 	}
@@ -616,6 +647,23 @@ func shouldUseFullRelationalEngine(trimmed string, upper string) bool {
 	// Check if target table in FROM / INSERT INTO / UPDATE / DELETE FROM is a table other than `users`
 	targetTbl := extractPrimaryTableName(trimmed, upper)
 	if targetTbl != "" && targetTbl != "users" && !strings.HasPrefix(targetTbl, "_shardmaster_") {
+		return true
+	}
+
+	// Check if `FROM users` is followed by a table alias or comma join (e.g. `FROM users u` or `FROM users, orders`)
+	if idx := strings.Index(upper, " FROM USERS "); idx != -1 {
+		afterUsers := strings.TrimSpace(upper[idx+12:])
+		firstAfter := readToken(afterUsers)
+		if firstAfter != "" &&
+			firstAfter != "WHERE" &&
+			firstAfter != "GROUP" &&
+			firstAfter != "ORDER" &&
+			firstAfter != "LIMIT" &&
+			firstAfter != "HAVING" {
+			return true
+		}
+	}
+	if strings.Contains(upper, " FROM USERS,") {
 		return true
 	}
 
@@ -627,6 +675,10 @@ func extractPrimaryTableName(trimmed string, upper string) string {
 	switch {
 	case strings.HasPrefix(upper, "INSERT INTO "):
 		rest = strings.TrimSpace(trimmed[len("INSERT INTO "):])
+	case strings.HasPrefix(upper, "INSERT OR REPLACE INTO "):
+		rest = strings.TrimSpace(trimmed[len("INSERT OR REPLACE INTO "):])
+	case strings.HasPrefix(upper, "INSERT OR IGNORE INTO "):
+		rest = strings.TrimSpace(trimmed[len("INSERT OR IGNORE INTO "):])
 	case strings.HasPrefix(upper, "UPDATE "):
 		rest = strings.TrimSpace(trimmed[len("UPDATE "):])
 	case strings.HasPrefix(upper, "DELETE FROM "):
@@ -645,4 +697,143 @@ func extractPrimaryTableName(trimmed string, upper string) string {
 	}
 	return tok
 }
+
+// NormalizeSQLWhitespace strips SQL comments (-- and /* */) and collapses all newlines,
+// tabs, and multi-space indentation outside of string literals into clean single spaces.
+func NormalizeSQLWhitespace(sql string) string {
+	var out strings.Builder
+	out.Grow(len(sql))
+
+	inSingle := false
+	inDouble := false
+	inLineComment := false
+	inBlockComment := false
+	lastWasSpace := true
+
+	for i := 0; i < len(sql); i++ {
+		ch := sql[i]
+
+		if inLineComment {
+			if ch == '\n' {
+				inLineComment = false
+				if !lastWasSpace {
+					out.WriteByte(' ')
+					lastWasSpace = true
+				}
+			}
+			continue
+		}
+		if inBlockComment {
+			if ch == '*' && i+1 < len(sql) && sql[i+1] == '/' {
+				inBlockComment = false
+				i++
+				if !lastWasSpace {
+					out.WriteByte(' ')
+					lastWasSpace = true
+				}
+			}
+			continue
+		}
+
+		if !inSingle && !inDouble {
+			if ch == '-' && i+1 < len(sql) && sql[i+1] == '-' {
+				inLineComment = true
+				i++
+				continue
+			}
+			if ch == '/' && i+1 < len(sql) && sql[i+1] == '*' {
+				inBlockComment = true
+				i++
+				continue
+			}
+			if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
+				if !lastWasSpace {
+					out.WriteByte(' ')
+					lastWasSpace = true
+				}
+				continue
+			}
+		}
+
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+		} else if ch == '"' && !inSingle {
+			inDouble = !inDouble
+		}
+		out.WriteByte(ch)
+		lastWasSpace = false
+	}
+	return strings.TrimSpace(out.String())
+}
+
+// SplitSQLStatements splits a multi-statement SQL script (separated by ';') into individual statements,
+// respecting string literals, comments, and CREATE TRIGGER BEGIN ... END blocks.
+func SplitSQLStatements(rawSQL string) []string {
+	var stmts []string
+	var cur strings.Builder
+
+	inSingle := false
+	inDouble := false
+	inLineComment := false
+	inBlockComment := false
+	inTriggerBlock := false
+
+	upperRaw := strings.ToUpper(rawSQL)
+	if strings.Contains(upperRaw, "CREATE TRIGGER") {
+		inTriggerBlock = true
+	}
+
+	for i := 0; i < len(rawSQL); i++ {
+		ch := rawSQL[i]
+		if inLineComment {
+			cur.WriteByte(ch)
+			if ch == '\n' {
+				inLineComment = false
+			}
+			continue
+		}
+		if inBlockComment {
+			cur.WriteByte(ch)
+			if ch == '*' && i+1 < len(rawSQL) && rawSQL[i+1] == '/' {
+				cur.WriteByte('/')
+				inBlockComment = false
+				i++
+			}
+			continue
+		}
+		if !inSingle && !inDouble {
+			if ch == '-' && i+1 < len(rawSQL) && rawSQL[i+1] == '-' {
+				inLineComment = true
+				cur.WriteString("--")
+				i++
+				continue
+			}
+			if ch == '/' && i+1 < len(rawSQL) && rawSQL[i+1] == '*' {
+				inBlockComment = true
+				cur.WriteString("/*")
+				i++
+				continue
+			}
+		}
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+		} else if ch == '"' && !inSingle {
+			inDouble = !inDouble
+		}
+		if ch == ';' && !inSingle && !inDouble && !inTriggerBlock {
+			s := strings.TrimSpace(cur.String())
+			if NormalizeSQLWhitespace(s) != "" {
+				stmts = append(stmts, s)
+			}
+			cur.Reset()
+			continue
+		}
+		cur.WriteByte(ch)
+	}
+	if rem := strings.TrimSpace(cur.String()); NormalizeSQLWhitespace(rem) != "" {
+		stmts = append(stmts, rem)
+	}
+	return stmts
+}
+
 

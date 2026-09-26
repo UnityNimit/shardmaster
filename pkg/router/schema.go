@@ -324,7 +324,7 @@ func (sc *SchemaCatalog) CreateCustomTable(rawSQL string) (*TableSchema, error) 
 	var cols []ColumnSchema
 	shardKey := "id (BIGINT)"
 	if strings.TrimSpace(body) != "" {
-		parts := strings.Split(body, ",")
+		parts := splitTopLevelCommas(body)
 		for i, p := range parts {
 			line := strings.TrimSpace(p)
 			if line == "" {
@@ -335,11 +335,15 @@ func (sc *SchemaCatalog) CreateCustomTable(rawSQL string) (*TableSchema, error) 
 				continue
 			}
 			upFirst := strings.ToUpper(tokens[0])
-			if upFirst == "PRIMARY" || upFirst == "CONSTRAINT" || upFirst == "UNIQUE" || upFirst == "INDEX" {
+			if upFirst == "PRIMARY" || upFirst == "CONSTRAINT" || upFirst == "UNIQUE" || upFirst == "INDEX" || upFirst == "FOREIGN" || upFirst == "CHECK" {
 				continue
 			}
 			colName := strings.Trim(tokens[0], "\"'`")
 			colType := strings.ToUpper(tokens[1])
+			// If type was split across whitespace like "NUMERIC (12, 2)", recombine parenthesized precision
+			if len(tokens) >= 3 && strings.HasPrefix(tokens[2], "(") && !strings.Contains(colType, "(") {
+				colType += tokens[2]
+			}
 			upLine := strings.ToUpper(line)
 
 			nullable := "NULL"
@@ -350,6 +354,10 @@ func (sc *SchemaCatalog) CreateCustomTable(rawSQL string) (*TableSchema, error) 
 			if strings.Contains(upLine, "PRIMARY KEY") || i == 0 {
 				keyConst = "PRIMARY KEY (SHARD KEY)"
 				shardKey = fmt.Sprintf("%s (%s)", colName, colType)
+			} else if strings.Contains(upLine, "REFERENCES") {
+				keyConst = "FOREIGN KEY"
+			} else if strings.Contains(upLine, "UNIQUE") {
+				keyConst = "UNIQUE"
 			}
 			defVal := "NULL"
 			if defIdx := strings.Index(upLine, "DEFAULT "); defIdx != -1 {
@@ -458,3 +466,35 @@ func FormatRowCountForTable(tableName string, usersRows int64, cdcEntries int, a
 		return "0"
 	}
 }
+
+func splitTopLevelCommas(s string) []string {
+	var out []string
+	var cur strings.Builder
+	parens := 0
+	inSingle := false
+	inDouble := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+		} else if ch == '"' && !inSingle {
+			inDouble = !inDouble
+		} else if !inSingle && !inDouble {
+			if ch == '(' {
+				parens++
+			} else if ch == ')' && parens > 0 {
+				parens--
+			} else if ch == ',' && parens == 0 {
+				out = append(out, cur.String())
+				cur.Reset()
+				continue
+			}
+		}
+		cur.WriteByte(ch)
+	}
+	if cur.Len() > 0 {
+		out = append(out, cur.String())
+	}
+	return out
+}
+

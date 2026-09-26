@@ -268,6 +268,43 @@ func TestSQLEngineSchemasAndQueries(t *testing.T) {
 	if err != nil || len(res.Rows) == 0 {
 		t.Fatalf("expected CDC journal entries, got err=%v rows=%d", err, len(res.Rows))
 	}
+
+	// 11. Multi-Line Indented SQL (Shift+Enter newlines + Tab indentation + Multi-Statement Batch)
+	multiLineScript := `
+		-- Multi-statement script with tabs and newlines
+		CREATE TABLE public.departments (
+			dept_id		BIGSERIAL PRIMARY KEY,
+			dept_name	VARCHAR(64) NOT NULL,
+			lead_user_id	BIGINT NOT NULL,
+			budget_usd	NUMERIC(12,2) DEFAULT 250000.00
+		);
+		INSERT INTO public.departments (dept_id, dept_name, lead_user_id, budget_usd)
+		VALUES
+			(10, 'Distributed Storage', 42, 750000.00),
+			(20, 'Query Optimizer', 777, 540000.00);
+		SELECT
+			d.dept_id,
+			d.dept_name,
+			u.name AS lead_engineer,
+			CONCAT(LEFT(d.dept_name, 4), '-', SPLIT_PART(u.email, '@', 1)) AS dept_code,
+			d.budget_usd::numeric(12,2) AS budget_usd
+		FROM
+			public.departments d
+			INNER JOIN public.users u
+				ON u.user_id = d.lead_user_id
+		WHERE
+			d.dept_name ILIKE '%storage%' OR d.budget_usd >= 500000
+		ORDER BY
+			d.budget_usd DESC;
+	`
+	res, err = qr.ExecuteSQL(multiLineScript)
+	if err != nil || len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows from multi-line indented SQL script, got err=%v rows=%d", err, len(res.Rows))
+	}
+	_, err = qr.ExecuteSQL("DROP TABLE departments;")
+	if err != nil {
+		t.Fatalf("DROP TABLE departments failed: %v", err)
+	}
 }
 
 func BenchmarkZeroAllocRouting(b *testing.B) {

@@ -383,7 +383,18 @@ Double-clicking `shardmaster.exe` in Windows Explorer (or running `.\shardmaster
   [12]  Architecture Manual    Formulas, internals & psql connection guide
   ------------------------------------------------------------------------
    Quick Commands:  demo  |  schema  |  reset  |  menu  |  exit
+   SQL Editor Keys: [Shift+Enter] New Line  |  [Tab] Indent 4 Spaces  |  [Up/Down] History
 ```
+
+### Native Multi-Line SQL Editor (`[Shift+Enter]` & `[Tab]` Indentation)
+
+Both the main `shardmaster [4-shards] >` prompt and Option `[5]` (`100% Full SQL Engine`) feature a native Win32 key-event multi-line SQL editor (`pkg/console/editor_windows.go`):
+
+- **`[Shift+Enter]` (or `[Ctrl+Enter]` / `[Alt+Enter]`)**: Moves to a new continuation line (`                  .. > `) without executing prematurely, allowing you to write multi-line SQL queries or multi-statement scripts.
+- **`[Tab]` & `[Shift+Tab]`**: Inserts or removes **4 spaces of indentation** aligned to 4-column tab stops.
+- **Smart Block Auto-Indentation**: Automatically indents 4 spaces after `(` or SQL clause headers (`CREATE TABLE (`, `SELECT`, `FROM`, `WHERE`, `VALUES`, `GROUP BY`, `ORDER BY`) and automatically un-indents closing `);` to align with the opening statement.
+- **`[Up]` / `[Down]` / `[Left]` / `[Right]` / `[Home]` / `[End]`**: Full cursor movement and recall of previously executed SQL statements.
+- **Multi-Statement Batch Scripts**: Type or paste multiple `;`-separated SQL statements (`CREATE TABLE ...; INSERT INTO ...; SELECT ...;`) in one block and press `[Enter]` to execute the entire batch sequentially.
 
 ### Direct CLI Subcommands
 
@@ -437,7 +448,8 @@ shardmaster/
 |       +-- console_windows.go      # Native Win32 console allocation & VT100 ANSI enabler
 |-- pkg/
 |   |-- console/
-|   |   +-- shell.go                # Animated ASCII banner, -/|\- spinners, typed SQL tables & REPL
+|   |   |-- shell.go                # Animated ASCII banner, -/|\- spinners, typed SQL tables & REPL
+|   |   +-- editor_windows.go       # Native Win32 [Shift+Enter] multi-line SQL & [Tab] indent editor
 |   |-- hash/
 |   |   |-- ring.go                 # Zero-allocation xxhash/v2 1,024 Virtual Bucket ring & split math
 |   |   +-- ring_test.go            # Unit, PGWire, K-Way Merge, CDC/VDiff, Full SQL & benchmark tests

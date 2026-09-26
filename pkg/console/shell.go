@@ -279,7 +279,7 @@ func styleCellValue(colIdx int, raw string, padded string) string {
 }
 
 // RenderSQLResult prints a complete SQL query execution report:
-// 1. Section title & SQL statement
+// 1. Section title & SQL statement (supporting multi-line indented SQL blocks)
 // 2. Execution Plan & Routing Path
 // 3. Typed PostgreSQL Grid Table
 // 4. Schema/Index Footer Notes (if any) & Summary Status Line
@@ -290,7 +290,15 @@ func RenderSQLResult(sql string, res *router.ResultSet) {
 	}
 	RenderSectionHeader(title)
 
-	fmt.Printf("  %s %s\n", cyanStyle.Render("SQL  >"), warnStyle.Render(sql))
+	sqlLines := strings.Split(strings.TrimSpace(sql), "\n")
+	if len(sqlLines) <= 1 {
+		fmt.Printf("  %s %s\n", cyanStyle.Render("SQL  >"), warnStyle.Render(strings.TrimSpace(sql)))
+	} else {
+		fmt.Printf("  %s %s\n", cyanStyle.Render("SQL  >"), warnStyle.Render(sqlLines[0]))
+		for _, sl := range sqlLines[1:] {
+			fmt.Printf("  %s %s\n", cyanStyle.Render("     |"), warnStyle.Render(sl))
+		}
+	}
 	if res.ExecutionPlan != "" {
 		fmt.Printf("  %s %s\n", cyanStyle.Render("PLAN >"), whiteBold.Render(res.ExecutionPlan))
 	}
@@ -315,6 +323,8 @@ func RenderSQLResult(sql string, res *router.ResultSet) {
 	)
 }
 
+var activeConsoleEditor *ConsoleEditor
+
 // RunInteractiveShell boots the complete ShardMaster system in the background
 // and provides a clean, animated, professional interactive control center.
 func RunInteractiveShell(qr *router.QueryRouter) {
@@ -329,21 +339,27 @@ func RunInteractiveShell(qr *router.QueryRouter) {
 	time.Sleep(35 * time.Millisecond)
 
 	reader := bufio.NewReader(os.Stdin)
+	activeConsoleEditor = NewConsoleEditor(reader)
 
 	AnimateBanner(qr, pgwireOnline)
 	printMainMenu()
 
 	for {
 		shardsCount := qr.Dir.ActiveShards()
+		fmt.Println("")
 		prompt := fmt.Sprintf(
-			"\n  %s [%s] %s ",
+			"  %s [%s] %s ",
 			cyanStyle.Render("shardmaster"),
 			okStyle.Render(fmt.Sprintf("%d-shards", shardsCount)),
 			warnStyle.Render(">"),
 		)
-		fmt.Print(prompt)
+		contPrompt := fmt.Sprintf(
+			"  %s %s ",
+			dimStyle.Render("                  .."),
+			warnStyle.Render(">"),
+		)
 
-		line, err := reader.ReadString('\n')
+		line, err := activeConsoleEditor.ReadCommandOrSQL(prompt, contPrompt, true)
 		if err != nil {
 			fmt.Println("\n  Shutting down ShardMaster. Goodbye.")
 			return
@@ -502,35 +518,12 @@ func RunInteractiveShell(qr *router.QueryRouter) {
 			return
 
 		default:
-			upper := strings.ToUpper(input)
-			if strings.HasPrefix(input, `\`) ||
-				strings.HasPrefix(upper, "SELECT ") ||
-				strings.HasPrefix(upper, "WITH ") ||
-				strings.HasPrefix(upper, "INSERT ") ||
-				strings.HasPrefix(upper, "REPLACE ") ||
-				strings.HasPrefix(upper, "UPDATE ") ||
-				strings.HasPrefix(upper, "DELETE ") ||
-				strings.HasPrefix(upper, "TRUNCATE ") ||
-				strings.HasPrefix(upper, "SHOW ") ||
-				strings.HasPrefix(upper, "DESCRIBE") ||
-				strings.HasPrefix(upper, "DESC ") ||
-				upper == "DESC" ||
-				strings.HasPrefix(upper, "CREATE ") ||
-				strings.HasPrefix(upper, "ALTER ") ||
-				strings.HasPrefix(upper, "DROP ") ||
-				strings.HasPrefix(upper, "PRAGMA ") ||
-				strings.HasPrefix(upper, "VALUES ") ||
-				strings.HasPrefix(upper, "BEGIN") ||
-				strings.HasPrefix(upper, "COMMIT") ||
-				strings.HasPrefix(upper, "ROLLBACK") ||
-				strings.HasPrefix(upper, "EXPLAIN") ||
-				strings.HasPrefix(upper, "REBALANCE") ||
-				strings.HasPrefix(upper, "RUN VDIFF") {
+			if strings.HasPrefix(input, `\`) || startsLikeSQL(input) {
 				runSQLAction(qr, input)
 			} else {
 				fmt.Printf("  %s Unknown command '%s'. Type %s, %s, or any SQL query (e.g. %s).\n",
 					warnStyle.Render("[INFO]"),
-					input,
+					truncatePlain(input, 40),
 					cyanStyle.Render("1-12"),
 					okStyle.Render("menu"),
 					warnStyle.Render("DESCRIBE users;"))
@@ -555,6 +548,8 @@ func printMainMenu() {
 	fmt.Println(dimStyle.Render("  ------------------------------------------------------------------------"))
 	fmt.Printf("   Quick Commands:  %s  |  %s  |  %s  |  %s  |  %s\n",
 		okStyle.Render("demo"), cyanStyle.Render("schema"), warnStyle.Render("reset"), dimStyle.Render("menu"), hotStyle.Render("exit"))
+	fmt.Printf("   SQL Editor Keys: %s New Line  |  %s Indent 4 Spaces  |  %s History\n",
+		cyanStyle.Render("[Shift+Enter]"), okStyle.Render("[Tab]"), warnStyle.Render("[Up/Down]"))
 }
 
 // ============================================================================
@@ -671,8 +666,13 @@ func runInteractiveSQLMenu(qr *router.QueryRouter, reader *bufio.Reader) {
 	fmt.Printf("   %s %-31s %s %s\n", hotStyle.Render("[24]"), "Window RANK() OVER (PARTITION)", hotStyle.Render("[26]"), "Subquery + xxhash64() Funcs")
 	fmt.Println(dimStyle.Render("  ------------------------------------------------------------------------"))
 	fmt.Printf("   Or type ANY valid SQL statement (JOIN, CTE, Window, View, Trigger, ALTER, etc.)\n")
+	fmt.Printf("   %s %s New Line  |  %s Indent 4 Spaces  |  %s Execute\n",
+		cyanStyle.Render("Multi-Line Editor:"),
+		okStyle.Render("[Shift+Enter]"),
+		okStyle.Render("[Tab]"),
+		warnStyle.Render("[Enter]"))
 
-	choice := promptDefault(reader, "Select [1-26, 'schema', 'all', or ANY SQL] [default: 23]", "23")
+	choice := promptSQLInput(reader, "Select [1-26, 'schema', 'all', or ANY SQL] [default: 23]", "23")
 	runSQLPresetOrQuery(qr, choice)
 }
 
@@ -978,15 +978,37 @@ func RunSixPillarShowcase(qr *router.QueryRouter) {
 }
 
 func truncatePlain(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
+	single := strings.Join(strings.Fields(s), " ")
+	if len(single) <= maxLen {
+		return single
 	}
-	return s[:maxLen-3] + "..."
+	return single[:maxLen-3] + "..."
 }
 
 func promptDefault(reader *bufio.Reader, promptText, defaultVal string) string {
-	fmt.Printf("   %s: ", warnStyle.Render(promptText))
-	line, err := reader.ReadString('\n')
+	prompt := fmt.Sprintf("   %s: ", warnStyle.Render(promptText))
+	contPrompt := fmt.Sprintf("   %s: ", dimStyle.Render(".."))
+	if activeConsoleEditor == nil {
+		activeConsoleEditor = NewConsoleEditor(reader)
+	}
+	line, err := activeConsoleEditor.ReadCommandOrSQL(prompt, contPrompt, false)
+	if err != nil {
+		return defaultVal
+	}
+	trimmed := strings.Trim(line, " \t\r\n\xef\xbb\xbf")
+	if trimmed == "" {
+		return defaultVal
+	}
+	return trimmed
+}
+
+func promptSQLInput(reader *bufio.Reader, promptText, defaultVal string) string {
+	prompt := fmt.Sprintf("   %s: ", warnStyle.Render(promptText))
+	contPrompt := fmt.Sprintf("   %s ", dimStyle.Render(".. >"))
+	if activeConsoleEditor == nil {
+		activeConsoleEditor = NewConsoleEditor(reader)
+	}
+	line, err := activeConsoleEditor.ReadCommandOrSQL(prompt, contPrompt, true)
 	if err != nil {
 		return defaultVal
 	}
