@@ -307,6 +307,96 @@ func TestSQLEngineSchemasAndQueries(t *testing.T) {
 	}
 }
 
+func TestCustomShardResizeDrainAndPinnedSQL(t *testing.T) {
+	dir := directory.NewShardDirectory(4)
+	cluster := storage.NewClusterStorage(4, t.TempDir())
+	cluster.SeedCluster(4096, dir.GetBucketOwner)
+	cdcEngine := cdc.NewEngine(dir, cluster)
+	tracker := hotspot.NewTracker(dir, cluster, cdcEngine)
+	qr := router.NewQueryRouter(dir, cluster, cdcEngine, tracker)
+
+	// 1. Provision a custom shard with custom name, disk GB, hardware tier, weight, and 200 target buckets
+	customCfg := storage.ShardSettings{
+		CustomAlias:     "eu-gdpr-vault-04",
+		Region:          "eu-central-1a",
+		DiskCapacityGB:  1024,
+		HardwareTier:    "Enterprise-XL 64vCPU/256GB",
+		Weight:          200,
+		TargetBuckets:   200,
+		AccessMode:      "READ_WRITE",
+		ReplicationMode: "SYNC_QUORUM",
+		MaxConnections:  5000,
+		BufferPoolMB:    65536,
+	}
+	newShard, _, err := cdcEngine.ProvisionCustomShard(customCfg, 0)
+	if err != nil {
+		t.Fatalf("ProvisionCustomShard failed: %v", err)
+	}
+	if newShard.DisplayName() != "eu-gdpr-vault-04" {
+		t.Fatalf("expected custom alias eu-gdpr-vault-04, got %s", newShard.DisplayName())
+	}
+	counts := dir.BucketCountsByShard()
+	if counts[newShard.ShardID] != 200 {
+		t.Fatalf("expected new custom shard to own 200 buckets, got %d", counts[newShard.ShardID])
+	}
+
+	// 2. Live resize Shard 0 to 320 buckets while running
+	_, err = cdcEngine.ResizeShardBuckets(0, 320, 0)
+	if err != nil {
+		t.Fatalf("ResizeShardBuckets(0, 320) failed: %v", err)
+	}
+	counts = dir.BucketCountsByShard()
+	if counts[0] != 320 {
+		t.Fatalf("expected Shard 0 to own 320 buckets after live resize, got %d", counts[0])
+	}
+
+	// 3. Drain Shard 3 (evacuate 100% of its buckets to 0)
+	_, err = cdcEngine.DrainShard(3, 0)
+	if err != nil {
+		t.Fatalf("DrainShard(3) failed: %v", err)
+	}
+	counts = dir.BucketCountsByShard()
+	if counts[3] != 0 || ShardRowCount(cluster, 3) != 0 {
+		t.Fatalf("expected drained Shard 3 to have 0 buckets and 0 rows, got buckets=%d rows=%d", counts[3], ShardRowCount(cluster, 3))
+	}
+
+	// Verify total rows across all shards still equals 4096
+	var totalRows int64
+	for _, s := range cluster.GetAllShards() {
+		totalRows += s.RowCount()
+	}
+	if totalRows != 4096 {
+		t.Fatalf("expected 4096 total rows preserved across live resize and drain, got %d", totalRows)
+	}
+
+	// 4. Execute Shard-Pinned SQL (ExecuteSQLOnShard and SQL hint /*+ SHARD(0) */)
+	pinnedRes, err := qr.ExecuteSQLOnShard("SELECT COUNT(*), SUM(balance_usd) FROM users;", int(newShard.ShardID))
+	if err != nil || len(pinnedRes.Rows) != 1 {
+		t.Fatalf("ExecuteSQLOnShard failed: %v", err)
+	}
+	hintRes, err := qr.ExecuteSQL("/*+ SHARD(0) */ SHOW SHARDS;")
+	if err != nil || len(hintRes.Rows) != 12 {
+		t.Fatalf("expected 12 profile rows for /*+ SHARD(0) */ SHOW SHARDS, got err=%v rows=%d", err, len(hintRes.Rows))
+	}
+
+	// 5. Execute SQL Control Plane ALTER SHARD
+	_, err = qr.ExecuteSQL("ALTER SHARD 0 SET NAME='us-west-ultra', SIZE=2048, WEIGHT=300, MODE='READ_WRITE';")
+	if err != nil {
+		t.Fatalf("ALTER SHARD 0 failed: %v", err)
+	}
+	s0, _ := cluster.GetShard(0)
+	if s0.DisplayName() != "us-west-ultra" || s0.GetSettings().DiskCapacityGB != 2048 {
+		t.Fatalf("expected Shard 0 alias=us-west-ultra and size=2048, got %s and %d", s0.DisplayName(), s0.GetSettings().DiskCapacityGB)
+	}
+}
+
+func ShardRowCount(cs *storage.ClusterStorage, id uint32) int64 {
+	if s, ok := cs.GetShard(id); ok {
+		return s.RowCount()
+	}
+	return -1
+}
+
 func BenchmarkZeroAllocRouting(b *testing.B) {
 	dir := directory.NewShardDirectory(8)
 	b.ReportAllocs()
@@ -319,4 +409,5 @@ func BenchmarkZeroAllocRouting(b *testing.B) {
 		}
 	})
 }
+
 

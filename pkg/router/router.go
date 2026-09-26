@@ -74,6 +74,9 @@ func (qr *QueryRouter) RouteFastPoint(userID int64) (shardID uint32, bucket uint
 // ExecuteSQL parses, routes, and executes any SQL statement (or multi-statement SQL script)
 // coming over PGWire (:6000) or the interactive CLI.
 func (qr *QueryRouter) ExecuteSQL(sql string) (*ResultSet, error) {
+	if pinnedID, cleanedSQL, ok := extractPinnedShardHint(sql); ok {
+		return qr.ExecuteSQLOnShard(cleanedSQL, pinnedID)
+	}
 	stmts := SplitSQLStatements(sql)
 	if len(stmts) > 1 {
 		var batchNotes []string
@@ -103,6 +106,11 @@ func (qr *QueryRouter) ExecuteSQL(sql string) (*ResultSet, error) {
 func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 	start := time.Now()
 	qr.TotalQueries.Add(1)
+
+	if ctrlRes, handled, ctrlErr := qr.handleShardControlCommand(sql, start); handled {
+		return ctrlRes, ctrlErr
+	}
+
 	cq := ClassifySQL(sql)
 
 	switch cq.Kind {
@@ -347,27 +355,33 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 		bucketCounts := qr.Dir.BucketCountsByShard()
 		rows := make([][]string, 0, len(shards))
 		for _, s := range shards {
+			cfg := s.GetSettings()
 			rows = append(rows, []string{
 				fmt.Sprintf("Shard %d", s.ShardID),
+				s.DisplayName(),
 				fmt.Sprintf(":%d", s.Port),
 				s.Region,
+				fmt.Sprintf("%.1f/%d GB", s.EstimatedUsedDiskGB(), cfg.DiskCapacityGB),
+				fmt.Sprintf("%d%%", cfg.Weight),
 				strconv.Itoa(bucketCounts[s.ShardID]),
 				strconv.FormatInt(s.RowCount(), 10),
 				fmt.Sprintf("%d QPS", s.CurrentQPS()),
-				fmt.Sprintf("%.2f ms", s.AvgLatencyMs()),
-				strconv.FormatUint(s.CurrentLSN(), 10),
-				"ONLINE",
+				cfg.AccessMode,
+				cfg.ReplicationMode,
 			})
 		}
 		return &ResultSet{
-			Title:         "PHYSICAL SHARD TOPOLOGY (_shardmaster_shards)",
-			Columns:       []string{"shard_id", "port", "region", "virtual_buckets", "rows", "qps", "p99_latency", "cdc_lsn", "state"},
-			ColumnTypes:   []string{"VARCHAR", "VARCHAR", "VARCHAR", "INT4", "INT8", "VARCHAR", "VARCHAR", "INT8", "VARCHAR"},
+			Title:         "PHYSICAL SHARD TOPOLOGY & CUSTOM SETTINGS (_shardmaster_shards)",
+			Columns:       []string{"shard_id", "custom_name", "port", "region", "disk_usage", "weight", "virtual_buckets", "rows", "qps", "mode", "replication"},
+			ColumnTypes:   []string{"VARCHAR", "VARCHAR", "VARCHAR", "VARCHAR", "VARCHAR", "VARCHAR", "INT4", "INT8", "VARCHAR", "VARCHAR", "VARCHAR"},
 			Rows:          rows,
 			CommandTag:    fmt.Sprintf("SELECT %d", len(rows)),
 			LatencyUs:     time.Since(start).Microseconds(),
 			RoutedShard:   "CONTROL_PLANE",
 			ExecutionPlan: fmt.Sprintf("Control Plane Topology Probe (%d Physical Shards, 1,024 Virtual Buckets)", len(shards)),
+			FooterNotes: []string{
+				"Customize live via TUI [e] Edit/Resize, [n] New Shard, [d] Drain, or SQL: ALTER SHARD 0 SET NAME='vip-west', SIZE=512, BUCKETS=320;",
+			},
 		}, nil
 
 	case QueryAdminShowBuckets:
@@ -1192,3 +1206,419 @@ func maxInt(a, b int) int {
 	}
 	return b
 }
+
+// extractPinnedShardHint checks for SQL hints like /*+ SHARD(0) */ or prefix TARGET SHARD 0:
+func extractPinnedShardHint(sql string) (int, string, bool) {
+	trimmed := strings.TrimSpace(sql)
+	upper := strings.ToUpper(trimmed)
+	if strings.HasPrefix(upper, "/*+ SHARD(") {
+		endIdx := strings.Index(upper, ") */")
+		if endIdx != -1 {
+			numStr := strings.TrimSpace(trimmed[len("/*+ SHARD("):endIdx])
+			if sid, err := strconv.Atoi(numStr); err == nil && sid >= 0 {
+				rest := strings.TrimSpace(trimmed[endIdx+4:])
+				return sid, rest, true
+			}
+		}
+	}
+	return -1, sql, false
+}
+
+// ExecuteSQLOnShard executes a SQL query pinned specifically to a single chosen physical shard (when targetShardID >= 0),
+// or across the entire distributed cluster (when targetShardID < 0).
+func (qr *QueryRouter) ExecuteSQLOnShard(sql string, targetShardID int) (*ResultSet, error) {
+	if targetShardID < 0 {
+		return qr.ExecuteSQL(sql)
+	}
+	start := time.Now()
+	shard, ok := qr.Cluster.GetShard(uint32(targetShardID))
+	if !ok {
+		return nil, fmt.Errorf("physical shard %d does not exist", targetShardID)
+	}
+	cfg := shard.GetSettings()
+	bucketCounts := qr.Dir.BucketCountsByShard()
+	ownedBuckets := bucketCounts[shard.ShardID]
+	pinBadge := fmt.Sprintf("PINNED -> Shard %d [%s] (:%d)", shard.ShardID, shard.DisplayName(), shard.Port)
+
+	cq := ClassifySQL(sql)
+	switch cq.Kind {
+	case QueryAdminShowShards:
+		rows := [][]string{
+			{"shard_id", fmt.Sprintf("Shard %d (postgres://localhost:%d/shard_%d)", shard.ShardID, shard.Port, shard.ShardID)},
+			{"custom_name", shard.DisplayName()},
+			{"region_az", shard.Region},
+			{"hardware_tier", cfg.HardwareTier},
+			{"disk_capacity", fmt.Sprintf("%.2f GB used / %d GB total (%.1f%%)", shard.EstimatedUsedDiskGB(), cfg.DiskCapacityGB, shard.DiskUsagePct())},
+			{"routing_weight", fmt.Sprintf("%d%% (Target Quota: %d Buckets)", cfg.Weight, cfg.TargetBuckets)},
+			{"owned_buckets", fmt.Sprintf("%d / 1024 Virtual Buckets", ownedBuckets)},
+			{"live_rows", strconv.FormatInt(shard.RowCount(), 10)},
+			{"access_mode", cfg.AccessMode},
+			{"replication", cfg.ReplicationMode},
+			{"max_connections", fmt.Sprintf("%d conns (Buffer Pool: %d MB)", cfg.MaxConnections, cfg.BufferPoolMB)},
+			{"cdc_lsn_head", fmt.Sprintf("LSN #%d (p99 Latency: %.2f ms)", shard.CurrentLSN(), shard.AvgLatencyMs())},
+		}
+		return &ResultSet{
+			Title:         fmt.Sprintf("SHARD %d [%s] CONFIGURATION & HARDWARE PROFILE", shard.ShardID, strings.ToUpper(shard.DisplayName())),
+			Columns:       []string{"setting_parameter", "configured_value"},
+			ColumnTypes:   []string{"VARCHAR(24)", "TEXT"},
+			Rows:          rows,
+			CommandTag:    "SHOW SHARD 12",
+			LatencyUs:     time.Since(start).Microseconds(),
+			RoutedShard:   pinBadge,
+			ExecutionPlan: fmt.Sprintf("Direct Shard Node Configuration Probe -> Shard %d [%s]", shard.ShardID, shard.DisplayName()),
+		}, nil
+
+	case QueryCountAggregate:
+		r, sumC, minC, maxC := shard.ComputeShardBalanceStats()
+		shard.RecordOp(140_000)
+		avgUSD := 0.0
+		if r > 0 {
+			avgUSD = (float64(sumC) / float64(r)) / 100.0
+		}
+		return &ResultSet{
+			Title:       fmt.Sprintf("SHARD-PINNED AGGREGATION ON SHARD %d [%s]", shard.ShardID, shard.DisplayName()),
+			Columns:     []string{"shard_id", "custom_name", "owned_buckets", "count_rows", "sum_balance_usd", "avg_balance_usd", "min_max_usd"},
+			ColumnTypes: []string{"VARCHAR", "VARCHAR", "INT4", "INT8", "NUMERIC(18,2)", "NUMERIC(12,2)", "VARCHAR"},
+			Rows: [][]string{{
+				fmt.Sprintf("shard_%d", shard.ShardID),
+				shard.DisplayName(),
+				strconv.Itoa(ownedBuckets),
+				strconv.FormatInt(r, 10),
+				fmt.Sprintf("$%.2f", float64(sumC)/100.0),
+				fmt.Sprintf("$%.2f", avgUSD),
+				fmt.Sprintf("$%.2f / $%.2f", float64(minC)/100.0, float64(maxC)/100.0),
+			}},
+			CommandTag:    "SELECT 1",
+			LatencyUs:     time.Since(start).Microseconds(),
+			RoutedShard:   pinBadge,
+			ExecutionPlan: fmt.Sprintf("Single-Shard Columnar Slab Scan on Shard %d [%s] (%d Virtual Buckets, 0 Cross-Shard Hops)", shard.ShardID, shard.DisplayName(), ownedBuckets),
+		}, nil
+
+	case QuerySelectCDCLog:
+		entries := shard.GetRecentCDCEntries(cq.Limit)
+		var rows [][]string
+		for _, e := range entries {
+			opLabel := "UPSERT"
+			if e.Op == storage.MutationDelete {
+				opLabel = "DELETE"
+			}
+			email := e.Row.Email
+			if email == "" {
+				email = fmt.Sprintf("user_%d@gmail.com", e.UserID)
+			}
+			rows = append(rows, []string{
+				strconv.FormatUint(e.LSN, 10),
+				fmt.Sprintf("shard_%d [%s]", shard.ShardID, shard.DisplayName()),
+				fmt.Sprintf("#%d", e.BucketID),
+				opLabel,
+				strconv.FormatInt(e.UserID, 10),
+				email,
+				fmt.Sprintf("$%.2f", float64(e.Row.BalanceCents)/100.0),
+				strconv.FormatInt(e.TimestampUs, 10),
+			})
+		}
+		return &ResultSet{
+			Title:         fmt.Sprintf("SHARD %d [%s] LOCAL CDC JOURNAL (_shardmaster_cdc)", shard.ShardID, shard.DisplayName()),
+			Columns:       []string{"lsn", "shard", "bucket_id", "op_type", "user_id", "email", "balance_usd", "timestamp_us"},
+			ColumnTypes:   []string{"INT8", "VARCHAR", "VARCHAR", "VARCHAR", "INT8", "VARCHAR", "NUMERIC(12,2)", "INT8"},
+			Rows:          rows,
+			CommandTag:    fmt.Sprintf("SELECT %d", len(rows)),
+			LatencyUs:     time.Since(start).Microseconds(),
+			RoutedShard:   pinBadge,
+			ExecutionPlan: fmt.Sprintf("Local CDC LSN Ring Buffer Read on Shard %d [%s]", shard.ShardID, shard.DisplayName()),
+		}, nil
+
+	case QueryScatterGather:
+		merged := ExecuteScatterGatherKWayMerge([]*storage.PhysicalShard{shard}, cq.Email, "", cq.Limit)
+		outRows := make([][]string, 0, len(merged))
+		for _, item := range merged {
+			outRows = append(outRows, formatUserRow(item.ShardID, item.Row))
+		}
+		cols, colTypes, projRows := projectUserResult(cq.ProjectedCols, outRows)
+		return &ResultSet{
+			Title:         fmt.Sprintf("SHARD-PINNED SELECT ON SHARD %d [%s] (TOP %d ROWS)", shard.ShardID, shard.DisplayName(), len(projRows)),
+			Columns:       cols,
+			ColumnTypes:   colTypes,
+			Rows:          projRows,
+			CommandTag:    fmt.Sprintf("SELECT %d", len(projRows)),
+			LatencyUs:     time.Since(start).Microseconds(),
+			RoutedShard:   pinBadge,
+			ExecutionPlan: fmt.Sprintf("Pinned Single-Shard Scan on Shard %d [%s] (:%d) across %d Owned Buckets", shard.ShardID, shard.DisplayName(), shard.Port, ownedBuckets),
+		}, nil
+	}
+
+	// Default fallback: execute query and filter/annotate for the pinned shard
+	res, err := qr.ExecuteSQL(sql)
+	if err != nil {
+		return nil, err
+	}
+	shardTag := fmt.Sprintf("shard_%d", shard.ShardID)
+	shardLabel := fmt.Sprintf("Shard %d", shard.ShardID)
+	shardColIdx := -1
+	for i, c := range res.Columns {
+		lc := strings.ToLower(c)
+		if lc == "shard_id" || lc == "owner_shard" || lc == "shard" {
+			shardColIdx = i
+			break
+		}
+	}
+	if shardColIdx >= 0 && len(res.Rows) > 1 {
+		var filtered [][]string
+		for _, r := range res.Rows {
+			if shardColIdx < len(r) {
+				cell := r[shardColIdx]
+				if strings.HasPrefix(cell, shardTag) || strings.HasPrefix(cell, shardLabel) {
+					filtered = append(filtered, r)
+				}
+			}
+		}
+		if len(filtered) > 0 {
+			res.Rows = filtered
+			res.CommandTag = fmt.Sprintf("SELECT %d", len(filtered))
+		}
+	}
+	res.Title = fmt.Sprintf("[SHARD %d: %s] %s", shard.ShardID, shard.DisplayName(), res.Title)
+	res.RoutedShard = pinBadge
+	return res, nil
+}
+
+// handleShardControlCommand parses and executes live shard customization DDL commands:
+//   - ALTER SHARD <id> SET NAME='...', SIZE=512, BUCKETS=320, WEIGHT=150, REGION='...', TIER='...', MODE='READ_WRITE', REPLICATION='SYNC_QUORUM', MAX_CONNS=2000;
+//   - CREATE SHARD 'alias' WITH SIZE=512, BUCKETS=256, WEIGHT=100, REGION='eu-west-1', TIER='NVMe-Pro 16vCPU/64GB', REPLICATION='SYNC_QUORUM';
+//   - DRAIN SHARD <id>;
+//   - REBALANCE SHARDS BY WEIGHT;
+func (qr *QueryRouter) handleShardControlCommand(sql string, start time.Time) (*ResultSet, bool, error) {
+	trimmed := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(sql), ";"))
+	upper := strings.ToUpper(trimmed)
+
+	if strings.HasPrefix(upper, "ALTER SHARD ") {
+		rest := strings.TrimSpace(trimmed[len("ALTER SHARD "):])
+		parts := strings.Fields(rest)
+		if len(parts) < 2 {
+			return nil, true, fmt.Errorf("syntax: ALTER SHARD <id> SET NAME='alias', SIZE=512, BUCKETS=256, WEIGHT=150, REGION='us-west', MODE='READ_WRITE'")
+		}
+		sid, err := strconv.Atoi(strings.TrimPrefix(strings.ToLower(parts[0]), "shard_"))
+		if err != nil || sid < 0 {
+			return nil, true, fmt.Errorf("invalid shard id '%s'", parts[0])
+		}
+		shard, ok := qr.Cluster.GetShard(uint32(sid))
+		if !ok {
+			return nil, true, fmt.Errorf("physical shard %d does not exist", sid)
+		}
+
+		setIdx := strings.Index(strings.ToUpper(rest), "SET ")
+		kvPart := rest
+		if setIdx != -1 {
+			kvPart = rest[setIdx+4:]
+		}
+		cfg := shard.GetSettings()
+		resizeBuckets := -1
+		parseShardKVSettings(kvPart, &cfg, &resizeBuckets)
+		shard.UpdateSettings(cfg)
+
+		actionNote := "Updated live shard metadata & parameters"
+		if cfg.AccessMode == "DRAINING" || resizeBuckets == 0 {
+			go func(id uint32) {
+				_, _ = qr.CDC.DrainShard(id, 15*time.Millisecond)
+			}(shard.ShardID)
+			actionNote = "Triggered Zero-Downtime CDC Shard Drain (0 Buckets)"
+		} else if resizeBuckets > 0 {
+			go func(id uint32, b int) {
+				_, _ = qr.CDC.ResizeShardBuckets(id, b, 15*time.Millisecond)
+			}(shard.ShardID, resizeBuckets)
+			actionNote = fmt.Sprintf("Triggered Live CDC Bucket Resize -> %d Buckets", resizeBuckets)
+		}
+		qr.Cluster.SaveStateFile(qr.Dir.SnapshotBuckets())
+
+		updated := shard.GetSettings()
+		return &ResultSet{
+			Title:       fmt.Sprintf("ALTERED SHARD %d [%s] LIVE CONFIGURATION", shard.ShardID, shard.DisplayName()),
+			Columns:     []string{"shard_id", "custom_name", "region", "disk_gb", "hardware_tier", "weight", "target_buckets", "mode", "replication", "action"},
+			ColumnTypes: []string{"VARCHAR", "VARCHAR", "VARCHAR", "INT4", "VARCHAR", "VARCHAR", "INT4", "VARCHAR", "VARCHAR", "TEXT"},
+			Rows: [][]string{{
+				fmt.Sprintf("Shard %d", shard.ShardID),
+				updated.CustomAlias,
+				updated.Region,
+				strconv.Itoa(updated.DiskCapacityGB),
+				updated.HardwareTier,
+				fmt.Sprintf("%d%%", updated.Weight),
+				strconv.Itoa(updated.TargetBuckets),
+				updated.AccessMode,
+				updated.ReplicationMode,
+				actionNote,
+			}},
+			CommandTag:    "ALTER SHARD",
+			LatencyUs:     time.Since(start).Microseconds(),
+			RoutedShard:   fmt.Sprintf("Shard %d [%s]", shard.ShardID, shard.DisplayName()),
+			ExecutionPlan: "Control Plane Dynamic Shard Reconfiguration + Asynchronous CDC Bucket Rebalancer",
+		}, true, nil
+	}
+
+	if strings.HasPrefix(upper, "CREATE SHARD") {
+		rest := strings.TrimSpace(trimmed[len("CREATE SHARD"):])
+		cfg := storage.ShardSettings{
+			CustomAlias:     fmt.Sprintf("custom-shard-%d", qr.Dir.ActiveShards()),
+			Region:          "us-west-2a",
+			DiskCapacityGB:  512,
+			HardwareTier:    "NVMe-Pro 16vCPU/64GB",
+			Weight:          100,
+			TargetBuckets:   128,
+			AccessMode:      "READ_WRITE",
+			ReplicationMode: "SYNC_QUORUM",
+			MaxConnections:  1500,
+			BufferPoolMB:    32768,
+		}
+		withIdx := strings.Index(strings.ToUpper(rest), "WITH ")
+		namePart := rest
+		kvPart := ""
+		if withIdx != -1 {
+			namePart = strings.TrimSpace(rest[:withIdx])
+			kvPart = strings.TrimSpace(rest[withIdx+5:])
+		} else if strings.Contains(rest, "=") {
+			kvPart = rest
+			namePart = ""
+		}
+		namePart = strings.Trim(namePart, "'\"` ")
+		if namePart != "" {
+			cfg.CustomAlias = namePart
+		}
+		resizeBuckets := cfg.TargetBuckets
+		if kvPart != "" {
+			parseShardKVSettings(kvPart, &cfg, &resizeBuckets)
+			if resizeBuckets >= 0 {
+				cfg.TargetBuckets = resizeBuckets
+			}
+		}
+
+		newShard := qr.Cluster.CreateCustomShard(cfg)
+		qr.Dir.RegisterShard(newShard.ShardID)
+		go func(id uint32, b int) {
+			_, _ = qr.CDC.ResizeShardBuckets(id, b, 15*time.Millisecond)
+		}(newShard.ShardID, cfg.TargetBuckets)
+
+		return &ResultSet{
+			Title:       fmt.Sprintf("PROVISIONED CUSTOM SHARD %d [%s]", newShard.ShardID, newShard.DisplayName()),
+			Columns:     []string{"shard_id", "custom_name", "port", "region", "disk_gb", "hardware_tier", "weight", "target_buckets", "replication", "status"},
+			ColumnTypes: []string{"VARCHAR", "VARCHAR", "VARCHAR", "VARCHAR", "INT4", "VARCHAR", "VARCHAR", "INT4", "VARCHAR", "VARCHAR"},
+			Rows: [][]string{{
+				fmt.Sprintf("Shard %d", newShard.ShardID),
+				newShard.DisplayName(),
+				fmt.Sprintf(":%d", newShard.Port),
+				cfg.Region,
+				strconv.Itoa(cfg.DiskCapacityGB),
+				cfg.HardwareTier,
+				fmt.Sprintf("%d%%", cfg.Weight),
+				strconv.Itoa(cfg.TargetBuckets),
+				cfg.ReplicationMode,
+				"CDC_BACKFILL_STREAMING",
+			}},
+			CommandTag:    "CREATE SHARD",
+			LatencyUs:     time.Since(start).Microseconds(),
+			RoutedShard:   fmt.Sprintf("Shard %d [%s]", newShard.ShardID, newShard.DisplayName()),
+			ExecutionPlan: fmt.Sprintf("Provisioned Shard %d (:%d) + Started Zero-Downtime CDC Migration for %d Virtual Buckets", newShard.ShardID, newShard.Port, cfg.TargetBuckets),
+		}, true, nil
+	}
+
+	if strings.HasPrefix(upper, "DRAIN SHARD ") {
+		numStr := strings.TrimSpace(trimmed[len("DRAIN SHARD "):])
+		numStr = strings.TrimPrefix(strings.ToLower(numStr), "shard_")
+		sid, err := strconv.Atoi(numStr)
+		if err != nil || sid < 0 {
+			return nil, true, fmt.Errorf("invalid shard id '%s'", numStr)
+		}
+		shard, ok := qr.Cluster.GetShard(uint32(sid))
+		if !ok {
+			return nil, true, fmt.Errorf("physical shard %d does not exist", sid)
+		}
+		go func(id uint32) {
+			_, _ = qr.CDC.DrainShard(id, 15*time.Millisecond)
+		}(shard.ShardID)
+		return &ResultSet{
+			Title:       fmt.Sprintf("DRAINING SHARD %d [%s] VIA ZERO-DOWNTIME CDC", shard.ShardID, shard.DisplayName()),
+			Columns:     []string{"shard_id", "custom_name", "mode", "target_buckets", "workflow"},
+			ColumnTypes: []string{"VARCHAR", "VARCHAR", "VARCHAR", "INT4", "VARCHAR"},
+			Rows: [][]string{{
+				fmt.Sprintf("Shard %d", shard.ShardID),
+				shard.DisplayName(),
+				"DRAINING",
+				"0",
+				"EVACUATING_BUCKETS_ZERO_DOWNTIME",
+			}},
+			CommandTag:    "DRAIN SHARD",
+			LatencyUs:     time.Since(start).Microseconds(),
+			RoutedShard:   "CONTROL_PLANE",
+			ExecutionPlan: fmt.Sprintf("Evacuating all Virtual Buckets from Shard %d [%s] to active READ_WRITE shards", shard.ShardID, shard.DisplayName()),
+		}, true, nil
+	}
+
+	if strings.HasPrefix(upper, "REBALANCE SHARDS BY WEIGHT") || upper == "REBALANCE BY WEIGHT" {
+		go func() {
+			_, _ = qr.CDC.RebalanceByWeights(15 * time.Millisecond)
+		}()
+		return &ResultSet{
+			Title:       "WEIGHTED CLUSTER BUCKET REBALANCING STARTED",
+			Columns:     []string{"workflow", "total_buckets", "strategy", "status"},
+			ColumnTypes: []string{"VARCHAR", "INT4", "VARCHAR", "VARCHAR"},
+			Rows: [][]string{{
+				"WEIGHTED_CDC_REBALANCE",
+				"1024",
+				"Proportional to Shard Weight & Disk Size",
+				"STREAMING (0.00ms Downtime)",
+			}},
+			CommandTag:    "REBALANCE WEIGHTS",
+			LatencyUs:     time.Since(start).Microseconds(),
+			RoutedShard:   "CONTROL_PLANE",
+			ExecutionPlan: "Proportional Bucket Quota Calculation + Zero-Downtime CDC VReplication",
+		}, true, nil
+	}
+
+	return nil, false, nil
+}
+
+func parseShardKVSettings(kvPart string, cfg *storage.ShardSettings, resizeBuckets *int) {
+	pairs := strings.Split(kvPart, ",")
+	for _, p := range pairs {
+		eq := strings.IndexByte(p, '=')
+		if eq == -1 {
+			continue
+		}
+		k := strings.ToUpper(strings.TrimSpace(p[:eq]))
+		v := strings.Trim(strings.TrimSpace(p[eq+1:]), "'\"` ")
+		switch k {
+		case "NAME", "ALIAS", "CUSTOM_NAME":
+			cfg.CustomAlias = v
+		case "REGION", "AZ", "ZONE":
+			cfg.Region = v
+		case "SIZE", "DISK", "DISK_GB", "CAPACITY", "SIZE_GB":
+			vClean := strings.TrimSuffix(strings.ToUpper(v), "GB")
+			if n, err := strconv.Atoi(strings.TrimSpace(vClean)); err == nil && n > 0 {
+				cfg.DiskCapacityGB = n
+			}
+		case "TIER", "HARDWARE", "HARDWARE_TIER":
+			cfg.HardwareTier = v
+		case "WEIGHT":
+			vClean := strings.TrimSuffix(v, "%")
+			if n, err := strconv.Atoi(strings.TrimSpace(vClean)); err == nil && n >= 0 {
+				cfg.Weight = n
+			}
+		case "BUCKETS", "TARGET_BUCKETS", "VIRTUAL_BUCKETS":
+			if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 1024 {
+				cfg.TargetBuckets = n
+				*resizeBuckets = n
+			}
+		case "MODE", "ACCESS_MODE", "STATE", "STATUS":
+			cfg.AccessMode = strings.ToUpper(v)
+		case "REPLICATION", "REPL", "DURABILITY", "SYNC":
+			cfg.ReplicationMode = strings.ToUpper(v)
+		case "MAX_CONNS", "MAX_CONNECTIONS", "CONNS":
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				cfg.MaxConnections = n
+			}
+		case "BUFFER_POOL", "BUFFER_POOL_MB":
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				cfg.BufferPoolMB = n
+			}
+		}
+	}
+}
+

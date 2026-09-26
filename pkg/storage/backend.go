@@ -75,6 +75,20 @@ var (
 	epochBaseTime = time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
 )
 
+// ShardSettings holds real-world customizable hardware, sizing, and operational parameters for a physical shard.
+type ShardSettings struct {
+	CustomAlias     string `json:"custom_alias"`
+	Region          string `json:"region"`
+	DiskCapacityGB  int    `json:"disk_capacity_gb"`
+	HardwareTier    string `json:"hardware_tier"`
+	Weight          int    `json:"weight"`
+	TargetBuckets   int    `json:"target_buckets"`
+	AccessMode      string `json:"access_mode"`      // READ_WRITE, READ_ONLY, DRAINING, MAINTENANCE
+	ReplicationMode string `json:"replication_mode"` // SYNC_QUORUM, SEMI_SYNC, ASYNC_FAST
+	MaxConnections  int    `json:"max_connections"`
+	BufferPoolMB    int    `json:"buffer_pool_mb"`
+}
+
 // PhysicalShard represents an isolated physical database shard (e.g. Shard 0 :5432 .. Shard 7 :5439).
 type PhysicalShard struct {
 	ShardID    uint32
@@ -83,6 +97,9 @@ type PhysicalShard struct {
 	Region     string
 	DSN        string
 	PostgresUp bool
+
+	metaMu   sync.RWMutex
+	settings ShardSettings
 
 	bucketMu   [hash.TotalVirtualBuckets]sync.RWMutex
 	buckets    [hash.TotalVirtualBuckets]*BucketSlab
@@ -98,15 +115,31 @@ type PhysicalShard struct {
 	cdcJournal []MutationLogEntry
 }
 
-// NewPhysicalShard initializes a physical shard with 1,024 virtual bucket columnar slabs.
+// NewPhysicalShard initializes a physical shard with 1,024 virtual bucket columnar slabs and default customizable settings.
 func NewPhysicalShard(shardID uint32, region string) *PhysicalShard {
 	port := 5432 + int(shardID)
+	if region == "" {
+		region = defaultRegions[int(shardID)%len(defaultRegions)]
+	}
+	alias := fmt.Sprintf("%s-core-%d", region, shardID)
 	s := &PhysicalShard{
-		ShardID:    shardID,
-		Name:       fmt.Sprintf("Shard %d :%d", shardID, port),
-		Port:       port,
-		Region:     region,
-		DSN:        fmt.Sprintf("postgres://postgres:postgres@localhost:%d/shard_%d?sslmode=disable", port, shardID),
+		ShardID: shardID,
+		Name:    fmt.Sprintf("Shard %d :%d", shardID, port),
+		Port:    port,
+		Region:  region,
+		DSN:     fmt.Sprintf("postgres://postgres:postgres@localhost:%d/shard_%d?sslmode=disable", port, shardID),
+		settings: ShardSettings{
+			CustomAlias:     alias,
+			Region:          region,
+			DiskCapacityGB:  256,
+			HardwareTier:    "NVMe-Pro 16vCPU/64GB",
+			Weight:          100,
+			TargetBuckets:   256,
+			AccessMode:      "READ_WRITE",
+			ReplicationMode: "SYNC_QUORUM",
+			MaxConnections:  1000,
+			BufferPoolMB:    16384,
+		},
 		cdcJournal: make([]MutationLogEntry, 0, 4096),
 	}
 	s.latencyNs.Store(380_000) // 0.38ms baseline
@@ -118,6 +151,85 @@ func NewPhysicalShard(shardID uint32, region string) *PhysicalShard {
 		}
 	}
 	return s
+}
+
+// GetSettings returns a thread-safe snapshot of the shard's customizable settings.
+func (s *PhysicalShard) GetSettings() ShardSettings {
+	s.metaMu.RLock()
+	defer s.metaMu.RUnlock()
+	return s.settings
+}
+
+// UpdateSettings updates the shard's live operational settings, custom name, size, tier, and weight.
+func (s *PhysicalShard) UpdateSettings(cfg ShardSettings) {
+	s.metaMu.Lock()
+	defer s.metaMu.Unlock()
+	if strings.TrimSpace(cfg.CustomAlias) != "" {
+		s.settings.CustomAlias = strings.TrimSpace(cfg.CustomAlias)
+	}
+	if strings.TrimSpace(cfg.Region) != "" {
+		s.settings.Region = strings.TrimSpace(cfg.Region)
+		s.Region = s.settings.Region
+	}
+	if cfg.DiskCapacityGB > 0 {
+		s.settings.DiskCapacityGB = cfg.DiskCapacityGB
+	}
+	if strings.TrimSpace(cfg.HardwareTier) != "" {
+		s.settings.HardwareTier = strings.TrimSpace(cfg.HardwareTier)
+	}
+	if cfg.Weight >= 0 {
+		s.settings.Weight = cfg.Weight
+	}
+	if cfg.TargetBuckets >= 0 && cfg.TargetBuckets <= hash.TotalVirtualBuckets {
+		s.settings.TargetBuckets = cfg.TargetBuckets
+	}
+	if strings.TrimSpace(cfg.AccessMode) != "" {
+		s.settings.AccessMode = strings.ToUpper(strings.TrimSpace(cfg.AccessMode))
+	}
+	if strings.TrimSpace(cfg.ReplicationMode) != "" {
+		s.settings.ReplicationMode = strings.ToUpper(strings.TrimSpace(cfg.ReplicationMode))
+	}
+	if cfg.MaxConnections > 0 {
+		s.settings.MaxConnections = cfg.MaxConnections
+	}
+	if cfg.BufferPoolMB > 0 {
+		s.settings.BufferPoolMB = cfg.BufferPoolMB
+	}
+}
+
+// DisplayName returns the user-configured CustomAlias for this shard.
+func (s *PhysicalShard) DisplayName() string {
+	s.metaMu.RLock()
+	alias := s.settings.CustomAlias
+	s.metaMu.RUnlock()
+	if alias != "" {
+		return alias
+	}
+	return fmt.Sprintf("shard-%d", s.ShardID)
+}
+
+// EstimatedUsedDiskGB computes realistic physical storage consumption (in GB) based on live row count.
+func (s *PhysicalShard) EstimatedUsedDiskGB() float64 {
+	rows := s.RowCount()
+	if rows <= 0 {
+		return 0.4 // baseline WAL + catalog metadata
+	}
+	// ~3.05 GB per 1,000,000 rows (table heap + B-tree indexes + CDC journal)
+	return 0.4 + (float64(rows)/1_000_000.0)*3.05
+}
+
+// DiskUsagePct returns the percentage of configured DiskCapacityGB currently used.
+func (s *PhysicalShard) DiskUsagePct() float64 {
+	cfg := s.GetSettings()
+	capGB := cfg.DiskCapacityGB
+	if capGB <= 0 {
+		capGB = 256
+	}
+	pct := (s.EstimatedUsedDiskGB() / float64(capGB)) * 100.0
+	if pct > 100.0 {
+		pct = 100.0
+	}
+	return pct
 }
 
 // RecordOp records a query hit and updates EWMA latency.
@@ -586,6 +698,26 @@ func (cs *ClusterStorage) EnsureShard(shardID uint32, region string) *PhysicalSh
 	return s
 }
 
+// CreateCustomShard provisions a new physical shard with custom alias, disk size, tier, weight, and settings.
+func (cs *ClusterStorage) CreateCustomShard(cfg ShardSettings) *PhysicalShard {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	var nextID uint32
+	for id := range cs.shards {
+		if id >= nextID {
+			nextID = id + 1
+		}
+	}
+	reg := cfg.Region
+	if reg == "" {
+		reg = defaultRegions[int(nextID)%len(defaultRegions)]
+	}
+	s := NewPhysicalShard(nextID, reg)
+	s.UpdateSettings(cfg)
+	cs.shards[nextID] = s
+	return s
+}
+
 func (cs *ClusterStorage) GetShard(shardID uint32) (*PhysicalShard, bool) {
 	cs.mu.RLock()
 	s, ok := cs.shards[shardID]
@@ -703,9 +835,10 @@ func (cs *ClusterStorage) SeedCluster(
 }
 
 type PersistedShardMeta struct {
-	ShardID  uint32 `json:"shard_id"`
-	Region   string `json:"region"`
-	RowCount int64  `json:"row_count"`
+	ShardID  uint32        `json:"shard_id"`
+	Region   string        `json:"region"`
+	RowCount int64         `json:"row_count"`
+	Settings ShardSettings `json:"settings"`
 }
 
 type PersistedClusterState struct {
@@ -728,6 +861,7 @@ func (cs *ClusterStorage) SaveStateFile(buckets [hash.TotalVirtualBuckets]uint32
 			ShardID:  s.ShardID,
 			Region:   s.Region,
 			RowCount: s.RowCount(),
+			Settings: s.GetSettings(),
 		}
 	}
 	raw, err := json.MarshalIndent(state, "", "  ")

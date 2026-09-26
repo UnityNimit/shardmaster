@@ -95,8 +95,322 @@ func (e *Engine) RebalanceToShards(targetShards uint32, stepDelay time.Duration)
 
 	currentBuckets := e.dir.SnapshotBuckets()
 	_, ranges := hash.ComputeOptimalSplit(currentBuckets, targetShards)
+	title := fmt.Sprintf("RESHARDING (%d -> %d Shards)", currentShards, targetShards)
+	return e.executeBucketMigrations(title, ranges, stepDelay)
+}
 
-	// Calculate total rows scheduled to move across all ranges (e.g. ~25,000,000 rows on 4 -> 8 split)
+// ProvisionCustomShard creates a new physical shard with custom name, disk capacity, hardware tier, weight,
+// and target virtual buckets, and immediately streams its target buckets via zero-downtime CDC VReplication.
+func (e *Engine) ProvisionCustomShard(cfg storage.ShardSettings, stepDelay time.Duration) (*storage.PhysicalShard, *WorkflowSnapshot, error) {
+	newShard := e.cluster.CreateCustomShard(cfg)
+	e.dir.RegisterShard(newShard.ShardID)
+
+	desired := cfg.TargetBuckets
+	if desired <= 0 {
+		// Compute proportional quota from weight across all active shards
+		shards := e.cluster.GetAllShards()
+		totalWeight := 0
+		for _, s := range shards {
+			st := s.GetSettings()
+			if st.AccessMode != "DRAINING" && st.Weight > 0 {
+				totalWeight += st.Weight
+			}
+		}
+		w := cfg.Weight
+		if w <= 0 {
+			w = 100
+		}
+		if totalWeight > 0 {
+			desired = (hash.TotalVirtualBuckets * w) / totalWeight
+		} else {
+			desired = hash.TotalVirtualBuckets / len(shards)
+		}
+		if desired < 16 {
+			desired = 64
+		}
+		st := newShard.GetSettings()
+		st.TargetBuckets = desired
+		newShard.UpdateSettings(st)
+	}
+
+	snap, err := e.ResizeShardBuckets(newShard.ShardID, desired, stepDelay)
+	return newShard, snap, err
+}
+
+// ResizeShardBuckets dynamically grows or shrinks the number of virtual buckets (0..1024) owned by shardID
+// while the cluster is running, migrating buckets in or out via zero-downtime CDC VReplication + VDiff.
+func (e *Engine) ResizeShardBuckets(shardID uint32, desiredBuckets int, stepDelay time.Duration) (*WorkflowSnapshot, error) {
+	if !e.running.CompareAndSwap(false, true) {
+		snap := e.GetSnapshot()
+		return &snap, nil
+	}
+	defer e.running.Store(false)
+
+	if desiredBuckets < 0 {
+		desiredBuckets = 0
+	}
+	if desiredBuckets > hash.TotalVirtualBuckets {
+		desiredBuckets = hash.TotalVirtualBuckets
+	}
+
+	targetShard, ok := e.cluster.GetShard(shardID)
+	if !ok {
+		return nil, fmt.Errorf("shard %d does not exist", shardID)
+	}
+	st := targetShard.GetSettings()
+	st.TargetBuckets = desiredBuckets
+	if desiredBuckets == 0 && st.AccessMode == "READ_WRITE" {
+		st.AccessMode = "DRAINING"
+	} else if desiredBuckets > 0 && st.AccessMode == "DRAINING" {
+		st.AccessMode = "READ_WRITE"
+	}
+	targetShard.UpdateSettings(st)
+
+	currentBuckets := e.dir.SnapshotBuckets()
+	counts := e.dir.BucketCountsByShard()
+	currentOwned := counts[shardID]
+
+	if desiredBuckets == currentOwned {
+		e.syncTargetBucketMetadata()
+		snap := e.GetSnapshot()
+		return &snap, nil
+	}
+
+	var singleMoves []hash.BucketMigrationRange
+
+	if desiredBuckets > currentOwned {
+		// Need to pull (desiredBuckets - currentOwned) buckets into shardID from donor shards
+		needed := desiredBuckets - currentOwned
+		for needed > 0 {
+			// Pick donor shard with the highest current bucket count (excluding shardID)
+			var bestDonor uint32
+			maxCount := -1
+			for sid, c := range counts {
+				if sid != shardID && c > maxCount {
+					maxCount = c
+					bestDonor = sid
+				}
+			}
+			if maxCount <= 0 {
+				break
+			}
+			// Find a bucket currently owned by bestDonor (scan from top down for clean contiguous ranges)
+			moved := false
+			for b := int(hash.TotalVirtualBuckets) - 1; b >= 0; b-- {
+				if currentBuckets[b] == bestDonor {
+					currentBuckets[b] = shardID
+					counts[bestDonor]--
+					counts[shardID]++
+					singleMoves = append(singleMoves, hash.BucketMigrationRange{
+						FromShard:   bestDonor,
+						ToShard:     shardID,
+						StartBucket: uint16(b),
+						EndBucket:   uint16(b),
+					})
+					needed--
+					moved = true
+					break
+				}
+			}
+			if !moved {
+				break
+			}
+		}
+	} else {
+		// Need to push (currentOwned - desiredBuckets) buckets out of shardID to recipient shards
+		toEvacuate := currentOwned - desiredBuckets
+		allShards := e.cluster.GetAllShards()
+		for toEvacuate > 0 {
+			// Pick recipient shard with the lowest current bucket count that is not DRAINING
+			var bestRecipient uint32
+			foundRecipient := false
+			minCount := hash.TotalVirtualBuckets + 1
+			for _, s := range allShards {
+				if s.ShardID == shardID {
+					continue
+				}
+				cfg := s.GetSettings()
+				if cfg.AccessMode == "DRAINING" {
+					continue
+				}
+				c := counts[s.ShardID]
+				if c < minCount {
+					minCount = c
+					bestRecipient = s.ShardID
+					foundRecipient = true
+				}
+			}
+			if !foundRecipient {
+				// Fallback to any other shard
+				for _, s := range allShards {
+					if s.ShardID != shardID {
+						bestRecipient = s.ShardID
+						foundRecipient = true
+						break
+					}
+				}
+			}
+			if !foundRecipient {
+				break
+			}
+
+			moved := false
+			for b := int(hash.TotalVirtualBuckets) - 1; b >= 0; b-- {
+				if currentBuckets[b] == shardID {
+					currentBuckets[b] = bestRecipient
+					counts[shardID]--
+					counts[bestRecipient]++
+					singleMoves = append(singleMoves, hash.BucketMigrationRange{
+						FromShard:   shardID,
+						ToShard:     bestRecipient,
+						StartBucket: uint16(b),
+						EndBucket:   uint16(b),
+					})
+					toEvacuate--
+					moved = true
+					break
+				}
+			}
+			if !moved {
+				break
+			}
+		}
+	}
+
+	ranges := coalesceSplitRanges(singleMoves)
+	title := fmt.Sprintf("LIVE SHARD RESIZE (S%d [%s]: %d -> %d Buckets)", shardID, targetShard.DisplayName(), currentOwned, desiredBuckets)
+	return e.executeBucketMigrations(title, ranges, stepDelay)
+}
+
+// DrainShard evacuates 100% of virtual buckets from shardID to remaining online shards via CDC VReplication.
+func (e *Engine) DrainShard(shardID uint32, stepDelay time.Duration) (*WorkflowSnapshot, error) {
+	if s, ok := e.cluster.GetShard(shardID); ok {
+		cfg := s.GetSettings()
+		cfg.AccessMode = "DRAINING"
+		cfg.Weight = 0
+		cfg.TargetBuckets = 0
+		s.UpdateSettings(cfg)
+	}
+	return e.ResizeShardBuckets(shardID, 0, stepDelay)
+}
+
+// RebalanceByWeights redistributes all 1,024 virtual buckets across all non-draining shards
+// proportional to each shard's configured Weight (and DiskCapacityGB).
+func (e *Engine) RebalanceByWeights(stepDelay time.Duration) (*WorkflowSnapshot, error) {
+	if !e.running.CompareAndSwap(false, true) {
+		snap := e.GetSnapshot()
+		return &snap, nil
+	}
+	defer e.running.Store(false)
+
+	shards := e.cluster.GetAllShards()
+	totalWeight := 0
+	for _, s := range shards {
+		cfg := s.GetSettings()
+		if cfg.AccessMode != "DRAINING" && cfg.Weight > 0 {
+			totalWeight += cfg.Weight
+		}
+	}
+	if totalWeight <= 0 {
+		snap := e.GetSnapshot()
+		return &snap, nil
+	}
+
+	quotas := make(map[uint32]int, len(shards))
+	assigned := 0
+	var lastActiveID uint32
+	for _, s := range shards {
+		cfg := s.GetSettings()
+		if cfg.AccessMode == "DRAINING" || cfg.Weight <= 0 {
+			quotas[s.ShardID] = 0
+			continue
+		}
+		q := (hash.TotalVirtualBuckets * cfg.Weight) / totalWeight
+		quotas[s.ShardID] = q
+		assigned += q
+		lastActiveID = s.ShardID
+	}
+	if assigned < hash.TotalVirtualBuckets {
+		quotas[lastActiveID] += hash.TotalVirtualBuckets - assigned
+	}
+
+	currentBuckets := e.dir.SnapshotBuckets()
+	counts := e.dir.BucketCountsByShard()
+	var singleMoves []hash.BucketMigrationRange
+
+	for b := uint16(0); b < hash.TotalVirtualBuckets; b++ {
+		owner := currentBuckets[b]
+		if counts[owner] > quotas[owner] {
+			// Find a shard that is below its quota
+			for _, s := range shards {
+				if counts[s.ShardID] < quotas[s.ShardID] {
+					currentBuckets[b] = s.ShardID
+					counts[owner]--
+					counts[s.ShardID]++
+					singleMoves = append(singleMoves, hash.BucketMigrationRange{
+						FromShard:   owner,
+						ToShard:     s.ShardID,
+						StartBucket: b,
+						EndBucket:   b,
+					})
+					break
+				}
+			}
+		}
+	}
+
+	ranges := coalesceSplitRanges(singleMoves)
+	title := fmt.Sprintf("WEIGHTED CLUSTER REBALANCE (%d Shards)", len(shards))
+	return e.executeBucketMigrations(title, ranges, stepDelay)
+}
+
+func coalesceSplitRanges(moves []hash.BucketMigrationRange) []hash.BucketMigrationRange {
+	if len(moves) == 0 {
+		return nil
+	}
+	// Sort by FromShard, ToShard, StartBucket ascending
+	for i := 0; i < len(moves); i++ {
+		for j := i + 1; j < len(moves); j++ {
+			if moves[j].FromShard < moves[i].FromShard ||
+				(moves[j].FromShard == moves[i].FromShard && moves[j].ToShard < moves[i].ToShard) ||
+				(moves[j].FromShard == moves[i].FromShard && moves[j].ToShard == moves[i].ToShard && moves[j].StartBucket < moves[i].StartBucket) {
+				moves[i], moves[j] = moves[j], moves[i]
+			}
+		}
+	}
+
+	var out []hash.BucketMigrationRange
+	cur := moves[0]
+	for i := 1; i < len(moves); i++ {
+		m := moves[i]
+		if m.FromShard == cur.FromShard && m.ToShard == cur.ToShard &&
+			m.StartBucket == cur.EndBucket+1 && (cur.EndBucket-cur.StartBucket) < 63 {
+			cur.EndBucket = m.EndBucket
+		} else {
+			out = append(out, cur)
+			cur = m
+		}
+	}
+	out = append(out, cur)
+	return out
+}
+
+func (e *Engine) syncTargetBucketMetadata() {
+	counts := e.dir.BucketCountsByShard()
+	for _, s := range e.cluster.GetAllShards() {
+		cfg := s.GetSettings()
+		cfg.TargetBuckets = counts[s.ShardID]
+		s.UpdateSettings(cfg)
+	}
+}
+
+func (e *Engine) executeBucketMigrations(title string, ranges []hash.BucketMigrationRange, stepDelay time.Duration) (*WorkflowSnapshot, error) {
+	if len(ranges) == 0 {
+		e.syncTargetBucketMetadata()
+		snap := e.GetSnapshot()
+		return &snap, nil
+	}
+
 	var totalRowsToMove int64
 	for _, r := range ranges {
 		if src, ok := e.cluster.GetShard(r.FromShard); ok {
@@ -107,7 +421,6 @@ func (e *Engine) RebalanceToShards(targetShards uint32, stepDelay time.Duration)
 		totalRowsToMove = 1
 	}
 
-	title := fmt.Sprintf("RESHARDING (%d -> %d Shards)", currentShards, targetShards)
 	e.updateState(func(s *WorkflowSnapshot) {
 		s.Active = true
 		s.Title = title
@@ -134,26 +447,24 @@ func (e *Engine) RebalanceToShards(targetShards uint32, stepDelay time.Duration)
 		}
 
 		rangeLabel := fmt.Sprintf(
-			"Bucket [%d-%d] (Shard %d -> Shard %d)",
-			rng.StartBucket, rng.EndBucket, rng.FromShard, rng.ToShard,
+			"Bucket [%d-%d] (S%d [%s] -> S%d [%s])",
+			rng.StartBucket, rng.EndBucket,
+			rng.FromShard, srcShard.DisplayName(),
+			rng.ToShard, dstShard.DisplayName(),
 		)
 
-		// Mark buckets as actively streaming CDC
 		for b := rng.StartBucket; b <= rng.EndBucket; b++ {
 			e.dir.SetBucketState(b, directory.BucketStateCDCStreaming)
 		}
 
 		watermarkLSN := srcShard.CurrentLSN()
 
-		// ====================================================================
 		// PHASE A: Columnar Keyset Backfill (Bucket-by-Bucket Non-Blocking Copy)
-		// ====================================================================
 		for b := rng.StartBucket; b <= rng.EndBucket; b++ {
 			slabCopy := srcShard.ExportBucketSlab(b)
 			dstShard.InstallBucketSlab(slabCopy)
 			rowsMovedSoFar += slabCopy.RowCount
 
-			// Stream any concurrent in-flight CDC mutations every 8 buckets
 			if (b-rng.StartBucket)%8 == 0 || b == rng.EndBucket {
 				events, latestLSN := srcShard.FetchCDCMutationsAfter(rng.StartBucket, rng.EndBucket, watermarkLSN)
 				for _, ev := range events {
@@ -186,9 +497,7 @@ func (e *Engine) RebalanceToShards(targetShards uint32, stepDelay time.Duration)
 			}
 		}
 
-		// ====================================================================
 		// PHASE B: Zero-Lag CDC Drain Gate (<200us) & VDiff Parity Verification
-		// ====================================================================
 		for b := rng.StartBucket; b <= rng.EndBucket; b++ {
 			e.dir.SetBucketState(b, directory.BucketStateCutoverGate)
 		}
@@ -204,17 +513,13 @@ func (e *Engine) RebalanceToShards(targetShards uint32, stepDelay time.Duration)
 		}
 		_ = finalLSN
 
-		// Pillar 4: Run VDiff Rolling XOR-SHA256 Checksum Comparison
 		vdiff := VerifyBucketRangeVDiff(srcShard, dstShard, rng.StartBucket, rng.EndBucket)
 
-		// ====================================================================
 		// PHASE C: Atomic Pointer Cutover (`atomic.Uint32.Store`)
-		// ====================================================================
 		for b := rng.StartBucket; b <= rng.EndBucket; b++ {
 			e.dir.AtomicCutoverBucket(b, rng.ToShard)
 		}
 
-		// Drain migrated historical bucket slabs from source shard now that pointer is flipped
 		srcShard.PurgeBucketRange(rng.StartBucket, rng.EndBucket)
 
 		vdiffCopy := vdiff
@@ -235,6 +540,7 @@ func (e *Engine) RebalanceToShards(targetShards uint32, stepDelay time.Duration)
 		})
 	}
 
+	e.syncTargetBucketMetadata()
 	e.cluster.SaveStateFile(e.dir.SnapshotBuckets())
 
 	e.updateState(func(s *WorkflowSnapshot) {
@@ -269,6 +575,7 @@ func (e *Engine) MigrateSingleHotBucket(bucket uint16, fromShardID, toShardID ui
 	vdiff := VerifyBucketRangeVDiff(srcShard, dstShard, bucket, bucket)
 	e.dir.AtomicCutoverBucket(bucket, toShardID)
 	srcShard.PurgeBucketRange(bucket, bucket)
+	e.syncTargetBucketMetadata()
 
 	e.mu.Lock()
 	e.vdiffLogs = append([]VDiffReport{vdiff}, e.vdiffLogs...)

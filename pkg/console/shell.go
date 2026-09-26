@@ -413,14 +413,12 @@ func RunInteractiveShell(qr *router.QueryRouter) {
 				runInteractiveSQLMenu(qr, reader)
 			}
 
-		case "6", "add", "add-shard":
-			region := ""
+		case "6", "add", "add-shard", "shard", "customize", "resize":
 			if len(args) > 0 {
-				region = args[0]
+				runAddShardAction(qr, args[0])
 			} else {
-				region = promptDefault(reader, "Region (us-west, us-east, eu-central, ap-south) [default: us-west]", "us-west")
+				runShardCustomizerMenu(qr, reader)
 			}
-			runAddShardAction(qr, region)
 
 		case "7", "split", "rebalance":
 			targetStr := ""
@@ -534,11 +532,11 @@ func RunInteractiveShell(qr *router.QueryRouter) {
 
 func printMainMenu() {
 	fmt.Printf("   %s  %-22s %s\n", okStyle.Render("[1]"), whiteBold.Render("Interactive Academy"), dimStyle.Render("Step-by-step guided tour of all 6 Pillars"))
-	fmt.Printf("   %s  %-22s %s\n", okStyle.Render("[2]"), whiteBold.Render("Cluster Status"), dimStyle.Render("View shard load bars, row counts & CDC lag"))
-	fmt.Printf("   %s  %-22s %s\n", okStyle.Render("[3]"), whiteBold.Render("Live Dashboard (TUI)"), dimStyle.Render("Open 4-Tab Terminal UI (fits any screen)"))
+	fmt.Printf("   %s  %-22s %s\n", okStyle.Render("[2]"), whiteBold.Render("Cluster Status"), dimStyle.Render("View shard names, sizes, load bars & CDC lag"))
+	fmt.Printf("   %s  %-22s %s\n", okStyle.Render("[3]"), whiteBold.Render("Live Dashboard (TUI)"), dimStyle.Render("4-Tab TUI + Live Shard Customizer & Resizer"))
 	fmt.Printf("   %s  %-22s %s\n", cyanStyle.Render("[4]"), whiteBold.Render("Route User Key"), dimStyle.Render("Inspect O(1) xxHash64 & Virtual Bucket"))
 	fmt.Printf("   %s  %-22s %s\n", cyanStyle.Render("[5]"), whiteBold.Render("100% Full SQL Engine"), dimStyle.Render("Schemas, DDL, JOINs, CTEs, Window Funcs & 26 Presets"))
-	fmt.Printf("   %s  %-22s %s\n", warnStyle.Render("[6]"), whiteBold.Render("Add Physical Shard"), dimStyle.Render("Add regional shard & stream buckets (CDC)"))
+	fmt.Printf("   %s  %-22s %s\n", warnStyle.Render("[6]"), whiteBold.Render("Customize & Add Shards"), dimStyle.Render("Custom names, disk sizes, live resize, drain & pin SQL"))
 	fmt.Printf("   %s  %-22s %s\n", warnStyle.Render("[7]"), whiteBold.Render("Zero-Downtime Split"), dimStyle.Render("Split cluster (4 -> 8 shards) with VDiff"))
 	fmt.Printf("   %s  %-22s %s\n", hotStyle.Render("[8]"), whiteBold.Render("Hotspot Self-Healer"), dimStyle.Render("Spike Bucket #412 & watch auto-isolation"))
 	fmt.Printf("   %s  %-22s %s\n", okStyle.Render("[9]"), whiteBold.Render("VDiff Parity Audit"), dimStyle.Render("Verify 256-bit XOR-SHA256 across shards"))
@@ -709,6 +707,168 @@ func runSQLAction(qr *router.QueryRouter, sql string) {
 		return
 	}
 	RenderSQLResult(sql, res)
+}
+
+func runShardCustomizerMenu(qr *router.QueryRouter, reader *bufio.Reader) {
+	PrintStaticDashboard(qr, false)
+	RenderSectionHeader("SHARD CUSTOMIZER, LIVE RESIZER & SHARD-PINNED SQL MANAGER")
+	fmt.Printf("   %s %-34s %s\n", okStyle.Render("[1]"), whiteBold.Render("Create Custom Physical Shard"), dimStyle.Render("Custom Name, Disk GB, Tier, Weight & Target Buckets"))
+	fmt.Printf("   %s %-34s %s\n", cyanStyle.Render("[2]"), whiteBold.Render("Edit & Live Resize Existing Shard"), dimStyle.Render("Rename, resize Disk GB / Virtual Buckets while running"))
+	fmt.Printf("   %s %-34s %s\n", hotStyle.Render("[3]"), whiteBold.Render("Drain / Evacuate a Shard (0ms)"), dimStyle.Render("Migrate 100% of shard buckets out via CDC + VDiff"))
+	fmt.Printf("   %s %-34s %s\n", warnStyle.Render("[4]"), whiteBold.Render("Rebalance All Shards by Weight"), dimStyle.Render("Distribute 1,024 Buckets proportional to Shard Weight"))
+	fmt.Printf("   %s %-34s %s\n", okStyle.Render("[5]"), whiteBold.Render("Pin & Query Specific Shard (SQL)"), dimStyle.Render("Choose a shard and run SELECT / SQL directly on it"))
+	fmt.Println(dimStyle.Render("  ------------------------------------------------------------------------"))
+
+	sub := promptDefault(reader, "Choose action [1-5, default: 1]", "1")
+	shards := qr.Cluster.GetAllShards()
+	counts := qr.Dir.BucketCountsByShard()
+
+	switch strings.TrimSpace(sub) {
+	case "1":
+		nextID := len(shards)
+		defAlias := fmt.Sprintf("custom-nvme-%d", nextID)
+		alias := promptDefault(reader, fmt.Sprintf("Custom Shard Name / Alias [default: %s]", defAlias), defAlias)
+		region := promptDefault(reader, "Region / Availability Zone [default: us-west-2a]", "us-west-2a")
+		diskStr := promptDefault(reader, "Disk Capacity in GB (64, 128, 256, 512, 1024, 2048) [default: 512]", "512")
+		tier := promptDefault(reader, "Hardware Tier [default: Enterprise-XL 64vCPU/256GB]", "Enterprise-XL 64vCPU/256GB")
+		wtStr := promptDefault(reader, "Routing Weight % (50, 100, 150, 200, 400) [default: 150]", "150")
+		bktStr := promptDefault(reader, "Target Virtual Buckets (0..1024) to stream live [default: 256]", "256")
+		repl := promptDefault(reader, "Replication Policy (SYNC_QUORUM, SEMI_SYNC, ASYNC_FAST) [default: SYNC_QUORUM]", "SYNC_QUORUM")
+
+		diskGB, _ := strconv.Atoi(diskStr)
+		if diskGB <= 0 {
+			diskGB = 512
+		}
+		wt, _ := strconv.Atoi(strings.TrimSuffix(wtStr, "%"))
+		if wt <= 0 {
+			wt = 150
+		}
+		bkts, err := strconv.Atoi(bktStr)
+		if err != nil || bkts < 0 || bkts > 1024 {
+			bkts = 256
+		}
+
+		cfg := storage.ShardSettings{
+			CustomAlias:     alias,
+			Region:          region,
+			DiskCapacityGB:  diskGB,
+			HardwareTier:    tier,
+			Weight:          wt,
+			TargetBuckets:   bkts,
+			AccessMode:      "READ_WRITE",
+			ReplicationMode: strings.ToUpper(repl),
+			MaxConnections:  2500,
+			BufferPoolMB:    32768,
+		}
+		var newShard *storage.PhysicalShard
+		var snap *cdc.WorkflowSnapshot
+		RunSpinnerWhile(fmt.Sprintf("Provisioning [%s] (%d GB, %s) & Streaming %d Buckets via CDC...", alias, diskGB, tier, bkts), func() {
+			newShard, snap, _ = qr.CDC.ProvisionCustomShard(cfg, 12*time.Millisecond)
+		})
+		fmt.Printf("  %s Provisioned Shard %d [%s] (:%d) | Migrated %s rows across %d ranges (0.00ms Downtime)\n",
+			okStyle.Render("[OK]"), newShard.ShardID, newShard.DisplayName(), newShard.Port,
+			FormatCommas(uint64(snap.RowsMigrated)), snap.RangesCompleted)
+		PrintStaticDashboard(qr, false)
+
+	case "2":
+		sidStr := promptDefault(reader, fmt.Sprintf("Select Shard ID to customize/resize (0..%d) [default: 0]", len(shards)-1), "0")
+		sid, _ := strconv.Atoi(sidStr)
+		s, ok := qr.Cluster.GetShard(uint32(sid))
+		if !ok {
+			fmt.Printf("  %s Shard %d not found.\n", hotStyle.Render("[ERROR]"), sid)
+			return
+		}
+		cfg := s.GetSettings()
+		curB := counts[s.ShardID]
+
+		alias := promptDefault(reader, fmt.Sprintf("Custom Shard Name [current: %s]", cfg.CustomAlias), cfg.CustomAlias)
+		region := promptDefault(reader, fmt.Sprintf("Region / AZ [current: %s]", cfg.Region), cfg.Region)
+		diskStr := promptDefault(reader, fmt.Sprintf("Disk Size in GB [current: %d]", cfg.DiskCapacityGB), strconv.Itoa(cfg.DiskCapacityGB))
+		tier := promptDefault(reader, fmt.Sprintf("Hardware Tier [current: %s]", cfg.HardwareTier), cfg.HardwareTier)
+		wtStr := promptDefault(reader, fmt.Sprintf("Routing Weight %% [current: %d]", cfg.Weight), strconv.Itoa(cfg.Weight))
+		bktStr := promptDefault(reader, fmt.Sprintf("Target Virtual Buckets (0..1024) [current: %d]", curB), strconv.Itoa(curB))
+		mode := promptDefault(reader, fmt.Sprintf("Operational Mode (READ_WRITE, READ_ONLY, DRAINING) [current: %s]", cfg.AccessMode), cfg.AccessMode)
+		repl := promptDefault(reader, fmt.Sprintf("Replication Mode (SYNC_QUORUM, SEMI_SYNC, ASYNC_FAST) [current: %s]", cfg.ReplicationMode), cfg.ReplicationMode)
+
+		diskGB, _ := strconv.Atoi(diskStr)
+		if diskGB > 0 {
+			cfg.DiskCapacityGB = diskGB
+		}
+		wt, _ := strconv.Atoi(strings.TrimSuffix(wtStr, "%"))
+		if wt >= 0 {
+			cfg.Weight = wt
+		}
+		newB, err := strconv.Atoi(bktStr)
+		if err != nil || newB < 0 || newB > 1024 {
+			newB = curB
+		}
+		cfg.CustomAlias = alias
+		cfg.Region = region
+		cfg.HardwareTier = tier
+		cfg.TargetBuckets = newB
+		cfg.AccessMode = strings.ToUpper(mode)
+		cfg.ReplicationMode = strings.ToUpper(repl)
+		s.UpdateSettings(cfg)
+
+		var snap *cdc.WorkflowSnapshot
+		if cfg.AccessMode == "DRAINING" || newB == 0 {
+			RunSpinnerWhile(fmt.Sprintf("Draining Shard %d [%s] -> 0 Buckets via CDC VReplication...", s.ShardID, s.DisplayName()), func() {
+				snap, _ = qr.CDC.DrainShard(s.ShardID, 12*time.Millisecond)
+			})
+		} else if newB != curB {
+			RunSpinnerWhile(fmt.Sprintf("Live Resizing Shard %d [%s]: %d -> %d Buckets via CDC VReplication...", s.ShardID, s.DisplayName(), curB, newB), func() {
+				snap, _ = qr.CDC.ResizeShardBuckets(s.ShardID, newB, 12*time.Millisecond)
+			})
+		}
+		if snap != nil {
+			fmt.Printf("  %s Live Resize Complete: %s rows migrated (0.00ms Downtime, VDiff Verified)\n",
+				okStyle.Render("[OK]"), FormatCommas(uint64(snap.RowsMigrated)))
+		} else {
+			qr.Cluster.SaveStateFile(qr.Dir.SnapshotBuckets())
+			fmt.Printf("  %s Updated Shard %d [%s] live settings.\n", okStyle.Render("[OK]"), s.ShardID, s.DisplayName())
+		}
+		PrintStaticDashboard(qr, false)
+
+	case "3":
+		defDrain := strconv.Itoa(len(shards) - 1)
+		sidStr := promptDefault(reader, fmt.Sprintf("Select Shard ID to Drain (0..%d) [default: %s]", len(shards)-1, defDrain), defDrain)
+		sid, _ := strconv.Atoi(sidStr)
+		var snap *cdc.WorkflowSnapshot
+		RunSpinnerWhile(fmt.Sprintf("Draining Shard %d (Evacuating 100%% of Virtual Buckets via CDC)...", sid), func() {
+			snap, _ = qr.CDC.DrainShard(uint32(sid), 12*time.Millisecond)
+		})
+		if snap != nil {
+			fmt.Printf("  %s Shard %d Drained (%s rows evacuated with 0.00ms Downtime).\n",
+				okStyle.Render("[OK]"), sid, FormatCommas(uint64(snap.RowsMigrated)))
+		}
+		PrintStaticDashboard(qr, false)
+
+	case "4":
+		var snap *cdc.WorkflowSnapshot
+		RunSpinnerWhile("Rebalancing all 1,024 Virtual Buckets proportionally by Shard Weight...", func() {
+			snap, _ = qr.CDC.RebalanceByWeights(12 * time.Millisecond)
+		})
+		if snap != nil {
+			fmt.Printf("  %s Weighted Rebalance Complete (%s rows migrated).\n",
+				okStyle.Render("[OK]"), FormatCommas(uint64(snap.RowsMigrated)))
+		}
+		PrintStaticDashboard(qr, false)
+
+	case "5":
+		sidStr := promptDefault(reader, fmt.Sprintf("Select Target Shard ID to pin SQL query (0..%d) [default: 0]", len(shards)-1), "0")
+		sid, _ := strconv.Atoi(sidStr)
+		sqlQuery := promptSQLInput(reader, fmt.Sprintf("Enter SQL to execute on Shard %d [default: SELECT * FROM users LIMIT 5;]", sid), "SELECT * FROM users LIMIT 5;")
+		var res *router.ResultSet
+		var err error
+		RunSpinnerWhile(fmt.Sprintf("Executing Shard-Pinned SQL on Shard %d...", sid), func() {
+			res, err = qr.ExecuteSQLOnShard(sqlQuery, sid)
+		})
+		if err != nil {
+			fmt.Printf("  %s Query Error: %v\n", hotStyle.Render("[ERROR]"), err)
+			return
+		}
+		RenderSQLResult(sqlQuery, res)
+	}
 }
 
 func runAddShardAction(qr *router.QueryRouter, region string) {
@@ -921,31 +1081,33 @@ func PrintStaticDashboard(qr *router.QueryRouter, showReshardingExample bool) {
 
 	RenderSectionHeader("SHARDMASTER CLUSTER TOPOLOGY (1,024 VIRTUAL BUCKETS)")
 
-	qpsSamples := []string{"3,120 QPS", "3,080 QPS", "3,150 QPS", "3,100 QPS", "2,980 QPS", "3,050 QPS", "3,110 QPS", "3,090 QPS"}
 	var rows [][]string
-	for idx, s := range shards {
+	for _, s := range shards {
+		cfg := s.GetSettings()
 		bCount := bucketCounts[s.ShardID]
-		barLen := (bCount * 16) / 256
-		if barLen > 16 {
-			barLen = 16
+		barLen := (bCount * 14) / 256
+		if barLen > 14 {
+			barLen = 14
 		}
 		if barLen < 1 && bCount > 0 {
 			barLen = 1
 		}
-		bar := "[" + strings.Repeat("#", barLen) + strings.Repeat(".", 16-barLen) + "]"
+		bar := "[" + strings.Repeat("#", barLen) + strings.Repeat(".", 14-barLen) + "]"
 		rows = append(rows, []string{
 			fmt.Sprintf("Shard %d (:%d)", s.ShardID, s.Port),
+			s.DisplayName(),
 			s.Region,
+			fmt.Sprintf("%.1f/%d GB", s.EstimatedUsedDiskGB(), cfg.DiskCapacityGB),
 			bar,
 			fmt.Sprintf("%d Buckets", bCount),
 			FormatCommas(uint64(s.RowCount())) + " rows",
-			qpsSamples[idx%len(qpsSamples)],
+			cfg.AccessMode,
 		})
 	}
 
 	RenderTypedTable(
-		[]string{"shard_node", "region", "load_distribution", "virtual_buckets", "row_count", "throughput"},
-		[]string{"PHYSICAL NODE", "ZONE", "BUCKET CAPACITY BAR", "INT4 [0..1024]", "INT8 SLAB", "ROLLING QPS"},
+		[]string{"shard_node", "custom_name", "region", "disk_size", "load_distribution", "virtual_buckets", "row_count", "mode"},
+		[]string{"PHYSICAL NODE", "SHARD ALIAS", "ZONE", "USED / CAP GB", "BUCKET CAPACITY BAR", "INT4 [0..1024]", "INT8 SLAB", "STATE"},
 		rows,
 	)
 
