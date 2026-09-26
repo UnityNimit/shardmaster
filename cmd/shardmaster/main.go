@@ -183,12 +183,15 @@ func main() {
 	}
 
 	queryCmd := &cobra.Command{
-		Use:   "query [sql]",
-		Short: "Execute a routed Point Query or Distributed K-Way Merge Scatter-Gather SQL query",
+		Use:     "query [sql]",
+		Aliases: []string{"sql", "schema"},
+		Short:   "Execute any Distributed SQL query, DDL, or Schema Introspection (DESCRIBE users, SHOW TABLES, etc.)",
 		Run: func(cmd *cobra.Command, args []string) {
 			sql := "SELECT * FROM users WHERE email LIKE '%@gmail.com' ORDER BY created_at DESC LIMIT 5;"
 			if len(args) > 0 {
 				sql = strings.Join(args, " ")
+			} else if cmd.CalledAs() == "schema" {
+				sql = "DESCRIBE users;"
 			}
 			var qr *router.QueryRouter
 			var res *router.ResultSet
@@ -201,10 +204,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Query error: %v\n", err)
 				os.Exit(1)
 			}
-			console.RenderSectionHeader("SHARDMASTER SQL QUERY ROUTER & K-WAY MERGE EXECUTOR")
-			fmt.Printf("   * SQL: %s  |  Route: %s  |  Latency: %d us\n",
-				warnStyle.Render(sql), cyanStyle.Render(res.RoutedShard), res.LatencyUs)
-			console.RenderProfessionalTable(res.Columns, res.Rows)
+			console.RenderSQLResult(sql, res)
 		},
 	}
 

@@ -21,15 +21,18 @@ var presetQueries = []struct {
 	title string
 	sql   string
 }{
-	{"Cluster Stats", "SHOW STATS;"},
+	{"All Tables", "SHOW TABLES;"},
+	{"Users Schema", "DESCRIBE users;"},
+	{"CDC Log Schema", "DESCRIBE _shardmaster_cdc;"},
 	{"Physical Shards", "SHOW SHARDS;"},
 	{"Bucket Ranges", "SHOW BUCKETS;"},
 	{"CDC Workflows", "SHOW CDC;"},
 	{"EWMA Hotspots", "SHOW HOTSPOTS;"},
-	{"Explain Route #42", "EXPLAIN SHARD SELECT * FROM users WHERE user_id = 42;"},
+	{"Cluster Stats", "SHOW STATS;"},
+	{"Explain Route #42", "EXPLAIN ANALYZE SELECT * FROM users WHERE user_id = 42;"},
 	{"Point Read #42", "SELECT * FROM users WHERE user_id = 42;"},
 	{"K-Way Merge Top 5", "SELECT * FROM users WHERE email LIKE '%@gmail.com' ORDER BY created_at DESC LIMIT 5;"},
-	{"Total Row Count", "SELECT COUNT(*) FROM users;"},
+	{"Group By Region", "SELECT region, COUNT(*), SUM(balance_usd), AVG(balance_usd) FROM users GROUP BY region;"},
 }
 
 // DashboardModel is a clean, minimalist 4-Tab TUI designed to fit 100% inside
@@ -422,14 +425,11 @@ func (m *DashboardModel) View() string {
 		lines = append(lines, fmt.Sprintf(
 			"%s  %s",
 			titleStyle.Render(fmt.Sprintf("SQL [%d/%d]: %s", m.queryIdx+1, len(presetQueries), q.title)),
-			dimStyle.Render("(Use Left/Right arrows to change query)"),
+			dimStyle.Render("(Left/Right: Switch Query, Up/Dn: Scroll)"),
 		))
 		lines = append(lines, " "+warnStyle.Render(truncateStr(q.sql, 70)))
 		if m.activeQueryRes != nil {
-			lines = append(lines, " "+barFillStyle.Render(truncateStr(strings.Join(m.activeQueryRes.Columns, " | "), 70)))
-			for _, row := range m.activeQueryRes.Rows {
-				lines = append(lines, " "+truncateStr(strings.Join(row, " | "), 70))
-			}
+			lines = append(lines, renderAlignedTUIRows(m.activeQueryRes, barFillStyle, dimStyle, 70)...)
 		}
 	}
 
@@ -504,3 +504,67 @@ func maxInt(a, b int) int {
 	}
 	return b
 }
+
+func renderAlignedTUIRows(res *router.ResultSet, hdrStyle, dimStyle lipgloss.Style, maxWidth int) []string {
+	if res == nil || len(res.Columns) == 0 {
+		return nil
+	}
+	widths := make([]int, len(res.Columns))
+	for i, c := range res.Columns {
+		widths[i] = len(c)
+	}
+	for _, r := range res.Rows {
+		for i := 0; i < len(res.Columns) && i < len(r); i++ {
+			if len(r[i]) > widths[i] {
+				widths[i] = len(r[i])
+			}
+		}
+	}
+
+	// Determine how many columns fit cleanly within maxWidth
+	used := 1
+	numCols := 0
+	for i, w := range widths {
+		if w > 22 {
+			widths[i] = 22
+			w = 22
+		}
+		if used+w+3 > maxWidth && numCols >= 2 {
+			break
+		}
+		used += w + 3
+		numCols++
+	}
+	if numCols == 0 {
+		numCols = 1
+	}
+
+	var out []string
+	var hdr strings.Builder
+	hdr.WriteString(" ")
+	for i := 0; i < numCols; i++ {
+		if i > 0 {
+			hdr.WriteString(" | ")
+		}
+		hdr.WriteString(fmt.Sprintf("%-*s", widths[i], truncateStr(res.Columns[i], widths[i])))
+	}
+	out = append(out, hdrStyle.Render(hdr.String()))
+
+	for _, r := range res.Rows {
+		var rowStr strings.Builder
+		rowStr.WriteString(" ")
+		for i := 0; i < numCols; i++ {
+			if i > 0 {
+				rowStr.WriteString(dimStyle.Render(" | "))
+			}
+			val := ""
+			if i < len(r) {
+				val = r[i]
+			}
+			rowStr.WriteString(fmt.Sprintf("%-*s", widths[i], truncateStr(val, widths[i])))
+		}
+		out = append(out, rowStr.String())
+	}
+	return out
+}
+

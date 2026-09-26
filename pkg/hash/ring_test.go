@@ -169,6 +169,63 @@ func TestPGWireProtocolServer(t *testing.T) {
 	}
 }
 
+func TestSQLEngineSchemasAndQueries(t *testing.T) {
+	dir := directory.NewShardDirectory(4)
+	cluster := storage.NewClusterStorage(4, t.TempDir())
+	cluster.SeedCluster(2000, dir.GetBucketOwner)
+	cdcEngine := cdc.NewEngine(dir, cluster)
+	tracker := hotspot.NewTracker(dir, cluster, cdcEngine)
+	qr := router.NewQueryRouter(dir, cluster, cdcEngine, tracker)
+
+	// 1. SHOW TABLES
+	res, err := qr.ExecuteSQL("SHOW TABLES;")
+	if err != nil || len(res.Rows) < 5 {
+		t.Fatalf("expected >= 5 tables from SHOW TABLES, got err=%v rows=%d", err, len(res.Rows))
+	}
+
+	// 2. DESCRIBE users
+	res, err = qr.ExecuteSQL("DESCRIBE users;")
+	if err != nil || len(res.Rows) != 11 {
+		t.Fatalf("expected 11 columns from DESCRIBE users, got err=%v rows=%d", err, len(res.Rows))
+	}
+
+	// 3. CREATE TABLE + DESCRIBE + DROP TABLE
+	_, err = qr.ExecuteSQL("CREATE TABLE orders (order_id BIGINT PRIMARY KEY, user_id BIGINT, amount_cents BIGINT);")
+	if err != nil {
+		t.Fatalf("CREATE TABLE orders failed: %v", err)
+	}
+	res, err = qr.ExecuteSQL("DESCRIBE orders;")
+	if err != nil || len(res.Rows) != 3 {
+		t.Fatalf("expected 3 columns from DESCRIBE orders, got err=%v rows=%d", err, len(res.Rows))
+	}
+	_, err = qr.ExecuteSQL("DROP TABLE orders;")
+	if err != nil {
+		t.Fatalf("DROP TABLE orders failed: %v", err)
+	}
+
+	// 4. Column projection + Multi-Key Batch IN (...)
+	res, err = qr.ExecuteSQL("SELECT user_id, name, email, balance_usd FROM users WHERE user_id IN (42, 100, 777);")
+	if err != nil || len(res.Rows) != 3 || len(res.Columns) != 4 {
+		t.Fatalf("expected 3 rows and 4 projected cols, got err=%v rows=%d cols=%d", err, len(res.Rows), len(res.Columns))
+	}
+
+	// 5. Distributed GROUP BY region
+	res, err = qr.ExecuteSQL("SELECT region, COUNT(*), SUM(balance_usd), AVG(balance_usd) FROM users GROUP BY region;")
+	if err != nil || len(res.Rows) != 4 {
+		t.Fatalf("expected 4 regional groups, got err=%v rows=%d", err, len(res.Rows))
+	}
+
+	// 6. UPDATE + CDC Journal Query
+	_, err = qr.ExecuteSQL("UPDATE users SET name = 'Grace Hopper', balance_usd = 12500.00 WHERE user_id = 42;")
+	if err != nil {
+		t.Fatalf("UPDATE users failed: %v", err)
+	}
+	res, err = qr.ExecuteSQL("SELECT * FROM _shardmaster_cdc LIMIT 5;")
+	if err != nil || len(res.Rows) == 0 {
+		t.Fatalf("expected CDC journal entries, got err=%v rows=%d", err, len(res.Rows))
+	}
+}
+
 func BenchmarkZeroAllocRouting(b *testing.B) {
 	dir := directory.NewShardDirectory(8)
 	b.ReportAllocs()
@@ -181,3 +238,4 @@ func BenchmarkZeroAllocRouting(b *testing.B) {
 		}
 	})
 }
+

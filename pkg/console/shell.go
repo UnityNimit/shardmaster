@@ -69,7 +69,6 @@ func RunSpinner(label string, duration time.Duration) {
 		)
 		time.Sleep(35 * time.Millisecond)
 	}
-	// Clear spinner line and print [OK]
 	fmt.Printf("\r%s\r", strings.Repeat(" ", len(label)+12))
 }
 
@@ -91,7 +90,6 @@ func RunSpinnerWhile(label string, fn func()) {
 		time.Sleep(40 * time.Millisecond)
 		i++
 	}
-	// Ensure at least 4 frames were visible so fast operations still show crisp feedback
 	minFrames := 6
 	if !isInteractiveTerminal() {
 		minFrames = 2
@@ -161,12 +159,21 @@ func RenderSectionHeader(title string) {
 
 // RenderProfessionalTable prints a PostgreSQL-style aligned grid table where every border matches the exact column width.
 func RenderProfessionalTable(columns []string, rows [][]string) {
+	RenderTypedTable(columns, nil, rows)
+}
+
+// RenderTypedTable prints an aligned grid table with optional PostgreSQL column data types in the header
+// and semantic cell coloring that preserves 100% exact character widths.
+func RenderTypedTable(columns []string, colTypes []string, rows [][]string) {
 	if len(columns) == 0 {
 		return
 	}
 	widths := make([]int, len(columns))
 	for i, col := range columns {
 		widths[i] = len(col)
+		if i < len(colTypes) && len(colTypes[i]) > widths[i] {
+			widths[i] = len(colTypes[i])
+		}
 	}
 	for _, row := range rows {
 		for i := 0; i < len(columns) && i < len(row); i++ {
@@ -176,25 +183,44 @@ func RenderProfessionalTable(columns []string, rows [][]string) {
 		}
 	}
 
-	// Build top/middle/bottom horizontal border: +------+------+
+	// Build horizontal borders: +------+------+ and +======+======+
 	var sepBuilder strings.Builder
+	var headSepBuilder strings.Builder
 	sepBuilder.WriteString("  +")
+	headSepBuilder.WriteString("  +")
 	for _, w := range widths {
 		sepBuilder.WriteString(strings.Repeat("-", w+2) + "+")
+		headSepBuilder.WriteString(strings.Repeat("=", w+2) + "+")
 	}
 	borderLine := dimStyle.Render(sepBuilder.String())
+	headerBorderLine := dimStyle.Render(headSepBuilder.String())
 
 	fmt.Println(borderLine)
 
-	// Header row
+	// Header row 1: Column Names
 	var hdrBuilder strings.Builder
-	hdrBuilder.WriteString("  |")
+	hdrBuilder.WriteString(dimStyle.Render("  |"))
 	for i, col := range columns {
 		padded := fmt.Sprintf(" %-*s ", widths[i], col)
 		hdrBuilder.WriteString(cyanStyle.Render(padded) + dimStyle.Render("|"))
 	}
 	fmt.Println(hdrBuilder.String())
-	fmt.Println(borderLine)
+
+	// Header row 2: Column Data Types (if provided)
+	if len(colTypes) > 0 {
+		var typeBuilder strings.Builder
+		typeBuilder.WriteString(dimStyle.Render("  |"))
+		for i := 0; i < len(columns); i++ {
+			tName := ""
+			if i < len(colTypes) {
+				tName = colTypes[i]
+			}
+			padded := fmt.Sprintf(" %-*s ", widths[i], tName)
+			typeBuilder.WriteString(dimStyle.Render(padded) + dimStyle.Render("|"))
+		}
+		fmt.Println(typeBuilder.String())
+	}
+	fmt.Println(headerBorderLine)
 
 	// Data rows
 	for _, row := range rows {
@@ -206,15 +232,87 @@ func RenderProfessionalTable(columns []string, rows [][]string) {
 				val = row[i]
 			}
 			padded := fmt.Sprintf(" %-*s ", widths[i], val)
-			if i == 0 {
-				rowBuilder.WriteString(whiteBold.Render(padded) + dimStyle.Render("|"))
-			} else {
-				rowBuilder.WriteString(padded + dimStyle.Render("|"))
-			}
+			rowBuilder.WriteString(styleCellValue(i, val, padded) + dimStyle.Render("|"))
 		}
 		fmt.Println(rowBuilder.String())
 	}
 	fmt.Println(borderLine)
+}
+
+// styleCellValue applies semantic color highlighting AFTER width padding so borders never shift by even 1 character.
+func styleCellValue(colIdx int, raw string, padded string) string {
+	upper := strings.ToUpper(strings.TrimSpace(raw))
+	if strings.Contains(upper, "VERIFIED") ||
+		upper == "READY" ||
+		upper == "ONLINE" ||
+		upper == "UNIQUE" ||
+		upper == "UPSERT" ||
+		strings.Contains(upper, "PRIMARY KEY") ||
+		strings.Contains(upper, "MATCH") ||
+		strings.Contains(upper, "CREATED_") ||
+		strings.Contains(upper, "NORMAL_ENVELOPE") {
+		return okStyle.Render(padded)
+	}
+	if strings.Contains(upper, "HOTSPOT") ||
+		strings.Contains(upper, "ISOLATED") ||
+		upper == "DELETE" ||
+		upper == "DROPPED" {
+		return hotStyle.Render(padded)
+	}
+	if strings.HasPrefix(raw, "$") ||
+		strings.HasPrefix(raw, "0x") ||
+		upper == "NOT NULL" ||
+		strings.Contains(upper, "STREAMING") ||
+		strings.Contains(upper, "SHARD KEY") {
+		return warnStyle.Render(padded)
+	}
+	if strings.HasPrefix(raw, "Bucket") ||
+		strings.HasPrefix(raw, "#") ||
+		strings.HasPrefix(raw, "Shard ") ||
+		strings.HasPrefix(raw, "shard_") {
+		return cyanStyle.Render(padded)
+	}
+	if colIdx == 0 {
+		return whiteBold.Render(padded)
+	}
+	return padded
+}
+
+// RenderSQLResult prints a complete SQL query execution report:
+// 1. Section title & SQL statement
+// 2. Execution Plan & Routing Path
+// 3. Typed PostgreSQL Grid Table
+// 4. Schema/Index Footer Notes (if any) & Summary Status Line
+func RenderSQLResult(sql string, res *router.ResultSet) {
+	title := res.Title
+	if title == "" {
+		title = "SQL QUERY RESULT"
+	}
+	RenderSectionHeader(title)
+
+	fmt.Printf("  %s %s\n", cyanStyle.Render("SQL  >"), warnStyle.Render(sql))
+	if res.ExecutionPlan != "" {
+		fmt.Printf("  %s %s\n", cyanStyle.Render("PLAN >"), whiteBold.Render(res.ExecutionPlan))
+	}
+
+	RenderTypedTable(res.Columns, res.ColumnTypes, res.Rows)
+
+	for _, note := range res.FooterNotes {
+		fmt.Printf("  %s %s\n", cyanStyle.Render("*"), dimStyle.Render(note))
+	}
+
+	latUs := res.LatencyUs
+	if latUs <= 0 {
+		latUs = 18
+	}
+	ms := float64(latUs) / 1000.0
+	fmt.Printf("  %s (%d rows)  |  Tag: %s  |  Route: %s  |  Time: %s\n",
+		okStyle.Render("[OK]"),
+		len(res.Rows),
+		whiteBold.Render(res.CommandTag),
+		cyanStyle.Render(res.RoutedShard),
+		okStyle.Render(fmt.Sprintf("%.3f ms (%d us)", ms, latUs)),
+	)
 }
 
 // RunInteractiveShell boots the complete ShardMaster system in the background
@@ -289,9 +387,12 @@ func RunInteractiveShell(qr *router.QueryRouter) {
 			}
 			runLookupAction(qr, key)
 
-		case "5", "sql", "query", "queries":
-			if len(args) > 0 {
-				runSQLAction(qr, strings.Join(args, " "))
+		case "5", "sql", "query", "queries", "schema", "tables":
+			if cmd == "schema" || cmd == "tables" {
+				runSQLAction(qr, "SHOW TABLES;")
+				runSQLAction(qr, "DESCRIBE users;")
+			} else if len(args) > 0 {
+				runSQLPresetOrQuery(qr, strings.Join(args, " "))
 			} else {
 				runInteractiveSQLMenu(qr, reader)
 			}
@@ -402,21 +503,28 @@ func RunInteractiveShell(qr *router.QueryRouter) {
 
 		default:
 			upper := strings.ToUpper(input)
-			if strings.HasPrefix(upper, "SELECT ") ||
+			if strings.HasPrefix(input, `\`) ||
+				strings.HasPrefix(upper, "SELECT ") ||
 				strings.HasPrefix(upper, "INSERT ") ||
 				strings.HasPrefix(upper, "UPDATE ") ||
 				strings.HasPrefix(upper, "DELETE ") ||
 				strings.HasPrefix(upper, "SHOW ") ||
-				strings.HasPrefix(upper, "EXPLAIN ") ||
+				strings.HasPrefix(upper, "DESCRIBE") ||
+				strings.HasPrefix(upper, "DESC ") ||
+				upper == "DESC" ||
+				strings.HasPrefix(upper, "CREATE ") ||
+				strings.HasPrefix(upper, "DROP ") ||
+				strings.HasPrefix(upper, "EXPLAIN") ||
 				strings.HasPrefix(upper, "REBALANCE") ||
 				strings.HasPrefix(upper, "RUN VDIFF") {
 				runSQLAction(qr, input)
 			} else {
-				fmt.Printf("  %s Unknown command '%s'. Type %s or %s.\n",
+				fmt.Printf("  %s Unknown command '%s'. Type %s, %s, or any SQL query (e.g. %s).\n",
 					warnStyle.Render("[INFO]"),
 					input,
 					cyanStyle.Render("1-12"),
-					okStyle.Render("menu"))
+					okStyle.Render("menu"),
+					warnStyle.Render("DESCRIBE users;"))
 			}
 		}
 	}
@@ -427,7 +535,7 @@ func printMainMenu() {
 	fmt.Printf("   %s  %-22s %s\n", okStyle.Render("[2]"), whiteBold.Render("Cluster Status"), dimStyle.Render("View shard load bars, row counts & CDC lag"))
 	fmt.Printf("   %s  %-22s %s\n", okStyle.Render("[3]"), whiteBold.Render("Live Dashboard (TUI)"), dimStyle.Render("Open 4-Tab Terminal UI (fits any screen)"))
 	fmt.Printf("   %s  %-22s %s\n", cyanStyle.Render("[4]"), whiteBold.Render("Route User Key"), dimStyle.Render("Inspect O(1) xxHash64 & Virtual Bucket"))
-	fmt.Printf("   %s  %-22s %s\n", cyanStyle.Render("[5]"), whiteBold.Render("SQL & Query Explorer"), dimStyle.Render("Run 16 built-in queries or custom SQL"))
+	fmt.Printf("   %s  %-22s %s\n", cyanStyle.Render("[5]"), whiteBold.Render("SQL & Schema Engine"), dimStyle.Render("Inspect table schemas, DDL & run 22 SQL presets"))
 	fmt.Printf("   %s  %-22s %s\n", warnStyle.Render("[6]"), whiteBold.Render("Add Physical Shard"), dimStyle.Render("Add regional shard & stream buckets (CDC)"))
 	fmt.Printf("   %s  %-22s %s\n", warnStyle.Render("[7]"), whiteBold.Render("Zero-Downtime Split"), dimStyle.Render("Split cluster (4 -> 8 shards) with VDiff"))
 	fmt.Printf("   %s  %-22s %s\n", hotStyle.Render("[8]"), whiteBold.Render("Hotspot Self-Healer"), dimStyle.Render("Spike Bucket #412 & watch auto-isolation"))
@@ -437,7 +545,7 @@ func printMainMenu() {
 	fmt.Printf("  %s  %-22s %s\n", warnStyle.Render("[12]"), whiteBold.Render("Architecture Manual"), dimStyle.Render("Formulas, internals & psql connection guide"))
 	fmt.Println(dimStyle.Render("  ------------------------------------------------------------------------"))
 	fmt.Printf("   Quick Commands:  %s  |  %s  |  %s  |  %s  |  %s\n",
-		okStyle.Render("demo"), warnStyle.Render("reset"), cyanStyle.Render("menu"), dimStyle.Render("clear"), hotStyle.Render("exit"))
+		okStyle.Render("demo"), cyanStyle.Render("schema"), warnStyle.Render("reset"), dimStyle.Render("menu"), hotStyle.Render("exit"))
 }
 
 // ============================================================================
@@ -486,8 +594,9 @@ func runLookupAction(qr *router.QueryRouter, key string) {
 	info := qr.Dir.LookupDetailed(key)
 
 	RenderSectionHeader("PILLAR 1: O(1) ATOMIC SHARD DIRECTORY LOOKUP")
-	RenderProfessionalTable(
-		[]string{"SHARD KEY", "XXHASH64 DIGEST", "VIRTUAL BUCKET", "TARGET SHARD", "SOURCE", "LATENCY"},
+	RenderTypedTable(
+		[]string{"shard_key", "xxhash64_digest", "virtual_bucket", "target_shard", "directory_source", "latency"},
+		[]string{"VARCHAR(64)", "CHAR(18)", "SMALLINT [0..1023]", "PHYSICAL NODE", "MEMORY TIER", "NANOSECONDS"},
 		[][]string{{
 			info.Key,
 			fmt.Sprintf("0x%016x", info.HashValue),
@@ -499,61 +608,78 @@ func runLookupAction(qr *router.QueryRouter, key string) {
 	)
 }
 
-func runInteractiveSQLMenu(qr *router.QueryRouter, reader *bufio.Reader) {
-	RunSpinner("Opening SQL & Internal Query Explorer...", 160*time.Millisecond)
-	RenderSectionHeader("SQL & INTERNAL QUERY EXPLORER (50,000,000 ROWS)")
-	fmt.Printf("   %-35s %s\n", cyanStyle.Render("INTERNAL DIAGNOSTICS"), cyanStyle.Render("DATA & K-WAY MERGE QUERIES"))
-	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[1]"), "Show Physical Shards", warnStyle.Render("[9] "), "Point Lookup (user_id = 42)")
-	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[2]"), "Show Bucket Ranges [0..1023]", warnStyle.Render("[10]"), "Point Lookup (user_id = 49.9M)")
-	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[3]"), "Show CDC Workflows", warnStyle.Render("[11]"), "K-Way Merge (@gmail.com Top 5)")
-	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[4]"), "Show EWMA Hotspots", warnStyle.Render("[12]"), "K-Way Merge (@stripe.com Top 5)")
-	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[5]"), "Show Engine & RAM Stats", warnStyle.Render("[13]"), "K-Way Merge (region = us-west)")
-	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[6]"), "Run VDiff SHA-256 Audit", warnStyle.Render("[14]"), "Count All Rows (50,000,000)")
-	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[7]"), "Explain Route (user_id = 42)", warnStyle.Render("[15]"), "Insert User (CDC Log Append)")
-	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[8]"), "Show All 16 SQL Syntaxes", warnStyle.Render("[16]"), "Delete User (Tombstone + CDC)")
-	fmt.Println(dimStyle.Render("  ------------------------------------------------------------------------"))
-	fmt.Printf("   %s Run All Diagnostics (1-5)  |  Or type any custom SQL query\n", cyanStyle.Render("[all]"))
+var sqlPresets = map[string]string{
+	"1":  "SHOW TABLES;",
+	"2":  "DESCRIBE users;",
+	"3":  "DESCRIBE _shardmaster_cdc;",
+	"4":  "SHOW CREATE TABLE users;",
+	"5":  "SHOW INDEXES;",
+	"6":  "SHOW SHARDS;",
+	"7":  "SHOW BUCKETS;",
+	"8":  "SHOW CDC;",
+	"9":  "SHOW HOTSPOTS;",
+	"10": "SHOW STATS;",
+	"11": "RUN VDIFF;",
+	"12": "EXPLAIN ANALYZE SELECT * FROM users WHERE user_id = 42;",
+	"13": "SELECT * FROM users WHERE user_id = 42;",
+	"14": "SELECT * FROM users WHERE user_id IN (42, 100, 777, 8888, 49999999);",
+	"15": "SELECT * FROM users WHERE email LIKE '%@gmail.com' ORDER BY created_at DESC LIMIT 5;",
+	"16": "SELECT * FROM users WHERE region = 'us-west' ORDER BY created_at DESC LIMIT 5;",
+	"17": "SELECT region, COUNT(*), SUM(balance_usd), AVG(balance_usd) FROM users GROUP BY region;",
+	"18": "SELECT shard_id, COUNT(*), AVG(balance_usd) FROM users GROUP BY shard_id;",
+	"19": "INSERT INTO users (user_id, name, email, balance_cents) VALUES (42, 'Ada Lovelace', 'ada@gmail.com', 950000);",
+	"20": "UPDATE users SET name = 'Grace Hopper', balance_usd = 12500.00 WHERE user_id = 42;",
+	"21": "DELETE FROM users WHERE user_id = 100;",
+	"22": "SELECT * FROM _shardmaster_cdc LIMIT 6;",
+}
 
-	choice := promptDefault(reader, "Select [1-16, 'all', or custom SQL] [default: 1]", "1")
-	switch strings.ToLower(choice) {
-	case "1":
-		runSQLAction(qr, "SHOW SHARDS;")
-	case "2":
-		runSQLAction(qr, "SHOW BUCKETS;")
-	case "3":
-		runSQLAction(qr, "SHOW CDC;")
-	case "4":
-		runSQLAction(qr, "SHOW HOTSPOTS;")
-	case "5":
-		runSQLAction(qr, "SHOW STATS;")
-	case "6":
-		runSQLAction(qr, "RUN VDIFF;")
-	case "7":
-		runSQLAction(qr, "EXPLAIN SHARD SELECT * FROM users WHERE user_id = 42;")
-	case "8":
-		runSQLAction(qr, "SHOW QUERIES;")
-	case "9":
-		runSQLAction(qr, "SELECT * FROM users WHERE user_id = 42;")
-	case "10":
-		runSQLAction(qr, "SELECT * FROM users WHERE user_id = 49999999;")
-	case "11":
-		runSQLAction(qr, "SELECT * FROM users WHERE email LIKE '%@gmail.com' ORDER BY created_at DESC LIMIT 5;")
-	case "12":
-		runSQLAction(qr, "SELECT * FROM users WHERE email LIKE '%@stripe.com' ORDER BY created_at DESC LIMIT 5;")
-	case "13":
-		runSQLAction(qr, "SELECT * FROM users WHERE region = 'us-west' ORDER BY created_at DESC LIMIT 5;")
-	case "14":
-		runSQLAction(qr, "SELECT COUNT(*) FROM users;")
-	case "15":
-		runSQLAction(qr, "INSERT INTO users (user_id, name, email) VALUES (42, 'Ada Lovelace', 'ada@gmail.com');")
-	case "16":
-		runSQLAction(qr, "DELETE FROM users WHERE user_id = 100;")
+func runInteractiveSQLMenu(qr *router.QueryRouter, reader *bufio.Reader) {
+	RunSpinner("Opening Distributed SQL & Schema Explorer...", 160*time.Millisecond)
+	RenderSectionHeader("DISTRIBUTED SQL & SCHEMA ENGINE (50,000,000 ROWS)")
+
+	fmt.Printf("   %-36s %s\n", cyanStyle.Render("SCHEMA & DDL CATALOG"), cyanStyle.Render("POINT, BATCH & K-WAY MERGE"))
+	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[1] "), "SHOW TABLES (All 5 Tables)", warnStyle.Render("[13]"), "Point Lookup (user_id = 42)")
+	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[2] "), "DESCRIBE users (Full Schema)", warnStyle.Render("[14]"), "Multi-Key IN (42, 100, 777..)")
+	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[3] "), "DESCRIBE _shardmaster_cdc", warnStyle.Render("[15]"), "K-Way Merge (@gmail.com Top 5)")
+	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[4] "), "SHOW CREATE TABLE users (DDL)", warnStyle.Render("[16]"), "K-Way Merge (region = us-west)")
+	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[5] "), "SHOW INDEXES (Global & Local)", warnStyle.Render("[17]"), "GROUP BY region (Map-Reduce)")
+	fmt.Println(dimStyle.Render("  ------------------------------------------------------------------------"))
+	fmt.Printf("   %-36s %s\n", cyanStyle.Render("CLUSTER TELEMETRY & PLANNER"), cyanStyle.Render("AGGREGATIONS & CDC MUTATIONS"))
+	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[6] "), "SHOW SHARDS (Nodes & Ports)", warnStyle.Render("[18]"), "GROUP BY shard_id (Balances)")
+	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[7] "), "SHOW BUCKETS (Ring [0..1023])", warnStyle.Render("[19]"), "INSERT User (Appends CDC LSN)")
+	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[8] "), "SHOW CDC (VReplication State)", warnStyle.Render("[20]"), "UPDATE User (Grace Hopper)")
+	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[9] "), "SHOW HOTSPOTS (EWMA Top-8)", warnStyle.Render("[21]"), "DELETE User (Tombstone + CDC)")
+	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[10]"), "SHOW STATS (RAM & Counters)", warnStyle.Render("[22]"), "SELECT * FROM _shardmaster_cdc")
+	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[11]"), "RUN VDIFF (XOR-SHA256 Audit)", cyanStyle.Render("[schema]"), "Run All Schema Views (1-5)")
+	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[12]"), "EXPLAIN ANALYZE Query Plan", cyanStyle.Render("[all]   "), "Run Full Diagnostic Suite")
+	fmt.Println(dimStyle.Render("  ------------------------------------------------------------------------"))
+	fmt.Printf("   Or type any custom SQL (e.g. %s or %s)\n",
+		warnStyle.Render("CREATE TABLE orders (order_id BIGINT PRIMARY KEY, amount INT);"),
+		warnStyle.Render("DESCRIBE _shardmaster_buckets;"))
+
+	choice := promptDefault(reader, "Select [1-22, 'schema', 'all', or custom SQL] [default: 2]", "2")
+	runSQLPresetOrQuery(qr, choice)
+}
+
+func runSQLPresetOrQuery(qr *router.QueryRouter, choice string) {
+	clean := strings.TrimSpace(choice)
+	lower := strings.ToLower(clean)
+
+	if sql, ok := sqlPresets[lower]; ok {
+		runSQLAction(qr, sql)
+		return
+	}
+	switch lower {
+	case "schema", "schemas", "ddl":
+		for _, id := range []string{"1", "2", "3", "4", "5"} {
+			runSQLAction(qr, sqlPresets[id])
+		}
 	case "all", "0":
-		for _, q := range []string{"SHOW SHARDS;", "SHOW BUCKETS;", "SHOW CDC;", "SHOW HOTSPOTS;", "SHOW STATS;"} {
-			runSQLAction(qr, q)
+		for _, id := range []string{"1", "2", "6", "7", "12", "13", "15", "17"} {
+			runSQLAction(qr, sqlPresets[id])
 		}
 	default:
-		runSQLAction(qr, choice)
+		runSQLAction(qr, clean)
 	}
 }
 
@@ -567,14 +693,7 @@ func runSQLAction(qr *router.QueryRouter, sql string) {
 		fmt.Printf("  %s Query Error: %v\n", hotStyle.Render("[ERROR]"), err)
 		return
 	}
-	fmt.Printf("\n  %s %s\n", cyanStyle.Render("SQL >"), warnStyle.Render(sql))
-	fmt.Printf("  %s Route: %s  |  Latency: %s  |  Tag: %s\n",
-		okStyle.Render("[OK]"),
-		cyanStyle.Render(res.RoutedShard),
-		okStyle.Render(fmt.Sprintf("%d us", res.LatencyUs)),
-		whiteBold.Render(res.CommandTag),
-	)
-	RenderProfessionalTable(res.Columns, res.Rows)
+	RenderSQLResult(sql, res)
 }
 
 func runAddShardAction(qr *router.QueryRouter, region string) {
@@ -643,8 +762,9 @@ func runRebalanceAction(qr *router.QueryRouter, targetNumShards uint32) {
 			"MATCH (0ms Lag)",
 		})
 	}
-	RenderProfessionalTable(
-		[]string{"BUCKET RANGE", "MIGRATION ROUTE", "ROWS MOVED", "VDIFF SHA256-XOR", "STATUS"},
+	RenderTypedTable(
+		[]string{"bucket_range", "migration_route", "rows_moved", "vdiff_sha256_xor", "status"},
+		[]string{"SMALLINT RANGE", "SHARD TRANSFER", "INT8", "CHAR(64) DIGEST", "PARITY VERDICT"},
 		vdiffRows,
 	)
 	PrintStaticDashboard(qr, false)
@@ -658,8 +778,9 @@ func runHotspotAction(qr *router.QueryRouter, bucketID uint16) {
 
 	RunSpinner("Evaluating 64-Byte Padded EWMA Counters & Isolating Hot Bucket...", 240*time.Millisecond)
 	if alert := qr.HotspotTracker.TickAndEvaluate(1.0); alert != nil {
-		RenderProfessionalTable(
-			[]string{"HOT BUCKET", "MEASURED LOAD", "ISOLATION ROUTE", "VDIFF DIGEST", "DOWNTIME"},
+		RenderTypedTable(
+			[]string{"hot_bucket", "measured_load", "isolation_route", "vdiff_digest", "downtime"},
+			[]string{"SMALLINT", "EWMA QPS", "SHARD TRANSFER", "CHAR(64) XOR", "AVAILABILITY"},
 			[][]string{{
 				fmt.Sprintf("Bucket #%d", alert.BucketID),
 				fmt.Sprintf("%d QPS (>98th Pct)", alert.MeasuredQPS),
@@ -687,8 +808,9 @@ func runVDiffAction(qr *router.QueryRouter) {
 			row[3],
 		})
 	}
-	RenderProfessionalTable(
-		[]string{"PHYSICAL SHARD", "ROWS VERIFIED", "ROLLING XOR-SHA256 DIGEST", "PARITY STATUS"},
+	RenderTypedTable(
+		[]string{"physical_shard", "rows_verified", "rolling_xor_sha256_digest", "parity_status"},
+		[]string{"SHARD NODE", "INT8 COUNT", "256-BIT MERKLE DIGEST", "AUDIT VERDICT"},
 		tableRows,
 	)
 }
@@ -700,8 +822,9 @@ func runBenchAction(qr *router.QueryRouter, benchDuration int) {
 		res = bench.RunPeakBenchmark(qr, time.Duration(benchDuration)*time.Second, 0)
 	})
 
-	RenderProfessionalTable(
-		[]string{"BENCHMARK METRIC", "MEASURED RESULT", "ARCHITECTURAL MECHANISM"},
+	RenderTypedTable(
+		[]string{"benchmark_metric", "measured_result", "architectural_mechanism"},
+		[]string{"TELEMETRY", "MEASURED VALUE", "SUBSYSTEM IMPLEMENTATION"},
 		[][]string{
 			{"Peak Routing Throughput", FormatCommas(res.RoutingThroughputQPS) + " req/sec", fmt.Sprintf("%d Logical CPU Threads in Parallel", runtime.NumCPU())},
 			{"Total Keys Routed", FormatCommas(res.TotalRoutingOps) + " ops", fmt.Sprintf("Completed in %v", res.Duration.Round(time.Millisecond))},
@@ -718,8 +841,9 @@ func runPetabyteAction(simFrom, simTo uint32) {
 		rep = bench.SimulatePetabyteScale(simFrom, simTo)
 	})
 	RenderSectionHeader("1-PETABYTE (1,000,000,000,000 ROWS) ARCHITECTURE PROOF")
-	RenderProfessionalTable(
-		[]string{"SIMULATION PARAMETER", "MEASURED VALUE", "ENGINEERING IMPACT"},
+	RenderTypedTable(
+		[]string{"simulation_parameter", "measured_value", "engineering_impact"},
+		[]string{"CAPACITY DIMENSION", "COMPUTED METRIC", "CLUSTER SCALABILITY"},
 		[][]string{
 			{"Simulated Dataset Scale", "1.00 Petabyte (1,024 TB)", "1,000,000,000,000 Rows @ 1 KB/row"},
 			{"Virtual Bucket Density", FormatCommas(rep.RecordsPerBucket) + " rows/bucket", fmt.Sprintf("%.0f GB per Virtual Bucket", rep.DataGBPerBucket)},
@@ -804,8 +928,9 @@ func PrintStaticDashboard(qr *router.QueryRouter, showReshardingExample bool) {
 		})
 	}
 
-	RenderProfessionalTable(
-		[]string{"SHARD NODE", "REGION", "LOAD DISTRIBUTION", "BUCKETS", "ROW COUNT", "THROUGHPUT"},
+	RenderTypedTable(
+		[]string{"shard_node", "region", "load_distribution", "virtual_buckets", "row_count", "throughput"},
+		[]string{"PHYSICAL NODE", "ZONE", "BUCKET CAPACITY BAR", "INT4 [0..1024]", "INT8 SLAB", "ROLLING QPS"},
 		rows,
 	)
 
@@ -829,6 +954,7 @@ func RunSixPillarShowcase(qr *router.QueryRouter) {
 	RenderSectionHeader("SHARDMASTER: 6-PILLAR END-TO-END AUTOMATED SHOWCASE")
 
 	runLookupAction(qr, "42")
+	runSQLAction(qr, "DESCRIBE users;")
 	runSQLAction(qr, "SELECT * FROM users WHERE email LIKE '%@gmail.com' ORDER BY created_at DESC LIMIT 3;")
 	runAddShardAction(qr, "us-west")
 	runHotspotAction(qr, 412)
