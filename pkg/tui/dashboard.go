@@ -420,33 +420,35 @@ func (m *DashboardModel) applyFreeFormShardModal() (tea.Model, tea.Cmd) {
 		m.selectedShardIdx = int(newShard.ShardID)
 		m.statusBanner = fmt.Sprintf("Created S%d [%s] (Max: %s) -> Streaming %d Buckets...", newShard.ShardID, newShard.DisplayName(), storage.FormatBytesExact(maxBytes), targetBuckets)
 		go func(id uint32, b int, maxB int64, slabB int) {
-			_, _ = m.qr.CDC.ResizeShardBuckets(id, b, 18*time.Millisecond)
+			_, _ = m.qr.CDC.ResizeShardBuckets(id, b, 15*time.Millisecond)
 			if s, ok := m.qr.Cluster.GetShard(id); ok {
 				s.ResizeMemorySlabs(maxB, slabB)
 			}
 		}(newShard.ShardID, targetBuckets, maxBytes, slabBytes)
 	} else {
 		if s, ok := m.qr.Cluster.GetShard(sid); ok {
-			s.UpdateSettings(cfg)
-			s.ResizeMemorySlabs(maxBytes, slabBytes)
 			counts := m.qr.Dir.BucketCountsByShard()
 			curB := counts[sid]
-			if cfg.AccessMode == "DRAINING" || targetBuckets == 0 {
-				m.statusBanner = fmt.Sprintf("Draining S%d [%s] -> 0 Buckets via Zero-Downtime CDC...", sid, s.DisplayName())
-				go func(id uint32) {
-					_, _ = m.qr.CDC.DrainShard(id, 18*time.Millisecond)
-				}(sid)
-			} else if targetBuckets != curB {
-				m.statusBanner = fmt.Sprintf("Updated S%d [%s] (%s) & Resizing %d -> %d Buckets...", sid, s.DisplayName(), storage.FormatBytesCompact(s.UsedMemoryBytes()), curB, targetBuckets)
-				go func(id uint32, b int, maxB int64, slabB int) {
-					_, _ = m.qr.CDC.ResizeShardBuckets(id, b, 18*time.Millisecond)
-					if sh, ok := m.qr.Cluster.GetShard(id); ok {
-						sh.ResizeMemorySlabs(maxB, slabB)
-					}
-				}(sid, targetBuckets, maxBytes, slabBytes)
+			explicitBuckets := -1
+			if targetBuckets != curB {
+				explicitBuckets = targetBuckets
+			}
+			snap, enfErr := m.qr.CDC.EnforceShardCapacityAndBuckets(sid, cfg, explicitBuckets, 0)
+			if enfErr != nil {
+				m.statusBanner = fmt.Sprintf("REJECTED S%d: %v", sid, enfErr)
 			} else {
+				evacuated := 0
+				if snap != nil {
+					evacuated = snap.RangesCompleted
+				}
 				m.qr.Cluster.SaveStateFile(m.qr.Dir.SnapshotBuckets())
-				m.statusBanner = fmt.Sprintf("Saved S%d [%s] | Live RAM: %s / %s", sid, s.DisplayName(), storage.FormatBytesExact(s.UsedMemoryBytes()), storage.FormatBytesExact(maxBytes))
+				if evacuated > 0 {
+					m.statusBanner = fmt.Sprintf("Saved S%d [%s] | Evacuated %d Ranges via CDC | RAM: %s / %s",
+						sid, s.DisplayName(), evacuated, storage.FormatBytesCompact(s.UsedMemoryBytes()), storage.FormatBytesCompact(maxBytes))
+				} else {
+					m.statusBanner = fmt.Sprintf("Saved S%d [%s] | Live RAM: %s / %s",
+						sid, s.DisplayName(), storage.FormatBytesExact(s.UsedMemoryBytes()), storage.FormatBytesExact(maxBytes))
+				}
 			}
 		}
 	}

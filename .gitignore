@@ -1,4 +1,23 @@
-data/
+# Compiled binaries and release archives (uploaded via GitHub Releases)
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.zip
+*.tar.gz
+
+# Documents and generated artifacts
+*.pdf
 *.log
 
-*.exe~
+# Runtime cluster state and local data directory
+data/
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

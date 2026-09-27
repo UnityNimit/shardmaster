@@ -1,7 +1,8 @@
 package hash
 
 import (
-	"encoding/binary"
+	"strconv"
+
 	"github.com/cespare/xxhash/v2"
 )
 
@@ -26,13 +27,14 @@ func HashKey(key string) uint64 {
 	return xxhash.Sum64String(key)
 }
 
-// HashInt64 computes a 64-bit xxHash digest for an integer key on the stack (0 allocs/op).
+// HashInt64 computes a 64-bit xxHash digest for an integer key on the stack (0 allocs/op),
+// matching HashKey(strconv.FormatInt(id, 10)) bit-for-bit.
 //
 //go:inline
 func HashInt64(id int64) uint64 {
-	var buf [8]byte
-	binary.LittleEndian.PutUint64(buf[:], uint64(id))
-	return xxhash.Sum64(buf[:])
+	var buf [24]byte
+	b := strconv.AppendInt(buf[:0], id, 10)
+	return xxhash.Sum64(b)
 }
 
 // ComputeBucket maps any string shard key to a virtual bucket in [0, 1023] in O(1) time.

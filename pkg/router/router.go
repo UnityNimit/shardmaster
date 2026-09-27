@@ -1,6 +1,7 @@
 package router
 
 import (
+	"errors"
 	"fmt"
 	"runtime"
 	"sort"
@@ -50,13 +51,14 @@ func NewQueryRouter(
 	tracker *hotspot.Tracker,
 ) *QueryRouter {
 	schema := NewSchemaCatalog()
+	sqlEng := NewRelationalEngine(dir, cluster, cdcEngine, schema)
 	return &QueryRouter{
 		Dir:            dir,
 		Cluster:        cluster,
 		CDC:            cdcEngine,
 		HotspotTracker: tracker,
 		Schema:         schema,
-		SQL:            NewRelationalEngine(dir, cluster, schema),
+		SQL:            sqlEng,
 	}
 }
 
@@ -81,9 +83,17 @@ func (qr *QueryRouter) ExecuteSQL(sql string) (*ResultSet, error) {
 	if len(stmts) > 1 {
 		var batchNotes []string
 		var lastRes *ResultSet
+		startedTxInBatch := false
 		for i, stmt := range stmts {
+			upperStmt := strings.ToUpper(strings.TrimSpace(stmt))
+			if upperStmt == "BEGIN" || strings.HasPrefix(upperStmt, "BEGIN ") || strings.HasPrefix(upperStmt, "START TRANSACTION") {
+				startedTxInBatch = true
+			}
 			res, err := qr.executeSingleSQL(stmt)
 			if err != nil {
+				if startedTxInBatch && qr.SQL != nil && qr.SQL.InTransaction() {
+					qr.SQL.AbortTransaction()
+				}
 				return nil, fmt.Errorf("statement %d (%s): %v", i+1, stmt, err)
 			}
 			lastRes = res
@@ -171,6 +181,18 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 		rows := make([][]string, 0, len(tables))
 		for _, t := range tables {
 			rc := FormatRowCountForTable(t.TableName, usersRows, cdcCount, len(shards), vdiffCount)
+			if strings.HasPrefix(rc, "0 (Custom") {
+				var customRows int
+				var customBytes int64
+				for _, s := range shards {
+					bBytes, rCount := s.GetCustomTableTotalBytesAndRows(t.TableName)
+					customBytes += bBytes
+					customRows += rCount
+				}
+				if customRows > 0 {
+					rc = fmt.Sprintf("%d (%s)", customRows, storage.FormatBytesCompact(customBytes))
+				}
+			}
 			rows = append(rows, []string{
 				t.SchemaName,
 				t.TableName,
@@ -708,23 +730,29 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 		}, nil
 
 	case QueryAdminRebalance:
-		go func(target uint32) {
-			_, _ = qr.CDC.RebalanceToShards(target, 25*time.Millisecond)
-		}(cq.TargetShards)
+		snap, err := qr.CDC.RebalanceToShards(cq.TargetShards, 0)
+		if err != nil {
+			return nil, err
+		}
+		rangesDone := 0
+		if snap != nil {
+			rangesDone = snap.RangesCompleted
+		}
 		return &ResultSet{
 			Title:       "ZERO-DOWNTIME CDC RESHARDING WORKFLOW",
-			Columns:     []string{"workflow", "target_shards", "engine", "status"},
-			ColumnTypes: []string{"VARCHAR", "INT4", "VARCHAR", "VARCHAR"},
+			Columns:     []string{"workflow", "target_shards", "ranges_migrated", "engine", "status"},
+			ColumnTypes: []string{"VARCHAR", "INT4", "INT4", "VARCHAR", "VARCHAR"},
 			Rows: [][]string{{
 				"CDC_VREPLICATION_SPLIT",
 				strconv.FormatUint(uint64(cq.TargetShards), 10),
+				strconv.Itoa(rangesDone),
 				"Keyset Backfill + CDC Stream + VDiff",
-				"STARTED (0ms Downtime)",
+				"COMPLETED (0ms Downtime)",
 			}},
 			CommandTag:    "REBALANCE",
 			LatencyUs:     time.Since(start).Microseconds(),
 			RoutedShard:   "CONTROL_PLANE",
-			ExecutionPlan: fmt.Sprintf("Asynchronous Vitess VReplication Split to %d Physical Shards", cq.TargetShards),
+			ExecutionPlan: fmt.Sprintf("Zero-Downtime Vitess VReplication Split to %d Physical Shards (%d VDiff Ranges Verified)", cq.TargetShards, rangesDone),
 		}, nil
 
 	case QueryAdminVDiff:
@@ -805,29 +833,55 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 
 	case QueryPointUpsert:
 		qr.PointQueries.Add(1)
-		shardID, bucket := qr.Dir.LookupFast(cq.UserKey)
+		shardID, bucket, release := qr.Dir.AcquireBucketWrite(cq.UserKey)
 		qr.HotspotTracker.RecordHit(bucket)
-
-		for qr.Dir.GetBucketState(bucket) == directory.BucketStateCutoverGate {
-			time.Sleep(50 * time.Microsecond)
-			shardID, _ = qr.Dir.LookupFast(cq.UserKey)
-		}
 
 		shard, ok := qr.Cluster.GetShard(shardID)
 		if !ok {
 			shard = qr.Cluster.EnsureShard(shardID, "")
 		}
+		if qr.SQL != nil && qr.SQL.InTransaction() {
+			qr.SQL.RecordBucketBackupBeforeWrite(shardID, bucket)
+		}
 
-		saved := shard.UpsertUser(storage.UserRow{
+		tenant := cq.TenantFilter
+		if tenant == "" {
+			tenant = "tenant_core"
+		}
+		region := cq.RegionFilter
+		if region == "" {
+			region = shard.Region
+		}
+		upRow := storage.UserRow{
 			UserID:       cq.UserID,
 			UserKey:      cq.UserKey,
 			Name:         cq.Name,
 			Email:        cq.Email,
-			TenantID:     "tenant_core",
-			Region:       shard.Region,
+			TenantID:     tenant,
+			Region:       region,
 			BalanceCents: cq.BalanceCents,
 			BucketID:     bucket,
-		}, true)
+		}
+
+		saved, err := shard.TryUpsertUser(upRow, true, true)
+		release()
+
+		if errors.Is(err, storage.ErrShardCapacityExceeded) && qr.CDC != nil {
+			needed := storage.UserRowMemoryBytes(upRow)
+			if _, evErr := qr.CDC.AutoEvacuateForWrite(shardID, bucket, needed); evErr == nil {
+				shardID, bucket, release = qr.Dir.AcquireBucketWrite(cq.UserKey)
+				if shard2, ok2 := qr.Cluster.GetShard(shardID); ok2 {
+					shard = shard2
+					upRow.BucketID = bucket
+					saved, err = shard.TryUpsertUser(upRow, true, true)
+				}
+				release()
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
+
 		if qr.SQL != nil {
 			qr.SQL.SyncUserUpsert(shard.ShardID, saved)
 		}
@@ -845,17 +899,15 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 
 	case QueryPointUpdate:
 		qr.PointQueries.Add(1)
-		shardID, bucket := qr.Dir.LookupFast(cq.UserKey)
+		shardID, bucket, release := qr.Dir.AcquireBucketWrite(cq.UserKey)
 		qr.HotspotTracker.RecordHit(bucket)
-
-		for qr.Dir.GetBucketState(bucket) == directory.BucketStateCutoverGate {
-			time.Sleep(50 * time.Microsecond)
-			shardID, _ = qr.Dir.LookupFast(cq.UserKey)
-		}
 
 		shard, ok := qr.Cluster.GetShard(shardID)
 		if !ok {
 			shard = qr.Cluster.EnsureShard(shardID, "")
+		}
+		if qr.SQL != nil && qr.SQL.InTransaction() {
+			qr.SQL.RecordBucketBackupBeforeWrite(shardID, bucket)
 		}
 
 		existing, found := shard.GetUser(cq.UserID)
@@ -886,9 +938,28 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 		if cq.HasBalanceUpd {
 			existing.BalanceCents = cq.BalanceCents
 		}
+		existing.BucketID = bucket
 		existing.UpdatedAt = time.Now().UTC()
 
-		saved := shard.UpsertUser(existing, true)
+		saved, err := shard.TryUpsertUser(existing, true, true)
+		release()
+
+		if errors.Is(err, storage.ErrShardCapacityExceeded) && qr.CDC != nil {
+			needed := storage.UserRowMemoryBytes(existing)
+			if _, evErr := qr.CDC.AutoEvacuateForWrite(shardID, bucket, needed); evErr == nil {
+				shardID, bucket, release = qr.Dir.AcquireBucketWrite(cq.UserKey)
+				if shard2, ok2 := qr.Cluster.GetShard(shardID); ok2 {
+					shard = shard2
+					existing.BucketID = bucket
+					saved, err = shard.TryUpsertUser(existing, true, true)
+				}
+				release()
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
+
 		if qr.SQL != nil {
 			qr.SQL.SyncUserUpsert(shard.ShardID, saved)
 		}
@@ -905,14 +976,28 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 
 	case QueryPointDelete:
 		qr.PointQueries.Add(1)
-		shardID, bucket := qr.Dir.LookupFast(cq.UserKey)
+		shardID, bucket, release := qr.Dir.AcquireBucketWrite(cq.UserKey)
 		qr.HotspotTracker.RecordHit(bucket)
 
 		shard, ok := qr.Cluster.GetShard(shardID)
+		if !ok {
+			release()
+			return nil, fmt.Errorf("physical shard %d not available", shardID)
+		}
+		if qr.SQL != nil && qr.SQL.InTransaction() {
+			qr.SQL.RecordBucketBackupBeforeWrite(shardID, bucket)
+		}
+
+		deletedBool, err := shard.TryDeleteUser(cq.UserID, true, true)
+		release()
+		if err != nil {
+			return nil, err
+		}
 		deleted := 0
-		if ok && shard.DeleteUser(cq.UserID, true) {
+		if deletedBool {
 			deleted = 1
 		}
+
 		if qr.SQL != nil {
 			qr.SQL.SyncUserDelete(cq.UserID)
 		}
@@ -1414,19 +1499,23 @@ func (qr *QueryRouter) handleShardControlCommand(sql string, start time.Time) (*
 		cfg := shard.GetSettings()
 		resizeBuckets := -1
 		parseShardKVSettings(kvPart, &cfg, &resizeBuckets)
-		shard.UpdateSettings(cfg)
+
+		snap, err := qr.CDC.EnforceShardCapacityAndBuckets(shard.ShardID, cfg, resizeBuckets, 0)
+		if err != nil {
+			return nil, true, err
+		}
+		evacuated := 0
+		if snap != nil {
+			evacuated = snap.RangesCompleted
+		}
 
 		actionNote := fmt.Sprintf("Updated live shard settings (Used RAM: %s)", storage.FormatBytesExact(shard.UsedMemoryBytes()))
 		if cfg.AccessMode == "DRAINING" || resizeBuckets == 0 {
-			go func(id uint32) {
-				_, _ = qr.CDC.DrainShard(id, 15*time.Millisecond)
-			}(shard.ShardID)
-			actionNote = "Triggered Zero-Downtime CDC Shard Drain (0 Buckets)"
-		} else if resizeBuckets > 0 {
-			go func(id uint32, b int) {
-				_, _ = qr.CDC.ResizeShardBuckets(id, b, 15*time.Millisecond)
-			}(shard.ShardID, resizeBuckets)
-			actionNote = fmt.Sprintf("Triggered Live CDC Bucket Resize -> %d Buckets", resizeBuckets)
+			actionNote = fmt.Sprintf("Completed Zero-Downtime CDC Shard Drain (%d Ranges Evacuated)", evacuated)
+		} else if evacuated > 0 {
+			actionNote = fmt.Sprintf("Evacuated %d Ranges via CDC VReplication to satisfy byte cap (Used RAM: %s)", evacuated, storage.FormatBytesExact(shard.UsedMemoryBytes()))
+		} else if resizeBuckets >= 0 {
+			actionNote = fmt.Sprintf("Completed Live CDC Bucket Resize -> %d Buckets (Used RAM: %s)", resizeBuckets, storage.FormatBytesExact(shard.UsedMemoryBytes()))
 		}
 		qr.Cluster.SaveStateFile(qr.Dir.SnapshotBuckets())
 
@@ -1487,22 +1576,36 @@ func (qr *QueryRouter) handleShardControlCommand(sql string, start time.Time) (*
 		if namePart != "" {
 			cfg.CustomAlias = namePart
 		}
-		resizeBuckets := cfg.TargetBuckets
+		resizeBuckets := -1
 		if kvPart != "" {
 			parseShardKVSettings(kvPart, &cfg, &resizeBuckets)
-			if resizeBuckets >= 0 {
-				cfg.TargetBuckets = resizeBuckets
+		}
+		slabB := int64(cfg.SlabBytesPerBucket)
+		if slabB < 4 {
+			slabB = 4
+		}
+		if resizeBuckets >= 0 {
+			if int64(resizeBuckets)*slabB > cfg.MaxCapacityBytes {
+				return nil, true, fmt.Errorf("%w: CREATE SHARD requested %d buckets (%d B) which exceeds BYTES=%d",
+					storage.ErrInsufficientClusterCapacity, resizeBuckets, int64(resizeBuckets)*slabB, cfg.MaxCapacityBytes)
+			}
+			cfg.TargetBuckets = resizeBuckets
+		} else {
+			maxFitting := int(cfg.MaxCapacityBytes / slabB)
+			if maxFitting < cfg.TargetBuckets {
+				cfg.TargetBuckets = maxFitting
 			}
 		}
 
 		newShard := qr.Cluster.CreateCustomShard(cfg)
 		qr.Dir.RegisterShard(newShard.ShardID)
-		go func(id uint32, b int, maxB int64, slabB int) {
-			_, _ = qr.CDC.ResizeShardBuckets(id, b, 15*time.Millisecond)
-			if s, ok := qr.Cluster.GetShard(id); ok {
-				s.ResizeMemorySlabs(maxB, slabB)
+		if cfg.TargetBuckets > 0 {
+			if _, err := qr.CDC.ResizeShardBuckets(newShard.ShardID, cfg.TargetBuckets, 0); err != nil {
+				return nil, true, err
 			}
-		}(newShard.ShardID, cfg.TargetBuckets, cfg.MaxCapacityBytes, cfg.SlabBytesPerBucket)
+		}
+		newShard.ResizeMemorySlabs(cfg.MaxCapacityBytes, cfg.SlabBytesPerBucket)
+		qr.Cluster.SaveStateFile(qr.Dir.SnapshotBuckets())
 
 		return &ResultSet{
 			Title:       fmt.Sprintf("PROVISIONED CUSTOM SHARD %d [%s]", newShard.ShardID, newShard.DisplayName()),
@@ -1518,12 +1621,12 @@ func (qr *QueryRouter) handleShardControlCommand(sql string, start time.Time) (*
 				fmt.Sprintf("%d%%", cfg.Weight),
 				strconv.Itoa(cfg.TargetBuckets),
 				cfg.ReplicationMode,
-				"CDC_BACKFILL_STREAMING",
+				"READY_ONLINE",
 			}},
 			CommandTag:    "CREATE SHARD",
 			LatencyUs:     time.Since(start).Microseconds(),
 			RoutedShard:   fmt.Sprintf("Shard %d [%s]", newShard.ShardID, newShard.DisplayName()),
-			ExecutionPlan: fmt.Sprintf("Provisioned Shard %d (:%d) + Started Zero-Downtime CDC Migration for %d Virtual Buckets", newShard.ShardID, newShard.Port, cfg.TargetBuckets),
+			ExecutionPlan: fmt.Sprintf("Provisioned Shard %d (:%d) + Completed Zero-Downtime CDC Migration for %d Virtual Buckets", newShard.ShardID, newShard.Port, cfg.TargetBuckets),
 		}, true, nil
 	}
 
@@ -1538,40 +1641,54 @@ func (qr *QueryRouter) handleShardControlCommand(sql string, start time.Time) (*
 		if !ok {
 			return nil, true, fmt.Errorf("physical shard %d does not exist", sid)
 		}
-		go func(id uint32) {
-			_, _ = qr.CDC.DrainShard(id, 15*time.Millisecond)
-		}(shard.ShardID)
+		snap, err := qr.CDC.DrainShard(shard.ShardID, 0)
+		if err != nil {
+			return nil, true, err
+		}
+		rangesDone := 0
+		if snap != nil {
+			rangesDone = snap.RangesCompleted
+		}
+		qr.Cluster.SaveStateFile(qr.Dir.SnapshotBuckets())
 		return &ResultSet{
-			Title:       fmt.Sprintf("DRAINING SHARD %d [%s] VIA ZERO-DOWNTIME CDC", shard.ShardID, shard.DisplayName()),
-			Columns:     []string{"shard_id", "custom_name", "mode", "target_buckets", "workflow"},
-			ColumnTypes: []string{"VARCHAR", "VARCHAR", "VARCHAR", "INT4", "VARCHAR"},
+			Title:       fmt.Sprintf("DRAINED SHARD %d [%s] VIA ZERO-DOWNTIME CDC", shard.ShardID, shard.DisplayName()),
+			Columns:     []string{"shard_id", "custom_name", "mode", "target_buckets", "ranges_evacuated", "workflow"},
+			ColumnTypes: []string{"VARCHAR", "VARCHAR", "VARCHAR", "INT4", "INT4", "VARCHAR"},
 			Rows: [][]string{{
 				fmt.Sprintf("Shard %d", shard.ShardID),
 				shard.DisplayName(),
 				"DRAINING",
 				"0",
-				"EVACUATING_BUCKETS_ZERO_DOWNTIME",
+				strconv.Itoa(rangesDone),
+				"EVACUATED_ZERO_DOWNTIME",
 			}},
 			CommandTag:    "DRAIN SHARD",
 			LatencyUs:     time.Since(start).Microseconds(),
 			RoutedShard:   "CONTROL_PLANE",
-			ExecutionPlan: fmt.Sprintf("Evacuating all Virtual Buckets from Shard %d [%s] to active READ_WRITE shards", shard.ShardID, shard.DisplayName()),
+			ExecutionPlan: fmt.Sprintf("Evacuated all Virtual Buckets from Shard %d [%s] to active READ_WRITE shards", shard.ShardID, shard.DisplayName()),
 		}, true, nil
 	}
 
 	if strings.HasPrefix(upper, "REBALANCE SHARDS BY WEIGHT") || upper == "REBALANCE BY WEIGHT" {
-		go func() {
-			_, _ = qr.CDC.RebalanceByWeights(15 * time.Millisecond)
-		}()
+		snap, err := qr.CDC.RebalanceByWeights(0)
+		if err != nil {
+			return nil, true, err
+		}
+		rangesDone := 0
+		if snap != nil {
+			rangesDone = snap.RangesCompleted
+		}
+		qr.Cluster.SaveStateFile(qr.Dir.SnapshotBuckets())
 		return &ResultSet{
-			Title:       "WEIGHTED CLUSTER BUCKET REBALANCING STARTED",
-			Columns:     []string{"workflow", "total_buckets", "strategy", "status"},
-			ColumnTypes: []string{"VARCHAR", "INT4", "VARCHAR", "VARCHAR"},
+			Title:       "WEIGHTED CLUSTER BUCKET REBALANCING COMPLETED",
+			Columns:     []string{"workflow", "total_buckets", "ranges_migrated", "strategy", "status"},
+			ColumnTypes: []string{"VARCHAR", "INT4", "INT4", "VARCHAR", "VARCHAR"},
 			Rows: [][]string{{
 				"WEIGHTED_CDC_REBALANCE",
 				"1024",
+				strconv.Itoa(rangesDone),
 				"Proportional to Shard Weight & Byte Capacity",
-				"STREAMING (0.00ms Downtime)",
+				"COMPLETED (0.00ms Downtime)",
 			}},
 			CommandTag:    "REBALANCE WEIGHTS",
 			LatencyUs:     time.Since(start).Microseconds(),

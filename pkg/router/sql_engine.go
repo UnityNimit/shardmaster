@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 
 	sqlite "modernc.org/sqlite"
 
+	"shardmaster/pkg/cdc"
 	"shardmaster/pkg/directory"
 	"shardmaster/pkg/hash"
 	"shardmaster/pkg/storage"
@@ -111,21 +113,31 @@ func ensureCustomSQLFunctions(dir *directory.ShardDirectory) {
 	})
 }
 
+type txBucketSnapshot struct {
+	shardID uint32
+	slab    *storage.BucketSlab
+}
+
 // RelationalEngine provides 100% full ANSI / PostgreSQL-compatible SQL execution
 // (JOINs, Window Functions, CTEs, Subqueries, Views, Triggers, Indexes, ALTER TABLE,
 // GROUP BY / HAVING, CASE WHEN, Transactions, and arbitrary DDL/DML) backed by
 // a pure-Go relational engine synchronized with the distributed ShardMaster cluster.
 type RelationalEngine struct {
-	mu      sync.Mutex
-	db      *sql.DB
-	dir     *directory.ShardDirectory
-	cluster *storage.ClusterStorage
-	catalog *SchemaCatalog
+	mu              sync.Mutex
+	db              *sql.DB
+	dir             *directory.ShardDirectory
+	cluster         *storage.ClusterStorage
+	cdcEngine       *cdc.Engine
+	catalog         *SchemaCatalog
+	customTables    map[string]string
+	inTx            bool
+	txBucketBackups map[uint16]txBucketSnapshot
 }
 
 func NewRelationalEngine(
 	dir *directory.ShardDirectory,
 	cluster *storage.ClusterStorage,
+	cdcEngine *cdc.Engine,
 	catalog *SchemaCatalog,
 ) *RelationalEngine {
 	ensureCustomSQLFunctions(dir)
@@ -138,12 +150,18 @@ func NewRelationalEngine(
 	db.SetMaxIdleConns(1)
 
 	re := &RelationalEngine{
-		db:      db,
-		dir:     dir,
-		cluster: cluster,
-		catalog: catalog,
+		db:              db,
+		dir:             dir,
+		cluster:         cluster,
+		cdcEngine:       cdcEngine,
+		catalog:         catalog,
+		customTables:    make(map[string]string),
+		txBucketBackups: make(map[uint16]txBucketSnapshot),
 	}
 	re.initializeSchemaAndSeed()
+	if cdcEngine != nil {
+		cdcEngine.SetCutoverHook(re.SyncBucketRangeCutover)
+	}
 	return re
 }
 
@@ -473,6 +491,10 @@ func (re *RelationalEngine) insertUserFromClusterTx(stmt *sql.Stmt, uid int64) {
 func (re *RelationalEngine) SyncUserUpsert(shardID uint32, user storage.UserRow) {
 	re.mu.Lock()
 	defer re.mu.Unlock()
+	re.syncUserUpsertLocked(shardID, user)
+}
+
+func (re *RelationalEngine) syncUserUpsertLocked(shardID uint32, user storage.UserRow) {
 	_, _ = re.db.Exec(`INSERT OR REPLACE INTO users (
 		shard_id, bucket_id, user_id, user_key, name, email, tenant_id, region, balance_cents, balance_usd, created_at, updated_at
 	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
@@ -498,12 +520,79 @@ func (re *RelationalEngine) SyncUserDelete(userID int64) {
 	_, _ = re.db.Exec(`DELETE FROM users WHERE user_id = ?;`, userID)
 }
 
+// InTransaction reports whether an explicit SQL transaction (BEGIN) is currently active.
+func (re *RelationalEngine) InTransaction() bool {
+	re.mu.Lock()
+	defer re.mu.Unlock()
+	return re.inTx
+}
+
+// RecordBucketBackupBeforeWrite snapshots a bucket before a write inside an active transaction
+// so that ROLLBACK can restore the physical shard's exact pre-transaction state.
+func (re *RelationalEngine) RecordBucketBackupBeforeWrite(shardID uint32, bucket uint16) {
+	re.mu.Lock()
+	defer re.mu.Unlock()
+	re.recordBucketBackupLocked(shardID, bucket)
+}
+
+func (re *RelationalEngine) recordBucketBackupLocked(shardID uint32, bucket uint16) {
+	if !re.inTx {
+		return
+	}
+	if _, exists := re.txBucketBackups[bucket]; exists {
+		return
+	}
+	if shard, ok := re.cluster.GetShard(shardID); ok {
+		re.txBucketBackups[bucket] = txBucketSnapshot{
+			shardID: shardID,
+			slab:    shard.ExportBucketSlab(bucket),
+		}
+	}
+}
+
+func (re *RelationalEngine) restoreTxBucketsLocked() {
+	for bucket, snap := range re.txBucketBackups {
+		curShardID := re.dir.GetBucketOwner(bucket)
+		if shard, ok := re.cluster.GetShard(curShardID); ok {
+			shard.InstallBucketSlab(snap.slab)
+		}
+		if snap.shardID != curShardID {
+			if origShard, ok := re.cluster.GetShard(snap.shardID); ok {
+				origShard.InstallBucketSlab(snap.slab)
+			}
+		}
+	}
+	re.txBucketBackups = make(map[uint16]txBucketSnapshot)
+}
+
+// AbortTransaction rolls back an active SQL transaction and restores all modified physical shard buckets.
+func (re *RelationalEngine) AbortTransaction() {
+	re.mu.Lock()
+	defer re.mu.Unlock()
+	if re.inTx {
+		_, _ = re.db.Exec(`ROLLBACK;`)
+		re.restoreTxBucketsLocked()
+		re.inTx = false
+	}
+}
+
+// SyncBucketRangeCutover updates shard_id metadata in the relational mirror when CDC VReplication cuts over a bucket range.
+func (re *RelationalEngine) SyncBucketRangeCutover(startBucket, endBucket uint16, targetShard uint32) {
+	re.mu.Lock()
+	defer re.mu.Unlock()
+	shardLabel := fmt.Sprintf("shard_%d", targetShard)
+	_, _ = re.db.Exec(`UPDATE users SET shard_id = ? WHERE bucket_id >= ? AND bucket_id <= ?;`, shardLabel, int(startBucket), int(endBucket))
+	_, _ = re.db.Exec(`UPDATE orders SET shard_id = ? WHERE bucket_id >= ? AND bucket_id <= ?;`, shardLabel, int(startBucket), int(endBucket))
+	_, _ = re.db.Exec(`UPDATE payments SET shard_id = ? WHERE bucket_id >= ? AND bucket_id <= ?;`, shardLabel, int(startBucket), int(endBucket))
+	_, _ = re.db.Exec(`UPDATE audit_events SET shard_id = ? WHERE bucket_id >= ? AND bucket_id <= ?;`, shardLabel, int(startBucket), int(endBucket))
+}
+
 // EnsureUserIDsMaterialized materializes any specific user_id literals mentioned in a SQL query
 // from the 50,000,000-row columnar shard slabs into the relational `users` table before executing.
 var numberLiteralRe = regexp.MustCompile(`\b\d{1,9}\b`)
 
 func (re *RelationalEngine) EnsureUserIDsMaterialized(rawSQL string) {
-	matches := numberLiteralRe.FindAllString(rawSQL, 12)
+	matches := numberLiteralRe.FindAllString(rawSQL, 16)
 	if len(matches) == 0 {
 		return
 	}
@@ -523,7 +612,8 @@ func (re *RelationalEngine) EnsureUserIDsMaterialized(rawSQL string) {
 }
 
 // ExecuteFullSQL executes any arbitrary ANSI/PostgreSQL SQL statement (SELECT, JOIN, CTE, Window Function,
-// Subquery, CREATE/ALTER/DROP TABLE/VIEW/INDEX, INSERT, UPDATE, DELETE, PRAGMA, EXPLAIN) and returns a ResultSet.
+// Subquery, CREATE/ALTER/DROP TABLE/VIEW/INDEX, INSERT, UPDATE, DELETE, BEGIN, COMMIT, ROLLBACK, PRAGMA, EXPLAIN)
+// and enforces physical shard byte capacity quotas, ACID transactions, and custom table bucket replication.
 func (re *RelationalEngine) ExecuteFullSQL(rawSQL string) (*ResultSet, error) {
 	start := time.Now()
 	re.EnsureUserIDsMaterialized(rawSQL)
@@ -533,7 +623,95 @@ func (re *RelationalEngine) ExecuteFullSQL(rawSQL string) (*ResultSet, error) {
 
 	normSQL := normalizePostgresSQL(rawSQL)
 	trimmed := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(normSQL), ";"))
-	upper := strings.ToUpper(trimmed)
+	upper := NormalizeSQLWhitespace(strings.ToUpper(trimmed))
+
+	// Handle explicit ACID transaction control statements (BEGIN, COMMIT, ROLLBACK)
+	if upper == "BEGIN" || strings.HasPrefix(upper, "BEGIN ") || strings.HasPrefix(upper, "START TRANSACTION") {
+		if re.inTx {
+			return nil, fmt.Errorf("SQLSTATE 25001: transaction is already in progress")
+		}
+		if _, err := re.db.Exec(`BEGIN IMMEDIATE;`); err != nil {
+			return nil, fmt.Errorf("SQL execution error: %v", err)
+		}
+		re.inTx = true
+		re.txBucketBackups = make(map[uint16]txBucketSnapshot)
+		return &ResultSet{
+			Title:         "DISTRIBUTED ACID TRANSACTION BEGIN",
+			Columns:       []string{"statement_type", "isolation_level", "shards_enlisted", "status"},
+			ColumnTypes:   []string{"VARCHAR(24)", "VARCHAR(24)", "INT4", "VARCHAR(24)"},
+			Rows:          [][]string{{"BEGIN", "SERIALIZABLE", strconv.Itoa(int(re.dir.ActiveShards())), "TX_ACTIVE"}},
+			CommandTag:    "BEGIN",
+			LatencyUs:     time.Since(start).Microseconds(),
+			RoutedShard:   fmt.Sprintf("ALL_SHARDS (%d Nodes)", re.dir.ActiveShards()),
+			ExecutionPlan: "Two-Phase Distributed Transaction Coordinator (BEGIN IMMEDIATE)",
+		}, nil
+	}
+
+	if upper == "COMMIT" || strings.HasPrefix(upper, "COMMIT ") || upper == "END" || strings.HasPrefix(upper, "END ") {
+		if !re.inTx {
+			return &ResultSet{
+				Title:         "DISTRIBUTED ACID TRANSACTION COMMIT",
+				Columns:       []string{"statement_type", "status"},
+				ColumnTypes:   []string{"VARCHAR(24)", "VARCHAR(24)"},
+				Rows:          [][]string{{"COMMIT", "NO_ACTIVE_TX_NOOP"}},
+				CommandTag:    "COMMIT",
+				LatencyUs:     time.Since(start).Microseconds(),
+				RoutedShard:   "COORDINATOR",
+				ExecutionPlan: "No active transaction to commit",
+			}, nil
+		}
+		if _, err := re.db.Exec(`COMMIT;`); err != nil {
+			re.restoreTxBucketsLocked()
+			re.inTx = false
+			return nil, fmt.Errorf("SQL execution error on COMMIT: %v", err)
+		}
+		re.txBucketBackups = make(map[uint16]txBucketSnapshot)
+		re.inTx = false
+		return &ResultSet{
+			Title:         "DISTRIBUTED ACID TRANSACTION COMMIT",
+			Columns:       []string{"statement_type", "shards_committed", "status"},
+			ColumnTypes:   []string{"VARCHAR(24)", "INT4", "VARCHAR(24)"},
+			Rows:          [][]string{{"COMMIT", strconv.Itoa(int(re.dir.ActiveShards())), "COMMITTED_OK"}},
+			CommandTag:    "COMMIT",
+			LatencyUs:     time.Since(start).Microseconds(),
+			RoutedShard:   fmt.Sprintf("ALL_SHARDS (%d Nodes)", re.dir.ActiveShards()),
+			ExecutionPlan: "Atomic Distributed Commit Finalized Across All Shards",
+		}, nil
+	}
+
+	if upper == "ROLLBACK" || strings.HasPrefix(upper, "ROLLBACK ") {
+		if !re.inTx {
+			return &ResultSet{
+				Title:         "DISTRIBUTED ACID TRANSACTION ROLLBACK",
+				Columns:       []string{"statement_type", "status"},
+				ColumnTypes:   []string{"VARCHAR(24)", "VARCHAR(24)"},
+				Rows:          [][]string{{"ROLLBACK", "NO_ACTIVE_TX_NOOP"}},
+				CommandTag:    "ROLLBACK",
+				LatencyUs:     time.Since(start).Microseconds(),
+				RoutedShard:   "COORDINATOR",
+				ExecutionPlan: "No active transaction to rollback",
+			}, nil
+		}
+		_, _ = re.db.Exec(`ROLLBACK;`)
+		restoredBuckets := len(re.txBucketBackups)
+		re.restoreTxBucketsLocked()
+		re.inTx = false
+		return &ResultSet{
+			Title:         "DISTRIBUTED ACID TRANSACTION ROLLBACK",
+			Columns:       []string{"statement_type", "buckets_restored", "status"},
+			ColumnTypes:   []string{"VARCHAR(24)", "INT4", "VARCHAR(24)"},
+			Rows:          [][]string{{"ROLLBACK", strconv.Itoa(restoredBuckets), "ROLLED_BACK_OK"}},
+			CommandTag:    "ROLLBACK",
+			LatencyUs:     time.Since(start).Microseconds(),
+			RoutedShard:   fmt.Sprintf("ALL_SHARDS (%d Nodes)", re.dir.ActiveShards()),
+			ExecutionPlan: fmt.Sprintf("Atomic Distributed Rollback (%d Virtual Buckets Restored to Pre-TX State)", restoredBuckets),
+		}, nil
+	}
+
+	isDML := strings.HasPrefix(upper, "INSERT") ||
+		strings.HasPrefix(upper, "UPDATE") ||
+		strings.HasPrefix(upper, "DELETE") ||
+		strings.HasPrefix(upper, "REPLACE")
 
 	// Determine whether the statement returns rows (SELECT, WITH, PRAGMA, VALUES, EXPLAIN, RETURNING)
 	isQuery := strings.HasPrefix(upper, "SELECT") ||
@@ -543,75 +721,56 @@ func (re *RelationalEngine) ExecuteFullSQL(rawSQL string) (*ResultSet, error) {
 		strings.HasPrefix(upper, "EXPLAIN") ||
 		strings.Contains(upper, "RETURNING ")
 
-	if isQuery {
-		rows, err := re.db.Query(normSQL)
-		if err != nil {
-			return nil, fmt.Errorf("SQL execution error: %v", err)
-		}
-		defer rows.Close()
-
-		cols, err := rows.Columns()
-		if err != nil {
-			return nil, err
-		}
-		colTypesInfo, _ := rows.ColumnTypes()
-		colTypes := make([]string, len(cols))
-		for i := range cols {
-			if i < len(colTypesInfo) && colTypesInfo[i] != nil {
-				dbType := strings.ToUpper(colTypesInfo[i].DatabaseTypeName())
-				colTypes[i] = mapSQLTypeToPostgresBadge(cols[i], dbType)
-			} else {
-				colTypes[i] = mapSQLTypeToPostgresBadge(cols[i], "")
-			}
-		}
-
-		var resultRows [][]string
-		scanDest := make([]any, len(cols))
-		scanPtrs := make([]any, len(cols))
-		for i := range scanDest {
-			scanPtrs[i] = &scanDest[i]
-		}
-
-		for rows.Next() {
-			if err := rows.Scan(scanPtrs...); err != nil {
-				return nil, err
-			}
-			rowStr := make([]string, len(cols))
-			for i, val := range scanDest {
-				if len(resultRows) == 0 && colTypes[i] == "TEXT" && val != nil {
-					switch val.(type) {
-					case int64:
-						colTypes[i] = "INT8"
-					case float64:
-						colTypes[i] = "NUMERIC(12,2)"
-					}
-				}
-				rowStr[i] = formatSQLValue(cols[i], val)
-			}
-			resultRows = append(resultRows, rowStr)
-		}
-
-		plan := describeQueryExecutionPlan(upper, re.dir.ActiveShards())
-		return &ResultSet{
-			Title:         determineQueryTitle(upper, len(resultRows)),
-			Columns:       cols,
-			ColumnTypes:   colTypes,
-			Rows:          resultRows,
-			CommandTag:    fmt.Sprintf("SELECT %d", len(resultRows)),
-			LatencyUs:     time.Since(start).Microseconds(),
-			RoutedShard:   fmt.Sprintf("FEDERATED_SQL (%d Shards)", re.dir.ActiveShards()),
-			ExecutionPlan: plan,
-		}, nil
+	if isQuery && !isDML {
+		return re.executeQueryRowsLocked(normSQL, upper, start)
 	}
 
-	// DML / DDL execution (CREATE, ALTER, DROP, INSERT, UPDATE, DELETE, BEGIN, COMMIT, ROLLBACK)
+	var preUsers map[int64]storage.UserRow
+	if isDML && strings.Contains(strings.ToLower(trimmed), "users") {
+		preUsers = re.snapshotRelationalUsersLocked()
+	}
+
+	if isDML {
+		_, _ = re.db.Exec(`SAVEPOINT _sm_dml_guard;`)
+	}
+
+	if isQuery && isDML {
+		res, err := re.executeQueryRowsLocked(normSQL, upper, start)
+		if err != nil {
+			_, _ = re.db.Exec(`ROLLBACK TO SAVEPOINT _sm_dml_guard;`)
+			_, _ = re.db.Exec(`RELEASE SAVEPOINT _sm_dml_guard;`)
+			return nil, err
+		}
+		if err := re.syncDMLToPhysicalShardsLocked(trimmed, upper, preUsers); err != nil {
+			_, _ = re.db.Exec(`ROLLBACK TO SAVEPOINT _sm_dml_guard;`)
+			_, _ = re.db.Exec(`RELEASE SAVEPOINT _sm_dml_guard;`)
+			return nil, err
+		}
+		_, _ = re.db.Exec(`RELEASE SAVEPOINT _sm_dml_guard;`)
+		return res, nil
+	}
+
+	// DML / DDL execution (CREATE, ALTER, DROP, INSERT, UPDATE, DELETE)
 	execRes, err := re.db.Exec(normSQL)
 	if err != nil {
+		if isDML {
+			_, _ = re.db.Exec(`ROLLBACK TO SAVEPOINT _sm_dml_guard;`)
+			_, _ = re.db.Exec(`RELEASE SAVEPOINT _sm_dml_guard;`)
+		}
 		return nil, fmt.Errorf("SQL execution error: %v", err)
 	}
 	affected, _ := execRes.RowsAffected()
 
-	// Sync schema catalog if DDL was executed
+	if isDML {
+		if err := re.syncDMLToPhysicalShardsLocked(trimmed, upper, preUsers); err != nil {
+			_, _ = re.db.Exec(`ROLLBACK TO SAVEPOINT _sm_dml_guard;`)
+			_, _ = re.db.Exec(`RELEASE SAVEPOINT _sm_dml_guard;`)
+			return nil, err
+		}
+		_, _ = re.db.Exec(`RELEASE SAVEPOINT _sm_dml_guard;`)
+	}
+
+	// Sync schema catalog & physical shards if DDL was executed
 	if strings.HasPrefix(upper, "CREATE TABLE") {
 		_, _ = re.catalog.CreateCustomTable(rawSQL)
 	} else if strings.HasPrefix(upper, "DROP TABLE") {
@@ -619,14 +778,18 @@ func (re *RelationalEngine) ExecuteFullSQL(rawSQL string) (*ResultSet, error) {
 		if strings.HasPrefix(strings.ToUpper(rest), "IF EXISTS") {
 			rest = strings.TrimSpace(rest[9:])
 		}
-		_, _ = re.catalog.DropCustomTable(rest)
+		tblName, _ := re.catalog.DropCustomTable(rest)
+		if tblName == "" {
+			tblName = strings.ToLower(strings.Trim(rest, "\"'`; "))
+		}
+		re.cluster.DropCustomTableEverywhere(tblName)
 	} else if strings.HasPrefix(upper, "ALTER TABLE") {
 		re.syncDynamicTableSchemaFromSQLite(trimmed)
 	}
 
 	cmdWord := strings.Fields(upper)[0]
 	tag := fmt.Sprintf("%s %d", cmdWord, affected)
-	if cmdWord == "CREATE" || cmdWord == "ALTER" || cmdWord == "DROP" || cmdWord == "BEGIN" || cmdWord == "COMMIT" || cmdWord == "ROLLBACK" {
+	if cmdWord == "CREATE" || cmdWord == "ALTER" || cmdWord == "DROP" {
 		parts := strings.Fields(upper)
 		if len(parts) >= 2 {
 			tag = parts[0] + " " + parts[1]
@@ -645,6 +808,410 @@ func (re *RelationalEngine) ExecuteFullSQL(rawSQL string) (*ResultSet, error) {
 		RoutedShard:   fmt.Sprintf("ALL_SHARDS (%d Nodes)", re.dir.ActiveShards()),
 		ExecutionPlan: fmt.Sprintf("Distributed Coordinator Execution (%s) Across %d Shards", tag, re.dir.ActiveShards()),
 	}, nil
+}
+
+func (re *RelationalEngine) executeQueryRowsLocked(normSQL, upper string, start time.Time) (*ResultSet, error) {
+	rows, err := re.db.Query(normSQL)
+	if err != nil {
+		return nil, fmt.Errorf("SQL execution error: %v", err)
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	colTypesInfo, _ := rows.ColumnTypes()
+	colTypes := make([]string, len(cols))
+	for i := range cols {
+		if i < len(colTypesInfo) && colTypesInfo[i] != nil {
+			dbType := strings.ToUpper(colTypesInfo[i].DatabaseTypeName())
+			colTypes[i] = mapSQLTypeToPostgresBadge(cols[i], dbType)
+		} else {
+			colTypes[i] = mapSQLTypeToPostgresBadge(cols[i], "")
+		}
+	}
+
+	var resultRows [][]string
+	scanDest := make([]any, len(cols))
+	scanPtrs := make([]any, len(cols))
+	for i := range scanDest {
+		scanPtrs[i] = &scanDest[i]
+	}
+
+	for rows.Next() {
+		if err := rows.Scan(scanPtrs...); err != nil {
+			return nil, err
+		}
+		rowStr := make([]string, len(cols))
+		for i, val := range scanDest {
+			if len(resultRows) == 0 && colTypes[i] == "TEXT" && val != nil {
+				switch val.(type) {
+				case int64:
+					colTypes[i] = "INT8"
+				case float64:
+					colTypes[i] = "NUMERIC(12,2)"
+				}
+			}
+			rowStr[i] = formatSQLValue(cols[i], val)
+		}
+		resultRows = append(resultRows, rowStr)
+	}
+
+	plan := describeQueryExecutionPlan(upper, re.dir.ActiveShards())
+	return &ResultSet{
+		Title:         determineQueryTitle(upper, len(resultRows)),
+		Columns:       cols,
+		ColumnTypes:   colTypes,
+		Rows:          resultRows,
+		CommandTag:    fmt.Sprintf("SELECT %d", len(resultRows)),
+		LatencyUs:     time.Since(start).Microseconds(),
+		RoutedShard:   fmt.Sprintf("FEDERATED_SQL (%d Shards)", re.dir.ActiveShards()),
+		ExecutionPlan: plan,
+	}, nil
+}
+
+func extractDMLTargetTable(trimmedSQL string) string {
+	fields := strings.Fields(trimmedSQL)
+	if len(fields) < 2 {
+		return ""
+	}
+	w0 := strings.ToUpper(fields[0])
+	switch w0 {
+	case "INSERT", "REPLACE":
+		idx := 1
+		if idx < len(fields) && strings.EqualFold(fields[idx], "OR") {
+			idx += 2
+		}
+		if idx < len(fields) && strings.EqualFold(fields[idx], "INTO") {
+			idx++
+		}
+		if idx < len(fields) {
+			raw := fields[idx]
+			if paren := strings.IndexByte(raw, '('); paren != -1 {
+				raw = raw[:paren]
+			}
+			return cleanTableIdentifier(raw)
+		}
+	case "UPDATE":
+		idx := 1
+		if idx < len(fields) && strings.EqualFold(fields[idx], "OR") {
+			idx += 2
+		}
+		if idx < len(fields) {
+			return cleanTableIdentifier(fields[idx])
+		}
+	case "DELETE":
+		idx := 1
+		if idx < len(fields) && strings.EqualFold(fields[idx], "FROM") {
+			idx++
+		}
+		if idx < len(fields) {
+			return cleanTableIdentifier(fields[idx])
+		}
+	}
+	return ""
+}
+
+func cleanTableIdentifier(raw string) string {
+	clean := strings.ToLower(strings.Trim(raw, "\"'`;() "))
+	if dot := strings.LastIndexByte(clean, '.'); dot != -1 {
+		clean = clean[dot+1:]
+	}
+	return clean
+}
+
+func (re *RelationalEngine) snapshotRelationalUsersLocked() map[int64]storage.UserRow {
+	snap := make(map[int64]storage.UserRow)
+	rows, err := re.db.Query(`SELECT user_id, user_key, name, email, tenant_id, region, balance_cents FROM users;`)
+	if err != nil {
+		return snap
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var u storage.UserRow
+		if err := rows.Scan(&u.UserID, &u.UserKey, &u.Name, &u.Email, &u.TenantID, &u.Region, &u.BalanceCents); err == nil {
+			snap[u.UserID] = u
+		}
+	}
+	return snap
+}
+
+func (re *RelationalEngine) syncDMLToPhysicalShardsLocked(trimmedSQL, upperSQL string, preUsers map[int64]storage.UserRow) error {
+	tbl := extractDMLTargetTable(trimmedSQL)
+	if tbl == "" {
+		return nil
+	}
+	if tbl == "users" {
+		return re.syncUsersDiffToShardsLocked(preUsers)
+	}
+	return re.syncCustomTableToShardsLocked(tbl)
+}
+
+func (re *RelationalEngine) syncUsersDiffToShardsLocked(preUsers map[int64]storage.UserRow) error {
+	postUsers := re.snapshotRelationalUsersLocked()
+
+	type appliedUndo struct {
+		bucket  uint16
+		shardID uint32
+		slab    *storage.BucketSlab
+	}
+	localBackups := make(map[uint16]appliedUndo)
+	backupBucket := func(shardID uint32, b uint16) {
+		re.recordBucketBackupLocked(shardID, b)
+		if _, ok := localBackups[b]; !ok {
+			if s, exists := re.cluster.GetShard(shardID); exists {
+				localBackups[b] = appliedUndo{
+					bucket:  b,
+					shardID: shardID,
+					slab:    s.ExportBucketSlab(b),
+				}
+			}
+		}
+	}
+	rollbackLocal := func() {
+		for _, undo := range localBackups {
+			if s, ok := re.cluster.GetShard(undo.shardID); ok {
+				s.InstallBucketSlab(undo.slab)
+			}
+		}
+	}
+
+	// 1. Check deleted users
+	for uid := range preUsers {
+		if _, stillExists := postUsers[uid]; !stillExists {
+			ukey := strconv.FormatInt(uid, 10)
+			shardID, bucket, release := re.dir.AcquireBucketWrite(ukey)
+			backupBucket(shardID, bucket)
+			shard, ok := re.cluster.GetShard(shardID)
+			if !ok {
+				release()
+				rollbackLocal()
+				return fmt.Errorf("shard %d not found", shardID)
+			}
+			_, err := shard.TryDeleteUser(uid, true, true)
+			release()
+			if err != nil {
+				rollbackLocal()
+				return err
+			}
+		}
+	}
+
+	// 2. Check inserted or updated users
+	for uid, post := range postUsers {
+		pre, existed := preUsers[uid]
+		if existed &&
+			pre.BalanceCents == post.BalanceCents &&
+			pre.Name == post.Name &&
+			pre.Email == post.Email &&
+			pre.TenantID == post.TenantID &&
+			pre.Region == post.Region {
+			continue
+		}
+		ukey := strconv.FormatInt(uid, 10)
+		if post.UserKey == "" {
+			post.UserKey = ukey
+		}
+		shardID, bucket, release := re.dir.AcquireBucketWrite(ukey)
+		backupBucket(shardID, bucket)
+		shard, ok := re.cluster.GetShard(shardID)
+		if !ok {
+			release()
+			rollbackLocal()
+			return fmt.Errorf("shard %d not found", shardID)
+		}
+		post.BucketID = bucket
+		_, err := shard.TryUpsertUser(post, true, true)
+		release()
+
+		if errors.Is(err, storage.ErrShardCapacityExceeded) && re.cdcEngine != nil {
+			needed := storage.UserRowMemoryBytes(post)
+			re.mu.Unlock()
+			_, evErr := re.cdcEngine.AutoEvacuateForWrite(shardID, bucket, needed)
+			re.mu.Lock()
+			if evErr == nil {
+				shardID, bucket, release = re.dir.AcquireBucketWrite(ukey)
+				if shard2, ok2 := re.cluster.GetShard(shardID); ok2 {
+					post.BucketID = bucket
+					_, err = shard2.TryUpsertUser(post, true, true)
+				}
+				release()
+			}
+		}
+		if err != nil {
+			rollbackLocal()
+			return err
+		}
+
+		// Ensure shard_id and bucket_id columns in SQLite `users` reflect canonical hash routing
+		_, _ = re.db.Exec(`UPDATE users SET shard_id = ?, bucket_id = ? WHERE user_id = ?;`,
+			fmt.Sprintf("shard_%d", shardID), int(bucket), uid)
+	}
+
+	return nil
+}
+
+// syncCustomTableToShardsLocked synchronizes any custom SQL table (CREATE TABLE / INSERT / UPDATE / DELETE)
+// with the physical shards' BucketSlab.CustomTables, enforcing MaxCapacityBytes (SQLSTATE 53100) and VDiff parity.
+func (re *RelationalEngine) syncCustomTableToShardsLocked(tableName string) error {
+	clean := cleanTableIdentifier(tableName)
+	if clean == "" || clean == "users" {
+		return nil
+	}
+
+	// For pre-seeded demo tables, only track rows inserted beyond the initial startup seed
+	whereFilter := ""
+	switch clean {
+	case "orders":
+		whereFilter = " WHERE order_id > 900512"
+	case "payments":
+		whereFilter = " WHERE payment_id > 700512"
+	case "audit_events":
+		whereFilter = " WHERE event_id > 500512"
+	case "products":
+		whereFilter = " WHERE product_id > 1008"
+	}
+
+	rows, err := re.db.Query(fmt.Sprintf(`SELECT rowid, * FROM "%s"%s;`, clean, whereFilter))
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return err
+	}
+
+	type desiredEntry struct {
+		rowKey string
+		bucket uint16
+		row    storage.CustomRow
+	}
+	desired := make(map[string]desiredEntry)
+
+	scanDest := make([]any, len(cols))
+	scanPtrs := make([]any, len(cols))
+	for i := range scanDest {
+		scanPtrs[i] = &scanDest[i]
+	}
+
+	for rows.Next() {
+		if err := rows.Scan(scanPtrs...); err != nil {
+			return err
+		}
+		rowIDStr := fmt.Sprintf("%v", scanDest[0])
+		colMap := make(map[string]string, len(cols)-1)
+		shardKeyVal := ""
+		firstVal := ""
+		for i := 1; i < len(cols); i++ {
+			cName := cols[i]
+			cVal := formatSQLValue(cName, scanDest[i])
+			colMap[cName] = cVal
+			if i == 1 {
+				firstVal = cVal
+			}
+			lowerC := strings.ToLower(cName)
+			if shardKeyVal == "" && (lowerC == "id" || lowerC == "user_id" || strings.HasSuffix(lowerC, "_id") || lowerC == "key") {
+				shardKeyVal = cVal
+			}
+		}
+		if shardKeyVal == "" {
+			if firstVal != "" {
+				shardKeyVal = firstVal
+			} else {
+				shardKeyVal = rowIDStr
+			}
+		}
+		bucket := hash.ComputeBucket(shardKeyVal)
+		cRow := storage.CustomRow{
+			TableName: clean,
+			RowKey:    rowIDStr,
+			ShardKey:  shardKeyVal,
+			BucketID:  bucket,
+			Columns:   colMap,
+		}
+		cRow.ByteSize = storage.ComputeCustomRowBytes(clean, rowIDStr, shardKeyVal, colMap)
+		desired[rowIDStr] = desiredEntry{
+			rowKey: rowIDStr,
+			bucket: bucket,
+			row:    cRow,
+		}
+	}
+
+	type appliedUndo struct {
+		bucket  uint16
+		shardID uint32
+		slab    *storage.BucketSlab
+	}
+	localBackups := make(map[uint16]appliedUndo)
+	backupBucket := func(shardID uint32, b uint16) {
+		re.recordBucketBackupLocked(shardID, b)
+		if _, ok := localBackups[b]; !ok {
+			if s, exists := re.cluster.GetShard(shardID); exists {
+				localBackups[b] = appliedUndo{
+					bucket:  b,
+					shardID: shardID,
+					slab:    s.ExportBucketSlab(b),
+				}
+			}
+		}
+	}
+	rollbackLocal := func() {
+		for _, undo := range localBackups {
+			if s, ok := re.cluster.GetShard(undo.shardID); ok {
+				s.InstallBucketSlab(undo.slab)
+			}
+		}
+	}
+
+	// 1. Remove any deleted rows from physical shards
+	for _, shard := range re.cluster.GetAllShards() {
+		existingKeys := shard.GetCustomTableKeys(clean)
+		for b, keys := range existingKeys {
+			for _, rk := range keys {
+				ent, exists := desired[rk]
+				if !exists || ent.bucket != b {
+					backupBucket(shard.ShardID, b)
+					shard.DeleteCustomRow(b, clean, rk, true)
+				}
+			}
+		}
+	}
+
+	// 2. Upsert desired rows into their owning physical shard & bucket with strict byte quota enforcement
+	for _, ent := range desired {
+		shardID, release := re.dir.AcquireBucketWriteByID(ent.bucket)
+		backupBucket(shardID, ent.bucket)
+		shard, ok := re.cluster.GetShard(shardID)
+		if !ok {
+			release()
+			rollbackLocal()
+			return fmt.Errorf("target shard %d not found for bucket %d", shardID, ent.bucket)
+		}
+		err := shard.TryUpsertCustomRow(ent.row, true, true)
+		release()
+
+		if errors.Is(err, storage.ErrShardCapacityExceeded) && re.cdcEngine != nil {
+			re.mu.Unlock()
+			_, evErr := re.cdcEngine.AutoEvacuateForWrite(shardID, ent.bucket, ent.row.ByteSize)
+			re.mu.Lock()
+			if evErr == nil {
+				shardID, release = re.dir.AcquireBucketWriteByID(ent.bucket)
+				if shard2, ok2 := re.cluster.GetShard(shardID); ok2 {
+					err = shard2.TryUpsertCustomRow(ent.row, true, true)
+				}
+				release()
+			}
+		}
+		if err != nil {
+			rollbackLocal()
+			return err
+		}
+	}
+
+	return nil
 }
 
 // IntrospectDynamicTable queries SQLite's `pragma_table_info` and `sqlite_master` if a user created/altered a table or view.

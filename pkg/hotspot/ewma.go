@@ -115,12 +115,19 @@ func (t *Tracker) TickAndEvaluate(intervalSec float64) *AlertEvent {
 	// Trigger threshold: Bucket load > 1,500 QPS and > 5x cluster average
 	if maxQPS >= 1500 && maxQPS >= avgBucketQPS*5 && t.autoHeal.Load() {
 		fromShard := t.dir.GetBucketOwner(maxBucket)
-		coldestShard := t.findColdestShardExcluding(fromShard)
+		var bucketBytes int64
+		if src, ok := t.cluster.GetShard(fromShard); ok {
+			bucketBytes = src.BucketMemoryBytes(maxBucket)
+		}
+		coldestShard := t.findColdestShardExcluding(fromShard, bucketBytes)
 
 		if coldestShard != fromShard {
 			vdiff, err := t.cdcEngine.MigrateSingleHotBucket(maxBucket, fromShard, coldestShard)
+			if err != nil {
+				return nil
+			}
 			digest := ""
-			if err == nil && vdiff != nil {
+			if vdiff != nil && len(vdiff.TargetDigest) >= 16 {
 				digest = vdiff.TargetDigest[:16]
 			}
 			msg := fmt.Sprintf(
@@ -149,7 +156,7 @@ func (t *Tracker) TickAndEvaluate(intervalSec float64) *AlertEvent {
 	return nil
 }
 
-func (t *Tracker) findColdestShardExcluding(excludeShard uint32) uint32 {
+func (t *Tracker) findColdestShardExcluding(excludeShard uint32, requiredBytes int64) uint32 {
 	shards := t.cluster.GetAllShards()
 	if len(shards) < 2 {
 		return excludeShard
@@ -160,6 +167,13 @@ func (t *Tracker) findColdestShardExcluding(excludeShard uint32) uint32 {
 	bucketCounts := t.dir.BucketCountsByShard()
 	for _, s := range shards {
 		if s.ShardID == excludeShard {
+			continue
+		}
+		cfg := s.GetSettings()
+		if cfg.AccessMode == "DRAINING" || cfg.AccessMode == "READ_ONLY" || cfg.Weight <= 0 {
+			continue
+		}
+		if s.FreeMemoryBytes() < requiredBytes {
 			continue
 		}
 		score := s.CurrentQPS()*10 + uint64(bucketCounts[s.ShardID])

@@ -93,15 +93,21 @@ func ClassifySQL(sql string) ClassifiedQuery {
 		}
 	}
 
-	// 2. psql startup / transaction / system catalog introspection queries
+	// 2. psql startup / system catalog introspection queries
 	if strings.HasPrefix(upper, "SET ") ||
 		strings.HasPrefix(upper, "SELECT PG_CATALOG") ||
 		strings.HasPrefix(upper, "SELECT VERSION()") ||
-		strings.HasPrefix(upper, "SELECT CURRENT_") ||
-		strings.HasPrefix(upper, "BEGIN") ||
-		strings.HasPrefix(upper, "COMMIT") ||
-		strings.HasPrefix(upper, "ROLLBACK") {
+		strings.HasPrefix(upper, "SELECT CURRENT_") {
 		return ClassifiedQuery{Kind: QuerySystemCatalog, RawSQL: trimmed}
+	}
+	if strings.HasPrefix(upper, "BEGIN") ||
+		strings.HasPrefix(upper, "START TRANSACTION") ||
+		strings.HasPrefix(upper, "COMMIT") ||
+		upper == "END" ||
+		strings.HasPrefix(upper, "ROLLBACK") ||
+		strings.HasPrefix(upper, "SAVEPOINT") ||
+		strings.HasPrefix(upper, "RELEASE") {
+		return ClassifiedQuery{Kind: QueryFullRelationalSQL, RawSQL: trimmed}
 	}
 
 	// 3. Schema & DDL Catalog Commands
@@ -237,7 +243,7 @@ func ClassifySQL(sql string) ClassifiedQuery {
 			uid = 42
 			ukey = "42"
 		}
-		name, email, balCents := extractInsertValues(trimmed, ukey)
+		name, email, tenant, region, balCents := extractInsertValuesFull(trimmed, ukey)
 		return ClassifiedQuery{
 			Kind:         QueryPointUpsert,
 			RawSQL:       trimmed,
@@ -246,6 +252,8 @@ func ClassifySQL(sql string) ClassifiedQuery {
 			UserKey:      ukey,
 			Name:         name,
 			Email:        email,
+			TenantFilter: tenant,
+			RegionFilter: region,
 			BalanceCents: balCents,
 		}
 	}
@@ -464,28 +472,68 @@ func extractUserIDClause(sql string) (int64, string, bool) {
 	return 0, "", false
 }
 
-func extractInsertValues(sql string, ukey string) (name string, email string, balCents int64) {
+func extractInsertValuesFull(sql string, ukey string) (name string, email string, tenant string, region string, balCents int64) {
 	name = extractQuotedField(sql, "name", "")
 	email = extractQuotedField(sql, "email", "")
+	tenant = extractQuotedField(sql, "tenant_id", "")
+	region = extractQuotedField(sql, "region", "")
 	balCents = 250000
 
 	lower := strings.ToLower(sql)
 	vIdx := strings.Index(lower, "values")
 	if vIdx != -1 {
+		beforeValues := sql[:vIdx]
+		var colNames []string
+		if cOpen := strings.IndexByte(beforeValues, '('); cOpen != -1 {
+			if cClose := strings.LastIndexByte(beforeValues, ')'); cClose > cOpen {
+				rawCols := strings.Split(beforeValues[cOpen+1:cClose], ",")
+				for _, rc := range rawCols {
+					colNames = append(colNames, strings.ToLower(strings.Trim(rc, " '\"`\t\r\n")))
+				}
+			}
+		}
+
 		rest := sql[vIdx+6:]
 		openP := strings.IndexByte(rest, '(')
 		closeP := strings.LastIndexByte(rest, ')')
 		if openP != -1 && closeP > openP {
 			parts := strings.Split(rest[openP+1:closeP], ",")
-			if len(parts) >= 2 && name == "" {
-				name = strings.Trim(parts[1], " '\"`")
-			}
-			if len(parts) >= 3 && email == "" {
-				email = strings.Trim(parts[2], " '\"`")
-			}
-			if len(parts) >= 4 {
-				if b, err := strconv.ParseInt(strings.Trim(parts[3], " '\"`"), 10, 64); err == nil {
-					balCents = b
+			if len(colNames) > 0 && len(colNames) == len(parts) {
+				for i, col := range colNames {
+					val := strings.Trim(parts[i], " '\"`\t\r\n")
+					switch col {
+					case "name":
+						name = val
+					case "email":
+						email = val
+					case "tenant_id", "tenant":
+						tenant = val
+					case "region":
+						region = val
+					case "balance_cents":
+						if b, err := strconv.ParseInt(val, 10, 64); err == nil {
+							balCents = b
+						}
+					case "balance_usd":
+						if f, err := strconv.ParseFloat(strings.TrimPrefix(val, "$"), 64); err == nil {
+							balCents = int64(f * 100)
+						}
+					}
+				}
+			} else {
+				if len(parts) >= 2 && name == "" {
+					name = strings.Trim(parts[1], " '\"`")
+				}
+				if len(parts) >= 3 && email == "" {
+					email = strings.Trim(parts[2], " '\"`")
+				}
+				if len(parts) >= 4 {
+					val := strings.Trim(parts[3], " '\"`$")
+					if b, err := strconv.ParseInt(val, 10, 64); err == nil {
+						balCents = b
+					} else if f, err := strconv.ParseFloat(val, 64); err == nil {
+						balCents = int64(f * 100)
+					}
 				}
 			}
 		}
@@ -496,7 +544,7 @@ func extractInsertValues(sql string, ukey string) (name string, email string, ba
 	if email == "" {
 		email = "user_" + ukey + "@gmail.com"
 	}
-	return name, email, balCents
+	return name, email, tenant, region, balCents
 }
 
 func extractBalanceFromSet(sql string) (int64, bool) {

@@ -35,10 +35,12 @@ type Engine struct {
 	dir     *directory.ShardDirectory
 	cluster *storage.ClusterStorage
 
+	opMu      sync.Mutex
 	mu        sync.RWMutex
 	running   atomic.Bool
 	snapshot  WorkflowSnapshot
 	vdiffLogs []VDiffReport
+	onCutover func(startBucket, endBucket uint16, newShardID uint32)
 }
 
 func NewEngine(dir *directory.ShardDirectory, cluster *storage.ClusterStorage) *Engine {
@@ -58,6 +60,13 @@ func NewEngine(dir *directory.ShardDirectory, cluster *storage.ClusterStorage) *
 	}
 }
 
+// SetCutoverHook registers a callback invoked whenever a bucket range is atomically cut over to a new shard.
+func (e *Engine) SetCutoverHook(fn func(startBucket, endBucket uint16, newShardID uint32)) {
+	e.mu.Lock()
+	e.onCutover = fn
+	e.mu.Unlock()
+}
+
 func (e *Engine) GetSnapshot() WorkflowSnapshot {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -72,13 +81,27 @@ func (e *Engine) GetVDiffHistory() []VDiffReport {
 	return out
 }
 
+func (e *Engine) snapshotShardCapacities() (used map[uint32]int64, maxCap map[uint32]int64) {
+	shards := e.cluster.GetAllShards()
+	used = make(map[uint32]int64, len(shards))
+	maxCap = make(map[uint32]int64, len(shards))
+	for _, s := range shards {
+		used[s.ShardID] = s.UsedMemoryBytes()
+		mc := s.GetSettings().MaxCapacityBytes
+		if mc <= 0 {
+			mc = storage.DefaultShardCapacityBytes
+		}
+		maxCap[s.ShardID] = mc
+	}
+	return used, maxCap
+}
+
 // RebalanceToShards scales the cluster from its current shard count to targetShards
 // using Keyset Snapshot Backfill + Real-Time CDC Catch-Up + VDiff Verification + Atomic Cutover.
 func (e *Engine) RebalanceToShards(targetShards uint32, stepDelay time.Duration) (*WorkflowSnapshot, error) {
-	if !e.running.CompareAndSwap(false, true) {
-		snap := e.GetSnapshot()
-		return &snap, nil
-	}
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+	e.running.Store(true)
 	defer e.running.Store(false)
 
 	currentShards := e.dir.ActiveShards()
@@ -94,25 +117,59 @@ func (e *Engine) RebalanceToShards(targetShards uint32, stepDelay time.Duration)
 	}
 
 	currentBuckets := e.dir.SnapshotBuckets()
-	_, ranges := hash.ComputeOptimalSplit(currentBuckets, targetShards)
+	_, rawRanges := hash.ComputeOptimalSplit(currentBuckets, targetShards)
+
+	// Verify capacity on target shards for every planned bucket move
+	projUsed, maxCap := e.snapshotShardCapacities()
+	var validMoves []hash.BucketMigrationRange
+	for _, rng := range rawRanges {
+		srcShard, ok1 := e.cluster.GetShard(rng.FromShard)
+		dstShard, ok2 := e.cluster.GetShard(rng.ToShard)
+		if !ok1 || !ok2 {
+			continue
+		}
+		dstCfg := dstShard.GetSettings()
+		if dstCfg.AccessMode == "READ_ONLY" || dstCfg.AccessMode == "DRAINING" {
+			return nil, fmt.Errorf("%w: target shard %d is in %s mode", storage.ErrInsufficientClusterCapacity, rng.ToShard, dstCfg.AccessMode)
+		}
+		for b := rng.StartBucket; b <= rng.EndBucket; b++ {
+			bBytes := srcShard.BucketMemoryBytes(b)
+			if projUsed[rng.ToShard]+bBytes > maxCap[rng.ToShard] {
+				return nil, fmt.Errorf("%w: target Shard %d cannot fit bucket #%d (%d B needed, %d B free of %d B max)",
+					storage.ErrInsufficientClusterCapacity, rng.ToShard, b, bBytes, maxCap[rng.ToShard]-projUsed[rng.ToShard], maxCap[rng.ToShard])
+			}
+			projUsed[rng.FromShard] -= bBytes
+			projUsed[rng.ToShard] += bBytes
+			validMoves = append(validMoves, hash.BucketMigrationRange{
+				FromShard:   rng.FromShard,
+				ToShard:     rng.ToShard,
+				StartBucket: b,
+				EndBucket:   b,
+			})
+		}
+	}
+
+	ranges := coalesceSplitRanges(validMoves)
 	title := fmt.Sprintf("RESHARDING (%d -> %d Shards)", currentShards, targetShards)
 	return e.executeBucketMigrations(title, ranges, stepDelay)
 }
 
-// ProvisionCustomShard creates a new physical shard with custom name, disk capacity, hardware tier, weight,
+// ProvisionCustomShard creates a new physical shard with custom name, byte capacity, hardware tier, weight,
 // and target virtual buckets, and immediately streams its target buckets via zero-downtime CDC VReplication.
 func (e *Engine) ProvisionCustomShard(cfg storage.ShardSettings, stepDelay time.Duration) (*storage.PhysicalShard, *WorkflowSnapshot, error) {
 	newShard := e.cluster.CreateCustomShard(cfg)
 	e.dir.RegisterShard(newShard.ShardID)
 
 	desired := cfg.TargetBuckets
-	if desired <= 0 {
-		// Compute proportional quota from weight across all active shards
+	if desired < 0 {
+		desired = 0
+	}
+	if desired == 0 && cfg.AccessMode != "DRAINING" && cfg.Weight > 0 {
 		shards := e.cluster.GetAllShards()
 		totalWeight := 0
 		for _, s := range shards {
 			st := s.GetSettings()
-			if st.AccessMode != "DRAINING" && st.Weight > 0 {
+			if st.AccessMode != "DRAINING" && st.AccessMode != "READ_ONLY" && st.Weight > 0 {
 				totalWeight += st.Weight
 			}
 		}
@@ -125,8 +182,8 @@ func (e *Engine) ProvisionCustomShard(cfg storage.ShardSettings, stepDelay time.
 		} else {
 			desired = hash.TotalVirtualBuckets / len(shards)
 		}
-		if desired < 16 {
-			desired = 64
+		if desired < 1 {
+			desired = 16
 		}
 		st := newShard.GetSettings()
 		st.TargetBuckets = desired
@@ -139,11 +196,15 @@ func (e *Engine) ProvisionCustomShard(cfg storage.ShardSettings, stepDelay time.
 
 // ResizeShardBuckets dynamically grows or shrinks the number of virtual buckets (0..1024) owned by shardID
 // while the cluster is running, migrating buckets in or out via zero-downtime CDC VReplication + VDiff.
+// Strictly verifies free byte capacity on all destination shards before moving a single byte.
 func (e *Engine) ResizeShardBuckets(shardID uint32, desiredBuckets int, stepDelay time.Duration) (*WorkflowSnapshot, error) {
-	if !e.running.CompareAndSwap(false, true) {
-		snap := e.GetSnapshot()
-		return &snap, nil
-	}
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+	return e.resizeShardBucketsLocked(shardID, desiredBuckets, stepDelay)
+}
+
+func (e *Engine) resizeShardBucketsLocked(shardID uint32, desiredBuckets int, stepDelay time.Duration) (*WorkflowSnapshot, error) {
+	e.running.Store(true)
 	defer e.running.Store(false)
 
 	if desiredBuckets < 0 {
@@ -157,32 +218,32 @@ func (e *Engine) ResizeShardBuckets(shardID uint32, desiredBuckets int, stepDela
 	if !ok {
 		return nil, fmt.Errorf("shard %d does not exist", shardID)
 	}
-	st := targetShard.GetSettings()
-	st.TargetBuckets = desiredBuckets
-	if desiredBuckets == 0 && st.AccessMode == "READ_WRITE" {
-		st.AccessMode = "DRAINING"
-	} else if desiredBuckets > 0 && st.AccessMode == "DRAINING" {
-		st.AccessMode = "READ_WRITE"
-	}
-	targetShard.UpdateSettings(st)
 
 	currentBuckets := e.dir.SnapshotBuckets()
 	counts := e.dir.BucketCountsByShard()
 	currentOwned := counts[shardID]
 
 	if desiredBuckets == currentOwned {
+		st := targetShard.GetSettings()
+		st.TargetBuckets = desiredBuckets
+		targetShard.UpdateSettings(st)
 		e.syncTargetBucketMetadata()
 		snap := e.GetSnapshot()
 		return &snap, nil
 	}
 
+	projUsed, maxCap := e.snapshotShardCapacities()
+	allShards := e.cluster.GetAllShards()
 	var singleMoves []hash.BucketMigrationRange
 
 	if desiredBuckets > currentOwned {
-		// Need to pull (desiredBuckets - currentOwned) buckets into shardID from donor shards
+		st := targetShard.GetSettings()
+		if st.AccessMode == "READ_ONLY" {
+			return nil, fmt.Errorf("%w: Shard %d [%s] is READ_ONLY and cannot receive buckets",
+				storage.ErrShardReadOnly, shardID, targetShard.DisplayName())
+		}
 		needed := desiredBuckets - currentOwned
 		for needed > 0 {
-			// Pick donor shard with the highest current bucket count (excluding shardID)
 			var bestDonor uint32
 			maxCount := -1
 			for sid, c := range counts {
@@ -192,15 +253,27 @@ func (e *Engine) ResizeShardBuckets(shardID uint32, desiredBuckets int, stepDela
 				}
 			}
 			if maxCount <= 0 {
+				return nil, fmt.Errorf("%w: no donor buckets available in cluster to grow Shard %d to %d buckets",
+					storage.ErrInsufficientClusterCapacity, shardID, desiredBuckets)
+			}
+			donorShard, ok := e.cluster.GetShard(bestDonor)
+			if !ok {
 				break
 			}
-			// Find a bucket currently owned by bestDonor (scan from top down for clean contiguous ranges)
+
 			moved := false
 			for b := int(hash.TotalVirtualBuckets) - 1; b >= 0; b-- {
 				if currentBuckets[b] == bestDonor {
+					bBytes := donorShard.BucketMemoryBytes(uint16(b))
+					if projUsed[shardID]+bBytes > maxCap[shardID] {
+						return nil, fmt.Errorf("%w: Shard %d [%s] cannot fit %d buckets (bucket #%d requires %d B, but only %d B free of %d B max)",
+							storage.ErrInsufficientClusterCapacity, shardID, targetShard.DisplayName(), desiredBuckets, b, bBytes, maxCap[shardID]-projUsed[shardID], maxCap[shardID])
+					}
 					currentBuckets[b] = shardID
 					counts[bestDonor]--
 					counts[shardID]++
+					projUsed[bestDonor] -= bBytes
+					projUsed[shardID] += bBytes
 					singleMoves = append(singleMoves, hash.BucketMigrationRange{
 						FromShard:   bestDonor,
 						ToShard:     shardID,
@@ -217,97 +290,339 @@ func (e *Engine) ResizeShardBuckets(shardID uint32, desiredBuckets int, stepDela
 			}
 		}
 	} else {
-		// Need to push (currentOwned - desiredBuckets) buckets out of shardID to recipient shards
+		// Need to evacuate (currentOwned - desiredBuckets) buckets out of shardID to writable shards with sufficient free byte capacity
 		toEvacuate := currentOwned - desiredBuckets
-		allShards := e.cluster.GetAllShards()
-		for toEvacuate > 0 {
-			// Pick recipient shard with the lowest current bucket count that is not DRAINING
+		for b := int(hash.TotalVirtualBuckets) - 1; b >= 0 && toEvacuate > 0; b-- {
+			if currentBuckets[b] != shardID {
+				continue
+			}
+			bBytes := targetShard.BucketMemoryBytes(uint16(b))
+
 			var bestRecipient uint32
 			foundRecipient := false
 			minCount := hash.TotalVirtualBuckets + 1
+			var maxFree int64 = -1
+
 			for _, s := range allShards {
 				if s.ShardID == shardID {
 					continue
 				}
 				cfg := s.GetSettings()
-				if cfg.AccessMode == "DRAINING" {
+				if cfg.AccessMode == "DRAINING" || cfg.AccessMode == "READ_ONLY" || cfg.Weight <= 0 {
 					continue
 				}
+				freeBytes := maxCap[s.ShardID] - projUsed[s.ShardID]
+				if freeBytes <= 0 || freeBytes < bBytes {
+					continue // Target shard is at 100% byte capacity or lacks enough free bytes for this bucket!
+				}
 				c := counts[s.ShardID]
-				if c < minCount {
+				if c < minCount || (c == minCount && freeBytes > maxFree) {
 					minCount = c
+					maxFree = freeBytes
 					bestRecipient = s.ShardID
 					foundRecipient = true
 				}
 			}
+
 			if !foundRecipient {
-				// Fallback to any other shard
-				for _, s := range allShards {
-					if s.ShardID != shardID {
-						bestRecipient = s.ShardID
-						foundRecipient = true
-						break
-					}
-				}
-			}
-			if !foundRecipient {
-				break
+				return nil, fmt.Errorf("%w: cannot evacuate %d buckets from Shard %d [%s] (bucket #%d requires %d B, but no writable shard in the cluster has sufficient free byte capacity)",
+					storage.ErrInsufficientClusterCapacity, currentOwned-desiredBuckets, shardID, targetShard.DisplayName(), b, bBytes)
 			}
 
-			moved := false
-			for b := int(hash.TotalVirtualBuckets) - 1; b >= 0; b-- {
-				if currentBuckets[b] == shardID {
-					currentBuckets[b] = bestRecipient
-					counts[shardID]--
-					counts[bestRecipient]++
-					singleMoves = append(singleMoves, hash.BucketMigrationRange{
-						FromShard:   shardID,
-						ToShard:     bestRecipient,
-						StartBucket: uint16(b),
-						EndBucket:   uint16(b),
-					})
-					toEvacuate--
-					moved = true
-					break
-				}
-			}
-			if !moved {
-				break
-			}
+			currentBuckets[b] = bestRecipient
+			counts[shardID]--
+			counts[bestRecipient]++
+			projUsed[shardID] -= bBytes
+			projUsed[bestRecipient] += bBytes
+			singleMoves = append(singleMoves, hash.BucketMigrationRange{
+				FromShard:   shardID,
+				ToShard:     bestRecipient,
+				StartBucket: uint16(b),
+				EndBucket:   uint16(b),
+			})
+			toEvacuate--
+		}
+		if toEvacuate > 0 {
+			return nil, fmt.Errorf("%w: could not evacuate all requested buckets from Shard %d", storage.ErrInsufficientClusterCapacity, shardID)
 		}
 	}
+
+	// Update metadata now that capacity validation passed
+	st := targetShard.GetSettings()
+	st.TargetBuckets = desiredBuckets
+	if desiredBuckets == 0 && st.AccessMode == "READ_WRITE" {
+		st.AccessMode = "DRAINING"
+	} else if desiredBuckets > 0 && st.AccessMode == "DRAINING" {
+		st.AccessMode = "READ_WRITE"
+	}
+	targetShard.UpdateSettings(st)
 
 	ranges := coalesceSplitRanges(singleMoves)
 	title := fmt.Sprintf("LIVE SHARD RESIZE (S%d [%s]: %d -> %d Buckets)", shardID, targetShard.DisplayName(), currentOwned, desiredBuckets)
 	return e.executeBucketMigrations(title, ranges, stepDelay)
 }
 
-// DrainShard evacuates 100% of virtual buckets from shardID to remaining online shards via CDC VReplication.
-func (e *Engine) DrainShard(shardID uint32, stepDelay time.Duration) (*WorkflowSnapshot, error) {
-	if s, ok := e.cluster.GetShard(shardID); ok {
-		cfg := s.GetSettings()
-		cfg.AccessMode = "DRAINING"
-		cfg.Weight = 0
-		cfg.TargetBuckets = 0
-		s.UpdateSettings(cfg)
+// EnforceShardCapacityAndBuckets validates and applies a shard's new configuration (including shrinking MaxCapacityBytes
+// or changing TargetBuckets) without EVER truncating committed rows or slabs in-place.
+// If MaxCapacityBytes is lowered below UsedMemoryBytes(), it calculates how many buckets must be evacuated to other shards,
+// verifies other writable shards have sufficient free bytes, and streams those buckets via CDC VReplication + VDiff.
+// If the cluster lacks free capacity (or explicitBuckets cannot fit in MaxCapacityBytes), it rejects with ERR_INSUFFICIENT_CLUSTER_CAPACITY before touching a single byte.
+func (e *Engine) EnforceShardCapacityAndBuckets(
+	shardID uint32,
+	proposedCfg storage.ShardSettings,
+	explicitBuckets int,
+	stepDelay time.Duration,
+) (*WorkflowSnapshot, error) {
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+
+	shard, ok := e.cluster.GetShard(shardID)
+	if !ok {
+		return nil, fmt.Errorf("shard %d does not exist", shardID)
 	}
-	return e.ResizeShardBuckets(shardID, 0, stepDelay)
+
+	newMaxCap := proposedCfg.MaxCapacityBytes
+	if newMaxCap <= 0 {
+		newMaxCap = shard.GetSettings().MaxCapacityBytes
+		if newMaxCap <= 0 {
+			newMaxCap = storage.DefaultShardCapacityBytes
+		}
+		proposedCfg.MaxCapacityBytes = newMaxCap
+	}
+
+	currentBuckets := e.dir.SnapshotBuckets()
+	counts := e.dir.BucketCountsByShard()
+	currentOwned := counts[shardID]
+	currentUsed := shard.UsedMemoryBytes()
+
+	// Determine how many buckets the shard wants to own
+	desiredBuckets := currentOwned
+	if proposedCfg.AccessMode == "DRAINING" || explicitBuckets == 0 {
+		desiredBuckets = 0
+	} else if explicitBuckets > 0 {
+		desiredBuckets = explicitBuckets
+	}
+
+	// If explicitBuckets was NOT set (or if desiredBuckets would still leave UsedMemoryBytes > newMaxCap),
+	// check how many buckets must be evacuated so remaining bytes on shardID <= newMaxCap.
+	if desiredBuckets == currentOwned && currentUsed > newMaxCap {
+		if explicitBuckets > 0 {
+			// User explicitly demanded keeping `explicitBuckets` buckets while setting BYTES below their actual size
+			return nil, fmt.Errorf("%w: Shard %d [%s] requires %d B for %d buckets, which exceeds requested BYTES=%d B",
+				storage.ErrInsufficientClusterCapacity, shardID, shard.DisplayName(), currentUsed, currentOwned, newMaxCap)
+		}
+		// Calculate how many buckets to keep so remaining bytes <= newMaxCap
+		remBytes := currentUsed
+		keepBuckets := currentOwned
+		for b := int(hash.TotalVirtualBuckets) - 1; b >= 0 && remBytes > newMaxCap; b-- {
+			if currentBuckets[b] == shardID {
+				remBytes -= shard.BucketMemoryBytes(uint16(b))
+				keepBuckets--
+			}
+		}
+		if remBytes > newMaxCap {
+			return nil, fmt.Errorf("%w: Shard %d [%s] cannot shrink to %d B",
+				storage.ErrInsufficientClusterCapacity, shardID, shard.DisplayName(), newMaxCap)
+		}
+		desiredBuckets = keepBuckets
+	} else if desiredBuckets < currentOwned && desiredBuckets > 0 {
+		// Verify that after evacuating (currentOwned - desiredBuckets) buckets, the remaining desiredBuckets fit in newMaxCap
+		remBytes := currentUsed
+		toDrop := currentOwned - desiredBuckets
+		for b := int(hash.TotalVirtualBuckets) - 1; b >= 0 && toDrop > 0; b-- {
+			if currentBuckets[b] == shardID {
+				remBytes -= shard.BucketMemoryBytes(uint16(b))
+				toDrop--
+			}
+		}
+		if remBytes > newMaxCap {
+			if explicitBuckets > 0 {
+				return nil, fmt.Errorf("%w: remaining %d buckets on Shard %d [%s] require %d B, which exceeds requested BYTES=%d B",
+					storage.ErrInsufficientClusterCapacity, desiredBuckets, shardID, shard.DisplayName(), remBytes, newMaxCap)
+			}
+			// Evacuate additional buckets until remBytes <= newMaxCap
+			keepBuckets := desiredBuckets
+			for b := int(hash.TotalVirtualBuckets) - 1; b >= 0 && remBytes > newMaxCap; b-- {
+				if currentBuckets[b] == shardID {
+					// Check if this bucket was already in the first (currentOwned - desiredBuckets) dropped
+					idxFromTop := 0
+					for k := int(hash.TotalVirtualBuckets) - 1; k > b; k-- {
+						if currentBuckets[k] == shardID {
+							idxFromTop++
+						}
+					}
+					if idxFromTop >= (currentOwned - desiredBuckets) {
+						remBytes -= shard.BucketMemoryBytes(uint16(b))
+						keepBuckets--
+					}
+				}
+			}
+			desiredBuckets = keepBuckets
+		}
+	}
+
+	// If growing buckets, temporarily set MaxCapacityBytes to newMaxCap on a copy check so resizeShardBucketsLocked validates against newMaxCap
+	oldSettings := shard.GetSettings()
+	tempSettings := proposedCfg
+	tempSettings.TargetBuckets = currentOwned
+	shard.UpdateSettings(tempSettings)
+
+	snap, err := e.resizeShardBucketsLocked(shardID, desiredBuckets, stepDelay)
+	if err != nil {
+		// Roll back settings completely on failure!
+		shard.UpdateSettings(oldSettings)
+		return nil, err
+	}
+
+	proposedCfg.TargetBuckets = desiredBuckets
+	if desiredBuckets == 0 && proposedCfg.AccessMode == "READ_WRITE" && explicitBuckets == 0 {
+		proposedCfg.AccessMode = "DRAINING"
+	}
+	shard.UpdateSettings(proposedCfg)
+	e.syncTargetBucketMetadata()
+	return snap, nil
+}
+
+// AutoEvacuateForWrite attempts to automatically evacuate one or more non-active virtual buckets from fullShardID
+// to other writable shards with free byte capacity when a write on activeBucket needs `neededBytes` additional bytes.
+func (e *Engine) AutoEvacuateForWrite(fullShardID uint32, activeBucket uint16, neededBytes int64) (bool, error) {
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+
+	fullShard, ok := e.cluster.GetShard(fullShardID)
+	if !ok {
+		return false, storage.ErrShardCapacityExceeded
+	}
+	cfg := fullShard.GetSettings()
+	maxCap := cfg.MaxCapacityBytes
+	if maxCap <= 0 {
+		maxCap = storage.DefaultShardCapacityBytes
+	}
+
+	// If fullShard already has enough free bytes (e.g., freed by a prior evacuation), return true
+	if fullShard.UsedMemoryBytes()+neededBytes <= maxCap {
+		return true, nil
+	}
+
+	// Check if activeBucket + neededBytes alone exceeds maxCap on fullShard
+	activeBucketBytes := fullShard.BucketMemoryBytes(activeBucket)
+	if activeBucketBytes+neededBytes > maxCap {
+		return false, fmt.Errorf("%w: bucket #%d (%d B) + write (%d B) exceeds Shard %d max capacity (%d B)",
+			storage.ErrShardCapacityExceeded, activeBucket, activeBucketBytes, neededBytes, fullShardID, maxCap)
+	}
+
+	currentBuckets := e.dir.SnapshotBuckets()
+	counts := e.dir.BucketCountsByShard()
+	projUsed, shardMaxCap := e.snapshotShardCapacities()
+	allShards := e.cluster.GetAllShards()
+
+	bytesToFree := (fullShard.UsedMemoryBytes() + neededBytes) - maxCap
+	var freedSoFar int64
+	var singleMoves []hash.BucketMigrationRange
+
+	for b := int(hash.TotalVirtualBuckets) - 1; b >= 0 && freedSoFar < bytesToFree; b-- {
+		ub := uint16(b)
+		if ub == activeBucket || currentBuckets[ub] != fullShardID {
+			continue
+		}
+		bBytes := fullShard.BucketMemoryBytes(ub)
+		if bBytes <= 0 {
+			continue
+		}
+
+		var bestRecipient uint32
+		found := false
+		minCount := hash.TotalVirtualBuckets + 1
+		for _, s := range allShards {
+			if s.ShardID == fullShardID {
+				continue
+			}
+			scfg := s.GetSettings()
+			if scfg.AccessMode == "DRAINING" || scfg.AccessMode == "READ_ONLY" || scfg.Weight <= 0 {
+				continue
+			}
+			if shardMaxCap[s.ShardID]-projUsed[s.ShardID] < bBytes {
+				continue
+			}
+			if counts[s.ShardID] < minCount {
+				minCount = counts[s.ShardID]
+				bestRecipient = s.ShardID
+				found = true
+			}
+		}
+		if !found {
+			continue
+		}
+
+		currentBuckets[ub] = bestRecipient
+		counts[fullShardID]--
+		counts[bestRecipient]++
+		projUsed[fullShardID] -= bBytes
+		projUsed[bestRecipient] += bBytes
+		freedSoFar += bBytes
+		singleMoves = append(singleMoves, hash.BucketMigrationRange{
+			FromShard:   fullShardID,
+			ToShard:     bestRecipient,
+			StartBucket: ub,
+			EndBucket:   ub,
+		})
+	}
+
+	if freedSoFar < bytesToFree || len(singleMoves) == 0 {
+		return false, fmt.Errorf("%w: Shard %d [%s] is full (%d / %d B) and cluster has insufficient free capacity to auto-evacuate buckets",
+			storage.ErrShardCapacityExceeded, fullShardID, fullShard.DisplayName(), fullShard.UsedMemoryBytes(), maxCap)
+	}
+
+	e.running.Store(true)
+	defer e.running.Store(false)
+	ranges := coalesceSplitRanges(singleMoves)
+	title := fmt.Sprintf("AUTO-SPLIT EVACUATION (S%d [%s] Freed %d B)", fullShardID, fullShard.DisplayName(), freedSoFar)
+	_, err := e.executeBucketMigrations(title, ranges, 0)
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// DrainShard evacuates 100% of virtual buckets from shardID to remaining online shards via CDC VReplication.
+// If remaining online writable shards do not have enough free byte capacity, DrainShard aborts cleanly with an error.
+func (e *Engine) DrainShard(shardID uint32, stepDelay time.Duration) (*WorkflowSnapshot, error) {
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+
+	s, ok := e.cluster.GetShard(shardID)
+	if !ok {
+		return nil, fmt.Errorf("shard %d does not exist", shardID)
+	}
+	oldCfg := s.GetSettings()
+
+	snap, err := e.resizeShardBucketsLocked(shardID, 0, stepDelay)
+	if err != nil {
+		s.UpdateSettings(oldCfg)
+		return nil, err
+	}
+
+	cfg := s.GetSettings()
+	cfg.AccessMode = "DRAINING"
+	cfg.Weight = 0
+	cfg.TargetBuckets = 0
+	s.UpdateSettings(cfg)
+	return snap, nil
 }
 
 // RebalanceByWeights redistributes all 1,024 virtual buckets across all non-draining shards
-// proportional to each shard's configured Weight (and DiskCapacityGB).
+// proportional to each shard's configured Weight while strictly respecting each shard's MaxCapacityBytes.
 func (e *Engine) RebalanceByWeights(stepDelay time.Duration) (*WorkflowSnapshot, error) {
-	if !e.running.CompareAndSwap(false, true) {
-		snap := e.GetSnapshot()
-		return &snap, nil
-	}
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+	e.running.Store(true)
 	defer e.running.Store(false)
 
 	shards := e.cluster.GetAllShards()
 	totalWeight := 0
 	for _, s := range shards {
 		cfg := s.GetSettings()
-		if cfg.AccessMode != "DRAINING" && cfg.Weight > 0 {
+		if cfg.AccessMode != "DRAINING" && cfg.AccessMode != "READ_ONLY" && cfg.Weight > 0 {
 			totalWeight += cfg.Weight
 		}
 	}
@@ -321,7 +636,7 @@ func (e *Engine) RebalanceByWeights(stepDelay time.Duration) (*WorkflowSnapshot,
 	var lastActiveID uint32
 	for _, s := range shards {
 		cfg := s.GetSettings()
-		if cfg.AccessMode == "DRAINING" || cfg.Weight <= 0 {
+		if cfg.AccessMode == "DRAINING" || cfg.AccessMode == "READ_ONLY" || cfg.Weight <= 0 {
 			quotas[s.ShardID] = 0
 			continue
 		}
@@ -336,24 +651,65 @@ func (e *Engine) RebalanceByWeights(stepDelay time.Duration) (*WorkflowSnapshot,
 
 	currentBuckets := e.dir.SnapshotBuckets()
 	counts := e.dir.BucketCountsByShard()
+	projUsed, maxCap := e.snapshotShardCapacities()
 	var singleMoves []hash.BucketMigrationRange
 
 	for b := uint16(0); b < hash.TotalVirtualBuckets; b++ {
 		owner := currentBuckets[b]
 		if counts[owner] > quotas[owner] {
-			// Find a shard that is below its quota
+			srcShard, ok := e.cluster.GetShard(owner)
+			if !ok {
+				continue
+			}
+			bBytes := srcShard.BucketMemoryBytes(b)
+
+			// First try a shard below its weighted quota that has enough free bytes
+			moved := false
 			for _, s := range shards {
-				if counts[s.ShardID] < quotas[s.ShardID] {
+				if s.ShardID == owner {
+					continue
+				}
+				freeBytes := maxCap[s.ShardID] - projUsed[s.ShardID]
+				if counts[s.ShardID] < quotas[s.ShardID] && freeBytes > 0 && freeBytes >= bBytes {
 					currentBuckets[b] = s.ShardID
 					counts[owner]--
 					counts[s.ShardID]++
+					projUsed[owner] -= bBytes
+					projUsed[s.ShardID] += bBytes
 					singleMoves = append(singleMoves, hash.BucketMigrationRange{
 						FromShard:   owner,
 						ToShard:     s.ShardID,
 						StartBucket: b,
 						EndBucket:   b,
 					})
+					moved = true
 					break
+				}
+			}
+			// If the below-quota shard was byte-full, try any writable shard with free bytes if owner is DRAINING
+			if !moved && quotas[owner] == 0 {
+				for _, s := range shards {
+					cfg := s.GetSettings()
+					freeBytes := maxCap[s.ShardID] - projUsed[s.ShardID]
+					if s.ShardID != owner && cfg.AccessMode != "DRAINING" && cfg.AccessMode != "READ_ONLY" && cfg.Weight > 0 && freeBytes > 0 && freeBytes >= bBytes {
+						currentBuckets[b] = s.ShardID
+						counts[owner]--
+						counts[s.ShardID]++
+						projUsed[owner] -= bBytes
+						projUsed[s.ShardID] += bBytes
+						singleMoves = append(singleMoves, hash.BucketMigrationRange{
+							FromShard:   owner,
+							ToShard:     s.ShardID,
+							StartBucket: b,
+							EndBucket:   b,
+						})
+						moved = true
+						break
+					}
+				}
+				if !moved {
+					return nil, fmt.Errorf("%w: insufficient free byte capacity in cluster to rebalance bucket #%d (%d B)",
+						storage.ErrInsufficientClusterCapacity, b, bBytes)
 				}
 			}
 		}
@@ -368,7 +724,6 @@ func coalesceSplitRanges(moves []hash.BucketMigrationRange) []hash.BucketMigrati
 	if len(moves) == 0 {
 		return nil
 	}
-	// Sort by FromShard, ToShard, StartBucket ascending
 	for i := 0; i < len(moves); i++ {
 		for j := i + 1; j < len(moves); j++ {
 			if moves[j].FromShard < moves[i].FromShard ||
@@ -401,7 +756,19 @@ func (e *Engine) syncTargetBucketMetadata() {
 		cfg := s.GetSettings()
 		cfg.TargetBuckets = counts[s.ShardID]
 		s.UpdateSettings(cfg)
-		s.ResizeMemorySlabs(cfg.MaxCapacityBytes, cfg.SlabBytesPerBucket)
+	}
+}
+
+func applyCDCEventToTarget(dstShard *storage.PhysicalShard, ev storage.MutationLogEntry) {
+	switch ev.Op {
+	case storage.MutationInsertOrUpdate:
+		dstShard.UpsertUser(ev.Row, false)
+	case storage.MutationDelete:
+		dstShard.DeleteUser(ev.UserID, false)
+	case storage.MutationCustomUpsert:
+		_ = dstShard.TryUpsertCustomRow(ev.Custom, false, false)
+	case storage.MutationCustomDelete:
+		dstShard.DeleteCustomRow(ev.BucketID, ev.Custom.TableName, ev.Custom.RowKey, false)
 	}
 }
 
@@ -458,25 +825,28 @@ func (e *Engine) executeBucketMigrations(title string, ranges []hash.BucketMigra
 			e.dir.SetBucketState(b, directory.BucketStateCDCStreaming)
 		}
 
-		watermarkLSN := srcShard.CurrentLSN()
+		bucketWatermarks := make(map[uint16]uint64, int(rng.EndBucket-rng.StartBucket)+1)
+		minWatermarkLSN := srcShard.CurrentLSN()
 
 		// PHASE A: Columnar Keyset Backfill (Bucket-by-Bucket Non-Blocking Copy)
 		for b := rng.StartBucket; b <= rng.EndBucket; b++ {
-			slabCopy := srcShard.ExportBucketSlab(b)
+			slabCopy, exportedLSN := srcShard.ExportBucketSlabWithLSN(b)
+			bucketWatermarks[b] = exportedLSN
+			if exportedLSN < minWatermarkLSN {
+				minWatermarkLSN = exportedLSN
+			}
 			dstShard.InstallBucketSlab(slabCopy)
 			rowsMovedSoFar += slabCopy.RowCount
 
 			if (b-rng.StartBucket)%8 == 0 || b == rng.EndBucket {
-				events, latestLSN := srcShard.FetchCDCMutationsAfter(rng.StartBucket, rng.EndBucket, watermarkLSN)
+				events, _ := srcShard.FetchCDCMutationsAfter(rng.StartBucket, b, minWatermarkLSN)
 				for _, ev := range events {
-					if ev.Op == storage.MutationInsertOrUpdate {
-						dstShard.UpsertUser(ev.Row, false)
-					} else if ev.Op == storage.MutationDelete {
-						dstShard.DeleteUser(ev.UserID, false)
+					if wm, ok := bucketWatermarks[ev.BucketID]; ok && ev.LSN > wm {
+						applyCDCEventToTarget(dstShard, ev)
+						bucketWatermarks[ev.BucketID] = ev.LSN
+						totalCDCEvents++
 					}
-					totalCDCEvents++
 				}
-				watermarkLSN = latestLSN
 
 				pct := (float64(rowsMovedSoFar) / float64(totalRowsToMove)) * 100.0
 				if pct > 99.0 {
@@ -498,21 +868,22 @@ func (e *Engine) executeBucketMigrations(title string, ranges []hash.BucketMigra
 			}
 		}
 
-		// PHASE B: Zero-Lag CDC Drain Gate (<200us) & VDiff Parity Verification
+		// PHASE B: Zero-Lag CDC Drain Gate (<50us) & VDiff Parity Verification
+		// Acquire write-gate locks in ascending bucket order so no writer is mid-flight on srcShard during VDiff & Cutover
+		e.dir.LockBucketRangeForCutover(rng.StartBucket, rng.EndBucket)
+
 		for b := rng.StartBucket; b <= rng.EndBucket; b++ {
 			e.dir.SetBucketState(b, directory.BucketStateCutoverGate)
 		}
 
-		tailEvents, finalLSN := srcShard.FetchCDCMutationsAfter(rng.StartBucket, rng.EndBucket, watermarkLSN)
+		tailEvents, _ := srcShard.FetchCDCMutationsAfter(rng.StartBucket, rng.EndBucket, minWatermarkLSN)
 		for _, ev := range tailEvents {
-			if ev.Op == storage.MutationInsertOrUpdate {
-				dstShard.UpsertUser(ev.Row, false)
-			} else if ev.Op == storage.MutationDelete {
-				dstShard.DeleteUser(ev.UserID, false)
+			if wm, ok := bucketWatermarks[ev.BucketID]; ok && ev.LSN > wm {
+				applyCDCEventToTarget(dstShard, ev)
+				bucketWatermarks[ev.BucketID] = ev.LSN
+				totalCDCEvents++
 			}
-			totalCDCEvents++
 		}
-		_ = finalLSN
 
 		vdiff := VerifyBucketRangeVDiff(srcShard, dstShard, rng.StartBucket, rng.EndBucket)
 
@@ -522,6 +893,15 @@ func (e *Engine) executeBucketMigrations(title string, ranges []hash.BucketMigra
 		}
 
 		srcShard.PurgeBucketRange(rng.StartBucket, rng.EndBucket)
+
+		e.mu.RLock()
+		hook := e.onCutover
+		e.mu.RUnlock()
+		if hook != nil {
+			hook(rng.StartBucket, rng.EndBucket, rng.ToShard)
+		}
+
+		e.dir.UnlockBucketRangeForCutover(rng.StartBucket, rng.EndBucket)
 
 		vdiffCopy := vdiff
 		e.mu.Lock()
@@ -558,8 +938,11 @@ func (e *Engine) executeBucketMigrations(title string, ranges []hash.BucketMigra
 }
 
 // MigrateSingleHotBucket isolates a single overloaded virtual bucket from fromShard to toShard
-// via autonomous CDC micro-rebalancing (Pillar 5).
+// via autonomous CDC micro-rebalancing (Pillar 5), checking free byte capacity first.
 func (e *Engine) MigrateSingleHotBucket(bucket uint16, fromShardID, toShardID uint32) (*VDiffReport, error) {
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+
 	if fromShardID == toShardID {
 		return nil, nil
 	}
@@ -568,14 +951,33 @@ func (e *Engine) MigrateSingleHotBucket(bucket uint16, fromShardID, toShardID ui
 	if !ok1 || !ok2 {
 		return nil, fmt.Errorf("source or target shard missing")
 	}
+	dstCfg := dstShard.GetSettings()
+	if dstCfg.AccessMode == "DRAINING" || dstCfg.AccessMode == "READ_ONLY" {
+		return nil, fmt.Errorf("%w: target shard %d is %s", storage.ErrInsufficientClusterCapacity, toShardID, dstCfg.AccessMode)
+	}
+	bBytes := srcShard.BucketMemoryBytes(bucket)
+	if dstShard.FreeMemoryBytes() < bBytes {
+		return nil, fmt.Errorf("%w: target shard %d lacks free bytes (%d B < %d B)",
+			storage.ErrInsufficientClusterCapacity, toShardID, dstShard.FreeMemoryBytes(), bBytes)
+	}
 
+	e.dir.LockBucketRangeForCutover(bucket, bucket)
 	e.dir.SetBucketState(bucket, directory.BucketStateCDCStreaming)
-	slabCopy := srcShard.ExportBucketSlab(bucket)
+	slabCopy, _ := srcShard.ExportBucketSlabWithLSN(bucket)
 	dstShard.InstallBucketSlab(slabCopy)
 
 	vdiff := VerifyBucketRangeVDiff(srcShard, dstShard, bucket, bucket)
 	e.dir.AtomicCutoverBucket(bucket, toShardID)
 	srcShard.PurgeBucketRange(bucket, bucket)
+
+	e.mu.RLock()
+	hook := e.onCutover
+	e.mu.RUnlock()
+	if hook != nil {
+		hook(bucket, bucket, toShardID)
+	}
+	e.dir.UnlockBucketRangeForCutover(bucket, bucket)
+
 	e.syncTargetBucketMetadata()
 
 	e.mu.Lock()
@@ -599,3 +1001,4 @@ func (e *Engine) updateState(fn func(*WorkflowSnapshot)) {
 	fn(&e.snapshot)
 	e.mu.Unlock()
 }
+

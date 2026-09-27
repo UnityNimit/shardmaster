@@ -32,6 +32,7 @@ type LookupResult struct {
 type ShardDirectory struct {
 	buckets        [hash.TotalVirtualBuckets]atomic.Uint32
 	bucketStates   [hash.TotalVirtualBuckets]atomic.Uint32
+	writeGateMu    [hash.TotalVirtualBuckets]sync.RWMutex
 	activeShards   atomic.Uint32
 	routingVersion atomic.Uint64
 	totalLookups   atomic.Uint64
@@ -168,6 +169,46 @@ func (d *ShardDirectory) AtomicCutoverBucket(bucket uint16, newShardID uint32) {
 		}
 	}
 	d.routingVersion.Add(1)
+}
+
+// AcquireBucketWrite acquires a read lock on the bucket's write gate and returns the current owning shardID,
+// bucket ID, and an unlock callback. This prevents writers from stranding mutations on a source shard during cutover.
+func (d *ShardDirectory) AcquireBucketWrite(key string) (uint32, uint16, func()) {
+	d.totalLookups.Add(1)
+	b := hash.ComputeBucket(key)
+	d.writeGateMu[b].RLock()
+	if d.hasPins.Load() {
+		d.pinMu.RLock()
+		if pinned, ok := d.pinnedKeys[key]; ok {
+			d.pinMu.RUnlock()
+			return pinned, b, func() { d.writeGateMu[b].RUnlock() }
+		}
+		d.pinMu.RUnlock()
+	}
+	owner := d.buckets[b].Load()
+	return owner, b, func() { d.writeGateMu[b].RUnlock() }
+}
+
+// AcquireBucketWriteByID acquires a read lock on the bucket's write gate by bucket ID.
+func (d *ShardDirectory) AcquireBucketWriteByID(bucket uint16) (uint32, func()) {
+	b := bucket & hash.BucketMask
+	d.writeGateMu[b].RLock()
+	owner := d.buckets[b].Load()
+	return owner, func() { d.writeGateMu[b].RUnlock() }
+}
+
+// LockBucketRangeForCutover acquires exclusive write-gate locks on [startBucket, endBucket] in ascending order.
+func (d *ShardDirectory) LockBucketRangeForCutover(startBucket, endBucket uint16) {
+	for b := startBucket; b <= endBucket; b++ {
+		d.writeGateMu[b&hash.BucketMask].Lock()
+	}
+}
+
+// UnlockBucketRangeForCutover releases exclusive write-gate locks on [startBucket, endBucket] in reverse order.
+func (d *ShardDirectory) UnlockBucketRangeForCutover(startBucket, endBucket uint16) {
+	for b := int(endBucket); b >= int(startBucket); b-- {
+		d.writeGateMu[uint16(b)&hash.BucketMask].Unlock()
+	}
 }
 
 // RegisterShard increments activeShards if shardID >= activeShards.

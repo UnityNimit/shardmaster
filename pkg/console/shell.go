@@ -775,16 +775,25 @@ func runShardCustomizerMenu(qr *router.QueryRouter, reader *bufio.Reader) {
 		}
 		var newShard *storage.PhysicalShard
 		var snap *cdc.WorkflowSnapshot
+		var provErr error
 		RunSpinnerWhile(fmt.Sprintf("Provisioning [%s] (Max: %s, Slab: %d B/bkt) & Streaming %d Buckets...", alias, storage.FormatBytesExact(maxB), slabB, bkts), func() {
-			newShard, snap, _ = qr.CDC.ProvisionCustomShard(cfg, 12*time.Millisecond)
+			newShard, snap, provErr = qr.CDC.ProvisionCustomShard(cfg, 12*time.Millisecond)
 			if newShard != nil {
 				newShard.ResizeMemorySlabs(maxB, int(slabB))
 			}
 		})
+		if provErr != nil {
+			fmt.Printf("  %s Provision Error: %v\n", hotStyle.Render("[ERROR]"), provErr)
+			return
+		}
+		rowsMoved := uint64(0)
+		if snap != nil {
+			rowsMoved = uint64(snap.RowsMigrated)
+		}
 		fmt.Printf("  %s Provisioned Shard %d [%s] (:%d) | Live RAM: %s | Migrated %s rows (0.00ms Downtime)\n",
 			okStyle.Render("[OK]"), newShard.ShardID, newShard.DisplayName(), newShard.Port,
 			storage.FormatBytesExact(newShard.UsedMemoryBytes()),
-			FormatCommas(uint64(snap.RowsMigrated)))
+			FormatCommas(rowsMoved))
 		PrintStaticDashboard(qr, false)
 
 	case "2":
@@ -831,29 +840,28 @@ func runShardCustomizerMenu(qr *router.QueryRouter, reader *bufio.Reader) {
 		cfg.TargetBuckets = newB
 		cfg.AccessMode = strings.ToUpper(mode)
 		cfg.ReplicationMode = strings.ToUpper(repl)
-		s.UpdateSettings(cfg)
-		s.ResizeMemorySlabs(cfg.MaxCapacityBytes, cfg.SlabBytesPerBucket)
 
+		explicitBuckets := -1
+		if newB != curB {
+			explicitBuckets = newB
+		}
 		var snap *cdc.WorkflowSnapshot
-		if cfg.AccessMode == "DRAINING" || newB == 0 {
-			RunSpinnerWhile(fmt.Sprintf("Draining Shard %d [%s] -> 0 Buckets via CDC VReplication...", s.ShardID, s.DisplayName()), func() {
-				snap, _ = qr.CDC.DrainShard(s.ShardID, 12*time.Millisecond)
-			})
-		} else if newB != curB {
-			RunSpinnerWhile(fmt.Sprintf("Live Resizing Shard %d [%s]: %d -> %d Buckets via CDC VReplication...", s.ShardID, s.DisplayName(), curB, newB), func() {
-				snap, _ = qr.CDC.ResizeShardBuckets(s.ShardID, newB, 12*time.Millisecond)
-				s.ResizeMemorySlabs(cfg.MaxCapacityBytes, cfg.SlabBytesPerBucket)
-			})
+		var enfErr error
+		RunSpinnerWhile(fmt.Sprintf("Applying byte-exact configuration & CDC bucket migration on Shard %d [%s]...", s.ShardID, alias), func() {
+			snap, enfErr = qr.CDC.EnforceShardCapacityAndBuckets(s.ShardID, cfg, explicitBuckets, 12*time.Millisecond)
+		})
+		if enfErr != nil {
+			fmt.Printf("  %s Configuration Rejected: %v\n", hotStyle.Render("[ERROR]"), enfErr)
+			return
 		}
+		evacuated := 0
 		if snap != nil {
-			fmt.Printf("  %s Live Resize Complete: %s rows migrated | Live RAM: %s (0.00ms Downtime)\n",
-				okStyle.Render("[OK]"), FormatCommas(uint64(snap.RowsMigrated)), storage.FormatBytesExact(s.UsedMemoryBytes()))
-		} else {
-			qr.Cluster.SaveStateFile(qr.Dir.SnapshotBuckets())
-			fmt.Printf("  %s Updated Shard %d [%s] | Live RAM: %s / %s.\n",
-				okStyle.Render("[OK]"), s.ShardID, s.DisplayName(),
-				storage.FormatBytesExact(s.UsedMemoryBytes()), storage.FormatBytesExact(cfg.MaxCapacityBytes))
+			evacuated = snap.RangesCompleted
 		}
+		qr.Cluster.SaveStateFile(qr.Dir.SnapshotBuckets())
+		fmt.Printf("  %s Updated Shard %d [%s] | Evacuated/Moved: %d Ranges | Live RAM: %s / %s.\n",
+			okStyle.Render("[OK]"), s.ShardID, s.DisplayName(), evacuated,
+			storage.FormatBytesExact(s.UsedMemoryBytes()), storage.FormatBytesExact(cfg.MaxCapacityBytes))
 		PrintStaticDashboard(qr, false)
 
 	case "3":
@@ -861,24 +869,38 @@ func runShardCustomizerMenu(qr *router.QueryRouter, reader *bufio.Reader) {
 		sidStr := promptDefault(reader, fmt.Sprintf("Select Shard ID to Drain (0..%d) [default: %s]", len(shards)-1, defDrain), defDrain)
 		sid, _ := strconv.Atoi(sidStr)
 		var snap *cdc.WorkflowSnapshot
+		var drainErr error
 		RunSpinnerWhile(fmt.Sprintf("Draining Shard %d (Evacuating 100%% of Virtual Buckets via CDC)...", sid), func() {
-			snap, _ = qr.CDC.DrainShard(uint32(sid), 12*time.Millisecond)
+			snap, drainErr = qr.CDC.DrainShard(uint32(sid), 12*time.Millisecond)
 		})
-		if snap != nil {
-			fmt.Printf("  %s Shard %d Drained (%s rows evacuated with 0.00ms Downtime).\n",
-				okStyle.Render("[OK]"), sid, FormatCommas(uint64(snap.RowsMigrated)))
+		if drainErr != nil {
+			fmt.Printf("  %s Drain Rejected: %v\n", hotStyle.Render("[ERROR]"), drainErr)
+			return
 		}
+		rangesDone := 0
+		if snap != nil {
+			rangesDone = snap.RangesCompleted
+		}
+		fmt.Printf("  %s Shard %d Drained (%d bucket ranges evacuated with 0.00ms Downtime).\n",
+			okStyle.Render("[OK]"), sid, rangesDone)
 		PrintStaticDashboard(qr, false)
 
 	case "4":
 		var snap *cdc.WorkflowSnapshot
+		var rebErr error
 		RunSpinnerWhile("Rebalancing all 1,024 Virtual Buckets proportionally by Shard Weight...", func() {
-			snap, _ = qr.CDC.RebalanceByWeights(12 * time.Millisecond)
+			snap, rebErr = qr.CDC.RebalanceByWeights(12 * time.Millisecond)
 		})
-		if snap != nil {
-			fmt.Printf("  %s Weighted Rebalance Complete (%s rows migrated).\n",
-				okStyle.Render("[OK]"), FormatCommas(uint64(snap.RowsMigrated)))
+		if rebErr != nil {
+			fmt.Printf("  %s Rebalance Rejected: %v\n", hotStyle.Render("[ERROR]"), rebErr)
+			return
 		}
+		rangesDone := 0
+		if snap != nil {
+			rangesDone = snap.RangesCompleted
+		}
+		fmt.Printf("  %s Weighted Rebalance Complete (%d bucket ranges migrated).\n",
+			okStyle.Render("[OK]"), rangesDone)
 		PrintStaticDashboard(qr, false)
 
 	case "5":
