@@ -909,12 +909,12 @@ func TestTUIDashboardLabelsAndLocalZones(t *testing.T) {
 	model := tui.NewDashboardModel(qr)
 	viewOut := model.View()
 
-	for _, forbidden := range []string{"50M Rows", "0.0M", "eu-central", "ap-south"} {
+	for _, forbidden := range []string{"50M Rows", "0.0M", "eu-central", "ap-south", "LOCAL ZONE"} {
 		if strings.Contains(viewOut, forbidden) {
-			t.Fatalf("expected TUI View() to NOT contain fake string %q, got:\n%s", forbidden, viewOut)
+			t.Fatalf("expected TUI View() to NOT contain string %q, got:\n%s", forbidden, viewOut)
 		}
 	}
-	for _, required := range []string{"10,000", "SHARD NAME", "LOCAL ZONE", "BUCKETS", "RAM USED / MAX", "ROWS", "QPS", "shard-0", "local-node-0", "128/1024", "SELECTED:"} {
+	for _, required := range []string{"10,042", "SHARD NAME", "PORT", "MODE", "BUCKETS", "RAM USED / MAX", "ROWS", "QPS", "shard-0", ":5432", "128/1024", "SELECTED:"} {
 		if !strings.Contains(viewOut, required) {
 			t.Fatalf("expected TUI View() to contain %q, got:\n%s", required, viewOut)
 		}
@@ -928,6 +928,11 @@ func TestAllRowsUniqueZeroSplitBrainAndLiveCatalog(t *testing.T) {
 	cdcEngine := cdc.NewEngine(dir, cluster)
 	tracker := hotspot.NewTracker(dir, cluster, cdcEngine)
 	qr := router.NewQueryRouter(dir, cluster, cdcEngine, tracker)
+
+	// 0. Verify TotalClusterRows reflects all 3 application tables (10,000 users + 21 orders + 21 payments = 10,042)
+	if qr.TotalClusterRows() != 10042 {
+		t.Fatalf("expected TotalClusterRows() == 10042, got %d", qr.TotalClusterRows())
+	}
 
 	// 1. Verify zero split-brain: physical shards AND SQLite relational engine both hold all 10,000 users
 	resFast, err := qr.ExecuteSQL("SELECT COUNT(*) FROM users;")
@@ -966,10 +971,13 @@ func TestAllRowsUniqueZeroSplitBrainAndLiveCatalog(t *testing.T) {
 		}
 	}
 
-	// 3. Verify SHOW TABLES reports live row counts (not hardcoded strings) when rows are inserted into orders
+	// 3. Verify SHOW TABLES and TotalClusterRows report live row counts (10,043) when rows are inserted into orders
 	_, err = qr.ExecuteSQL("INSERT INTO orders (order_id, user_id, shard_id, bucket_id, product_name, category, amount_cents, amount_usd, order_status, region) VALUES (2050, 42, 'shard_0', 10, 'Custom Order Live', 'Test', 77700, 777.00, 'COMPLETED', 'local-node-0');")
 	if err != nil {
 		t.Fatalf("INSERT INTO orders failed: %v", err)
+	}
+	if qr.TotalClusterRows() != 10043 {
+		t.Fatalf("expected TotalClusterRows() == 10043 after INSERT into orders, got %d", qr.TotalClusterRows())
 	}
 	showRes, err := qr.ExecuteSQL("SHOW TABLES;")
 	if err != nil {

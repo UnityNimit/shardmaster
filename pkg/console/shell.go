@@ -122,10 +122,7 @@ func AnimateBanner(qr *router.QueryRouter, pgwireUp bool) {
 		fmt.Println(style.Render(line))
 	}
 
-	var totalRows uint64
-	for _, s := range qr.Cluster.GetAllShards() {
-		totalRows += uint64(s.RowCount())
-	}
+	totalRows := uint64(qr.TotalClusterRows())
 
 	pgStatus := "PGWire :6000 ONLINE"
 	if !pgwireUp {
@@ -1152,34 +1149,28 @@ func PrintStaticDashboard(qr *router.QueryRouter, showReshardingExample bool) {
 		rows = append(rows, []string{
 			fmt.Sprintf("Shard %d (:%d)", s.ShardID, s.Port),
 			s.DisplayName(),
-			s.Region,
 			fmt.Sprintf("%s / %s (%d B)", storage.FormatBytesCompact(s.UsedMemoryBytes()), storage.FormatBytesCompact(cfg.MaxCapacityBytes), s.UsedMemoryBytes()),
 			bar,
 			fmt.Sprintf("%d Buckets", bCount),
-			FormatCommas(uint64(s.RowCount())) + " rows",
+			FormatCommas(uint64(qr.ShardTotalRows(s.ShardID))) + " rows",
 			cfg.AccessMode,
 		})
 	}
 
 	RenderTypedTable(
-		[]string{"shard_node", "custom_name", "region", "used_vs_max_bytes", "load_distribution", "virtual_buckets", "row_count", "mode"},
-		[]string{"PHYSICAL NODE", "SHARD ALIAS", "ZONE", "EXACT RAM BYTES", "BUCKET CAPACITY BAR", "INT4 [0..1024]", "INT8 SLAB", "STATE"},
+		[]string{"shard_node", "custom_name", "used_vs_max_bytes", "load_distribution", "virtual_buckets", "row_count", "mode"},
+		[]string{"PHYSICAL NODE", "SHARD ALIAS", "EXACT RAM BYTES", "BUCKET CAPACITY BAR", "INT4 [0..1024]", "INT8 SLAB", "STATE"},
 		rows,
 	)
 
-	if showReshardingExample {
-		fmt.Printf("  %s RESHARDING (4 -> 5 Shards) | Scope: Bucket [204-255] | Lag: 0.42 ms | Parity: %s\n",
-			cyanStyle.Render("WORKFLOW:"), okStyle.Render("VERIFIED"))
-	} else {
-		fmt.Printf("  %s %s [%s]  |  Scope: %s  |  Lag: %.2f ms  |  Parity: %s\n",
-			cyanStyle.Render("WORKFLOW:"),
-			whiteBold.Render(wf.Title),
-			okStyle.Render(wf.Status),
-			wf.CurrentRangeText,
-			wf.ReplicationLagMs,
-			okStyle.Render(wf.VDiffStatus),
-		)
-	}
+	fmt.Printf("  %s %s [%s]  |  Scope: %s  |  Lag: %.2f ms  |  Parity: %s\n",
+		cyanStyle.Render("WORKFLOW:"),
+		whiteBold.Render(wf.Title),
+		okStyle.Render(wf.Status),
+		wf.CurrentRangeText,
+		wf.ReplicationLagMs,
+		okStyle.Render(wf.VDiffStatus),
+	)
 }
 
 func RunSixPillarShowcase(qr *router.QueryRouter) {

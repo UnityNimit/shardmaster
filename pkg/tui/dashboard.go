@@ -46,7 +46,7 @@ var presetQueries = []struct {
 	{"Explain Route #42", "EXPLAIN ANALYZE SELECT * FROM users WHERE user_id = 42;"},
 }
 
-// DashboardModel is a clean, minimalist 4-Tab TUI with a 100% free-form, byte-exact Shard Customizer,
+// DashboardModel is a minimalist 4-Tab TUI with a 100% free-form, byte-exact Shard Customizer,
 // Live Resizer, Custom Shard Creator, and Shard-Pinned SQL Explorer that fits inside 80x24 terminals.
 type DashboardModel struct {
 	qr            *router.QueryRouter
@@ -81,17 +81,23 @@ func NewDashboardModel(qr *router.QueryRouter) *DashboardModel {
 	stop.Store(true)
 	m := &DashboardModel{
 		qr:            qr,
-		loadGenActive: false,
+		loadGenActive: true,
 		stopLoadFlag:  stop,
 		activeTab:     0,
 		pinnedShardID: -1,
-		statusBanner:  "Select shard [Up/Dn] | [e] Customize  [n] New  [s] Split +1  [b] Stress Load",
+		statusBanner:  "Ready · Select shard [Up/Dn] · [e] Customize · [s] Split +1 · [b] Traffic",
 	}
 	m.refreshActiveQuery()
 	for _, s := range qr.Cluster.GetAllShards() {
-		_ = s.TickQPS(1.0)
+		s.ResetQPSCounter()
 	}
-	m.globalQPS = 0
+	// Run an initial warm-up batch so per-shard and global QPS reflect live traffic immediately
+	m.runDynamicLoadStep(1, 1)
+	var warmQPS uint64
+	for _, s := range qr.Cluster.GetAllShards() {
+		warmQPS += s.TickQPS(0.05)
+	}
+	m.globalQPS = warmQPS
 	return m
 }
 
@@ -112,36 +118,59 @@ func (m *DashboardModel) refreshActiveQuery() {
 	}
 }
 
-func (m *DashboardModel) runLoadBatch(startUID int64) int64 {
-	uid := startUID
-	totalRows := m.qr.Cluster.TotalRows()
-	if totalRows <= 0 {
-		totalRows = 10000
+// runDynamicLoadStep executes a naturally varying, Zipf-skewed batch of real shard reads
+// so per-shard and cluster QPS fluctuate organically with real execution timing.
+func (m *DashboardModel) runDynamicLoadStep(cursorUID int64, step uint64) int64 {
+	totalUsers := m.qr.Cluster.TotalRows()
+	if totalUsers <= 0 {
+		totalUsers = 10000
 	}
-	for i := 0; i < 160; i++ {
-		targetUID := (uid % totalRows) + 1
-		shardID, bucket := m.qr.RouteFastPoint(targetUID)
+	ns := uint64(time.Now().UnixNano())
+	wave := []int{64, 118, 92, 175, 140, 84, 210, 108}[step%8]
+	jitter := int((ns >> 7) % 53)
+	batchSize := wave + jitter
+
+	// Pick a rotating focal user so individual shards see organic traffic shifts
+	focalBase := int64(((step * 397) + (ns >> 11)) % uint64(totalUsers)) + 1
+	uid := cursorUID
+	for i := 0; i < batchSize; i++ {
+		var targetUID int64
+		if i%4 == 0 {
+			// Skewed access cluster
+			targetUID = ((focalBase + int64(i*7)) % totalUsers) + 1
+		} else {
+			// Sequential + stride scan across all buckets
+			targetUID = (uid % totalUsers) + 1
+			uid += 3
+		}
+		shardID, _ := m.qr.RouteFastPoint(targetUID)
 		if s, ok := m.qr.Cluster.GetShard(shardID); ok {
 			_, _ = s.GetUser(targetUID)
 		}
-		_ = bucket
-		uid++
 	}
 	return uid
 }
 
 func (m *DashboardModel) startBackgroundLoad() {
-	m.stopLoadFlag.Store(false)
+	if !m.stopLoadFlag.CompareAndSwap(true, false) {
+		return
+	}
 	go func(stop *atomic.Bool) {
 		uid := int64(1)
+		var step uint64 = 1
 		for !stop.Load() {
-			uid = m.runLoadBatch(uid)
-			time.Sleep(12 * time.Millisecond)
+			uid = m.runDynamicLoadStep(uid, step)
+			step++
+			sleepMs := 10 + int((uint64(time.Now().UnixNano())>>9)%14)
+			time.Sleep(time.Duration(sleepMs) * time.Millisecond)
 		}
 	}(m.stopLoadFlag)
 }
 
 func (m *DashboardModel) Init() tea.Cmd {
+	if m.loadGenActive {
+		m.startBackgroundLoad()
+	}
 	return tickCmd()
 }
 
@@ -176,7 +205,7 @@ func (m *DashboardModel) openEditShardModal() {
 		cfg.HardwareTier,
 		fmt.Sprintf("%s/%s/%d", cfg.AccessMode, cfg.ReplicationMode, cfg.MaxConnections),
 	}
-	m.statusBanner = fmt.Sprintf("Editing S%d | Type ANY value on ANY field ([Ctrl+U] Clear, [Enter] Apply)", s.ShardID)
+	m.statusBanner = fmt.Sprintf("Customize S%d · Type any value ([Ctrl+U] Clear · [Enter] Apply)", s.ShardID)
 }
 
 func (m *DashboardModel) openCreateShardModal() {
@@ -196,7 +225,7 @@ func (m *DashboardModel) openCreateShardModal() {
 		"16GB-PC-RAM-Slab",
 		"READ_WRITE/SYNC_QUORUM/1000",
 	}
-	m.statusBanner = fmt.Sprintf("Create Shard %d | Type ANY custom bytes, name, buckets or zone & press [Enter]", nextID)
+	m.statusBanner = fmt.Sprintf("Provision S%d · Customize bytes, name, or buckets & press [Enter]", nextID)
 }
 
 func (m *DashboardModel) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -291,7 +320,7 @@ func (m *DashboardModel) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // while keeping every field 100% editable as free-form text.
 func (m *DashboardModel) nudgeFreeFormField(delta int) {
 	switch m.formFieldIdx {
-	case 1: // Max Capacity Bytes: nudge by 1,024 bytes (1 KB) or 1 byte if < 1024
+	case 1: // Max Capacity Bytes: nudge by 1,024 bytes (1 KB) or 64 bytes if <= 4096
 		b, err := storage.ParseByteSize(m.formInputs[1])
 		if err != nil {
 			b = storage.DefaultShardCapacityBytes
@@ -387,7 +416,7 @@ func (m *DashboardModel) applyFreeFormShardModal() (tea.Model, tea.Cmd) {
 
 	region := strings.TrimSpace(m.formInputs[5])
 	if region == "" {
-		region = "local"
+		region = "local-node-0"
 	}
 
 	tier := strings.TrimSpace(m.formInputs[6])
@@ -468,10 +497,10 @@ func (m *DashboardModel) applyFreeFormShardModal() (tea.Model, tea.Cmd) {
 				}
 				m.qr.Cluster.SaveStateFile(m.qr.Dir.SnapshotBuckets())
 				if evacuated > 0 {
-					m.statusBanner = fmt.Sprintf("Saved S%d [%s] | Evacuated %d Ranges via CDC | RAM: %s / %s",
+					m.statusBanner = fmt.Sprintf("Saved S%d [%s] · Evacuated %d Ranges via CDC · RAM: %s / %s",
 						sid, s.DisplayName(), evacuated, storage.FormatBytesCompact(s.UsedMemoryBytes()), storage.FormatBytesCompact(maxBytes))
 				} else {
-					m.statusBanner = fmt.Sprintf("Saved S%d [%s] | Live RAM: %s / %s",
+					m.statusBanner = fmt.Sprintf("Saved S%d [%s] · Live RAM: %s / %s",
 						sid, s.DisplayName(), storage.FormatBytesExact(s.UsedMemoryBytes()), storage.FormatBytesExact(maxBytes))
 				}
 			}
@@ -596,7 +625,7 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.customSQLInput == "" {
 					m.customSQLInput = presetQueries[m.queryIdx%len(presetQueries)].sql
 				}
-				m.statusBanner = "Type SQL query & press [Enter] to execute ([Esc] Cancel, [Ctrl+U] Clear)"
+				m.statusBanner = "Type SQL query & press [Enter] to execute ([Esc] Cancel · [Ctrl+U] Clear)"
 				return m, nil
 			}
 		}
@@ -668,7 +697,7 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.activeTab = 3
 				m.scrollOffset = 0
 				m.refreshActiveQuery()
-				m.statusBanner = fmt.Sprintf("SQL Explorer pinned to S%d [%s] | Press [f] to cycle target shard", s.ShardID, s.DisplayName())
+				m.statusBanner = fmt.Sprintf("SQL Explorer pinned to S%d [%s] · Press [f] to cycle target shard", s.ShardID, s.DisplayName())
 			} else {
 				if m.pinnedShardID < 0 {
 					m.pinnedShardID = 0
@@ -716,11 +745,15 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.loadGenActive {
 				m.stopLoadFlag.Store(true)
 				m.loadGenActive = false
-				m.statusBanner = "Background Stress Load: OFF (Idle QPS = 0/s)."
+				for _, s := range m.qr.Cluster.GetAllShards() {
+					s.ResetQPSCounter()
+				}
+				m.globalQPS = 0
+				m.statusBanner = "Live Traffic Generator: PAUSED (QPS = 0/s)"
 			} else {
 				m.loadGenActive = true
 				m.startBackgroundLoad()
-				m.statusBanner = "Background Stress Load: ON (Generating Live Queries)."
+				m.statusBanner = "Live Traffic Generator: ACTIVE (Dynamic Workload)"
 			}
 			return m, nil
 
@@ -743,7 +776,7 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pinnedShardID = -1
 			m.scrollOffset = 0
 			m.refreshActiveQuery()
-			m.statusBanner = fmt.Sprintf("Reset to 4 Local Shards (1,024 Buckets, %s rows).", formatUintComma(uint64(m.qr.Cluster.TotalRows())))
+			m.statusBanner = fmt.Sprintf("Reset to 4 Shards (1,024 Buckets, %s total rows).", formatUintComma(uint64(m.qr.TotalClusterRows())))
 			return m, nil
 		}
 
@@ -757,7 +790,7 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case peakBurstDoneMsg:
 		m.peakBurstQPS = msg.RoutingThroughputQPS
 		m.statusBanner = fmt.Sprintf(
-			"PEAK BURST: %s req/sec (%d ns/op, 0 allocs) | 0 Dropped!",
+			"PEAK BURST: %s req/sec (%d ns/op, 0 allocs) · 0 Dropped!",
 			formatUintComma(msg.RoutingThroughputQPS),
 			msg.P50LatencyNs,
 		)
@@ -787,52 +820,63 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *DashboardModel) View() string {
-	// 78-column width (76 inner chars) and 21-line height so it fits cleanly inside 80x24 terminals without wrapping
+	// Minimalist 78-column rounded frame (76 inner chars) fitting 80x24 terminals cleanly
 	borderStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("39")).
+		BorderForeground(lipgloss.Color("240")).
 		Padding(0, 1).
 		Width(78)
 
-	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("86"))
-	colHdrStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
+	brandStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("86"))
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("252"))
+	colHdrStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("111"))
 	okStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
 	warnStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
 	hotStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196"))
-	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+	ruleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
 	selStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("51"))
-	activeTabStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Background(lipgloss.Color("33")).Padding(0, 1)
-	inactiveTabStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("248")).Padding(0, 1)
-	barFillStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
-	migBarStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("46"))
+	keyStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81"))
+	activeTabStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("255")).Background(lipgloss.Color("25")).Padding(0, 1)
+	inactiveTabStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Padding(0, 1)
+	barFillStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("45"))
+	barEmptyStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("237"))
+	migBarStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
 
 	shards := m.qr.Cluster.GetAllShards()
 	bucketCounts := m.qr.Dir.BucketCountsByShard()
 	wf := m.qr.CDC.GetSnapshot()
 	alerts := m.qr.HotspotTracker.GetRecentAlerts()
-	totalRows := uint64(m.qr.Cluster.TotalRows())
+	totalRows := uint64(m.qr.TotalClusterRows())
+	appTables := m.qr.ApplicationTableCount()
 
 	var b strings.Builder
 
-	// 1. Minimalist Animated Header with Real Row Count & Real Measured QPS
-	spinFrames := []byte{'-', '\\', '|', '/'}
-	spinChar := spinFrames[m.ticks%len(spinFrames)]
-	peakText := ""
+	// 1. Minimalist Telemetry Header Bar
+	pulseIcons := []string{"●", "◉"}
+	pulse := okStyle.Render(pulseIcons[m.ticks%2])
+	if !m.loadGenActive && m.globalQPS == 0 {
+		pulse = dimStyle.Render("○")
+	}
+	qpsDisplay := warnStyle.Render(formatUintComma(m.globalQPS) + "/s")
 	if m.peakBurstQPS > 0 {
-		peakText = " | PEAK: " + okStyle.Render(formatUintComma(m.peakBurstQPS)+"/s")
+		qpsDisplay += dimStyle.Render(" (Peak ") + okStyle.Render(formatCompactUint(m.peakBurstQPS)+"/s") + dimStyle.Render(")")
 	}
 	b.WriteString(fmt.Sprintf(
-		"%s %s  |  %d Shards  |  %s Rows  |  QPS: %s/s%s\n",
-		barFillStyle.Render(fmt.Sprintf("[%c]", spinChar)),
-		titleStyle.Render("SHARDMASTER"),
+		" %s %s  %s  %d Shards  %s  %s Rows (%d tbls)  %s  QPS %s\n",
+		pulse,
+		brandStyle.Render("SHARDMASTER"),
+		ruleStyle.Render("│"),
 		len(shards),
+		ruleStyle.Render("│"),
 		okStyle.Render(formatUintComma(totalRows)),
-		warnStyle.Render(formatUintComma(m.globalQPS)),
-		peakText,
+		appTables,
+		ruleStyle.Render("│"),
+		qpsDisplay,
 	))
 
-	// 2. Clean Navigation Tabs
-	tabNames := []string{"[1] Shards & Bytes", "[2] CDC & VDiff", "[3] Hotspots", "[4] SQL Explorer"}
+	// 2. Minimalist Pill Navigation Bar
+	tabNames := []string{"1 Topology", "2 CDC & VDiff", "3 Hotspots", "4 SQL Explorer"}
 	var renderedTabs []string
 	for i, name := range tabNames {
 		if i == m.activeTab {
@@ -841,21 +885,21 @@ func (m *DashboardModel) View() string {
 			renderedTabs = append(renderedTabs, inactiveTabStyle.Render(name))
 		}
 	}
-	b.WriteString(strings.Join(renderedTabs, " ") + "\n")
-	b.WriteString(dimStyle.Render(strings.Repeat("-", 74)) + "\n")
+	b.WriteString(" " + strings.Join(renderedTabs, "  ") + "\n")
+	b.WriteString(ruleStyle.Render(strings.Repeat("─", 74)) + "\n")
 
-	// 3. Focused Tab Content or 100% Free-Form Byte-Exact Customizer Modal (13-line viewport)
+	// 3. Focused Tab Viewport (13 lines)
 	const viewLines = 13
 	var lines []string
 	maxScroll := 0
 
 	if m.modalMode == modalEditShard || m.modalMode == modalCreateShard {
-		hdr := fmt.Sprintf("CUSTOMIZE SHARD %d ([Enter] Save  [Ctrl+U] Clear  [Esc] Cancel)", m.formShardID)
+		hdr := fmt.Sprintf(" CUSTOMIZE SHARD %d   [Enter] Save  [Ctrl+U] Clear  [Esc] Cancel", m.formShardID)
 		if m.modalMode == modalCreateShard {
-			hdr = fmt.Sprintf("CREATE LOCAL SHARD %d ([Enter] Provision  [Ctrl+U] Clear  [Esc] Cancel)", m.formShardID)
+			hdr = fmt.Sprintf(" PROVISION SHARD %d   [Enter] Create  [Ctrl+U] Clear  [Esc] Cancel", m.formShardID)
 		}
-		lines = append(lines, titleStyle.Render(hdr))
-		lines = append(lines, dimStyle.Render(" FIELD                 CURRENT VALUE                LIVE UNIT PREVIEW"))
+		lines = append(lines, brandStyle.Render(hdr))
+		lines = append(lines, colHdrStyle.Render("  PARAMETER             VALUE                         LIVE PREVIEW"))
 
 		parsedMaxB, _ := storage.ParseByteSize(m.formInputs[1])
 		parsedSlabB, _ := storage.ParseByteSize(m.formInputs[2])
@@ -864,39 +908,37 @@ func (m *DashboardModel) View() string {
 			val   string
 			hint  string
 		}{
-			{"1. Custom Shard Name", m.formInputs[0], "(Any local alias)"},
-			{"2. Max Size (Bytes) ", m.formInputs[1], fmt.Sprintf("(= %s)", storage.FormatBytesCompact(parsedMaxB))},
-			{"3. Slab Bytes/Bucket", m.formInputs[2], fmt.Sprintf("(= %s/bkt)", storage.FormatBytesCompact(parsedSlabB))},
-			{"4. Virtual Buckets  ", m.formInputs[3], "(0..1024 buckets)"},
-			{"5. Weight % : Port  ", m.formInputs[4], "(e.g. 100:5432)"},
-			{"6. Local Zone / Node", m.formInputs[5], "(e.g. local-node-0)"},
-			{"7. Hardware Profile ", m.formInputs[6], "(Local RAM profile)"},
-			{"8. Mode/Repl/Conns  ", m.formInputs[7], "(RW/SYNC_QUORUM/1000)"},
+			{"1. Shard Name      ", m.formInputs[0], "Custom node alias"},
+			{"2. Max RAM (Bytes) ", m.formInputs[1], fmt.Sprintf("= %s", storage.FormatBytesCompact(parsedMaxB))},
+			{"3. Slab Bytes/Bkt  ", m.formInputs[2], fmt.Sprintf("= %s/bkt", storage.FormatBytesCompact(parsedSlabB))},
+			{"4. Virtual Buckets ", m.formInputs[3], "0..1024 buckets"},
+			{"5. Weight % : Port ", m.formInputs[4], "e.g. 100:5432"},
+			{"6. Shard Tag       ", m.formInputs[5], "Grouping label"},
+			{"7. Memory Profile  ", m.formInputs[6], "Columnar slab tier"},
+			{"8. Mode/Repl/Conns ", m.formInputs[7], "RW/SYNC_QUORUM/1000"},
 		}
 		for idx, f := range fields {
 			cursor := "  "
-			valRendered := okStyle.Render(f.val)
+			valRendered := okStyle.Render(fmt.Sprintf("%-26s", truncateStr(f.val, 26)))
 			if idx == m.formFieldIdx {
-				cursor = "> "
-				valRendered = selStyle.Render("[" + f.val + "_]")
+				cursor = selStyle.Render("▸ ")
+				valRendered = selStyle.Render(fmt.Sprintf("%-26s", "["+truncateStr(f.val, 23)+"_]"))
 			}
-			line := fmt.Sprintf("%s%-20s: %-28s %s", cursor, f.label, valRendered, dimStyle.Render(truncateStr(f.hint, 20)))
+			line := fmt.Sprintf("%s%-19s  %s  %s", cursor, f.label, valRendered, dimStyle.Render(truncateStr(f.hint, 20)))
 			lines = append(lines, line)
 		}
 	} else if m.activeTab == 0 {
-		// TAB 1: TOPOLOGY, LABELED COLUMNS & PINNED SELECTED SHARD INSPECTOR
-		lines = append(lines, titleStyle.Render("LOCAL SHARD TOPOLOGY ([Up/Dn] Select  [e] Customize  [n] New  [f] Pin SQL)"))
+		// TAB 1: MINIMALIST SHARD TOPOLOGY (No fake zones; real local port, mode, bucket bar, RAM, all-table rows & live QPS)
 		lines = append(lines, colHdrStyle.Render(
-			fmt.Sprintf(" %-3s %-12s  %-12s  %9s  %-15s  %6s  %6s",
-				"ID", "SHARD NAME", "LOCAL ZONE", "BUCKETS", "RAM USED / MAX", "ROWS", "QPS"),
+			fmt.Sprintf("  %-13s %-6s %-4s %-14s %-15s %7s %7s",
+				"SHARD NAME", "PORT", "MODE", "BUCKETS", "RAM USED / MAX", "ROWS", "QPS"),
 		))
 
 		if m.selectedShardIdx >= len(shards) && len(shards) > 0 {
 			m.selectedShardIdx = len(shards) - 1
 		}
 
-		// Keep up to 8 shard rows visible at once so header + 8 shards + 3-line inspector = 13 lines
-		const maxVisibleShards = 8
+		const maxVisibleShards = 9
 		startIdx := 0
 		if len(shards) > maxVisibleShards {
 			if m.selectedShardIdx >= maxVisibleShards {
@@ -918,154 +960,194 @@ func (m *DashboardModel) View() string {
 			shardQPS := s.CurrentQPS()
 			usedB := s.UsedMemoryBytes()
 			maxB := cfg.MaxCapacityBytes
+			shardRows := m.qr.ShardTotalRows(s.ShardID)
 
-			prefix := " "
-			idStr := fmt.Sprintf("S%-2d", s.ShardID)
-			nameStr := fmt.Sprintf("%-12s", truncateStr(s.DisplayName(), 12))
-			zoneStr := fmt.Sprintf("%-12s", truncateStr(s.Region, 12))
-			bktStr := fmt.Sprintf("%4d/1024", bCount)
-			ramStr := fmt.Sprintf("%-15s", fmt.Sprintf("%s / %s", storage.FormatBytesCompact(usedB), storage.FormatBytesCompact(maxB)))
-			rowStr := fmt.Sprintf("%6s", formatUintComma(uint64(s.RowCount())))
-			qpsStr := fmt.Sprintf("%6s", formatCompactUint(shardQPS)+"/s")
+			modeShort := "R/W"
+			modeRendered := okStyle.Render(fmt.Sprintf("%-4s", modeShort))
+			if cfg.AccessMode == "READ_ONLY" {
+				modeShort = "R/O"
+				modeRendered = warnStyle.Render(fmt.Sprintf("%-4s", modeShort))
+			}
 
+			barCells := (bCount * 5) / 256
+			if barCells > 5 {
+				barCells = 5
+			}
+			if barCells < 1 && bCount > 0 {
+				barCells = 1
+			}
+			miniBar := barFillStyle.Render(strings.Repeat("█", barCells)) + barEmptyStyle.Render(strings.Repeat("░", 5-barCells))
+			bktCol := fmt.Sprintf("%4d/1024 %s", bCount, miniBar)
+
+			rawName := fmt.Sprintf("S%d %s", s.ShardID, s.DisplayName())
+			nameCol := fmt.Sprintf("%-13s", truncateStr(rawName, 13))
+			portCol := fmt.Sprintf(":%-5d", s.Port)
+			ramCol := fmt.Sprintf("%-15s", fmt.Sprintf("%s / %s", storage.FormatBytesCompact(usedB), storage.FormatBytesCompact(maxB)))
+			rowCol := fmt.Sprintf("%7s", formatUintComma(uint64(shardRows)))
+			qpsCol := fmt.Sprintf("%7s", formatCompactUint(shardQPS)+"/s")
+
+			pointer := "  "
 			if idx == m.selectedShardIdx {
-				prefix = ">"
-				idStr = selStyle.Render(idStr)
-				nameStr = selStyle.Render(nameStr)
+				pointer = selStyle.Render("▸ ")
+				nameCol = selStyle.Render(nameCol)
+				portCol = selStyle.Render(portCol)
 			} else {
-				zoneStr = dimStyle.Render(zoneStr)
+				portCol = dimStyle.Render(portCol)
 			}
 
 			lines = append(lines, fmt.Sprintf(
-				"%s%s %s  %s  %s  %s  %s  %s",
-				prefix, idStr, nameStr, zoneStr, bktStr, ramStr, rowStr, qpsStr,
+				"%s%s %s %s %s %s %s %s",
+				pointer, nameCol, portCol, modeRendered, bktCol, ramCol, rowCol, qpsCol,
 			))
 		}
-		for len(lines) < 2+maxVisibleShards {
+		for len(lines) < 1+maxVisibleShards {
 			lines = append(lines, "")
 		}
 
-		// Pinned Selected Shard Inspector Card at the bottom of Tab 1 (always visible!)
+		// Minimalist Selected Shard Inspector Card (3 lines pinned at bottom of Tab 1)
 		if len(shards) > 0 {
 			sel := shards[m.selectedShardIdx%len(shards)]
 			scfg := sel.GetSettings()
 			usedB := sel.UsedMemoryBytes()
-			lines = append(lines, dimStyle.Render(strings.Repeat(".", 74)))
+			selTotalRows := m.qr.ShardTotalRows(sel.ShardID)
+			lines = append(lines, ruleStyle.Render(strings.Repeat("─", 74)))
 			lines = append(lines, fmt.Sprintf(
-				" SELECTED: %s (Port :%d) | Zone: %s | Mode: %s",
+				" SELECTED: %s (:%d)  %s  Mode: %s  %s  Rows: %s  %s  Weight: %d%%",
 				selStyle.Render(fmt.Sprintf("S%d [%s]", sel.ShardID, sel.DisplayName())),
 				sel.Port,
-				okStyle.Render(sel.Region),
-				warnStyle.Render(scfg.AccessMode),
+				ruleStyle.Render("│"),
+				okStyle.Render(scfg.AccessMode),
+				ruleStyle.Render("│"),
+				titleStyle.Render(formatUintComma(uint64(selTotalRows))),
+				ruleStyle.Render("│"),
+				scfg.Weight,
 			))
 			lines = append(lines, fmt.Sprintf(
-				" EXACT RAM: %s B (%s) / Max: %s B (%s) | Slab: %s B/bkt",
+				" EXACT RAM: %s B (%s) / %s B (%s)  %s  Slab: %s B/bkt",
 				formatUintComma(uint64(usedB)),
 				storage.FormatBytesCompact(usedB),
 				formatUintComma(uint64(scfg.MaxCapacityBytes)),
 				storage.FormatBytesCompact(scfg.MaxCapacityBytes),
+				ruleStyle.Render("│"),
 				formatUintComma(uint64(scfg.SlabBytesPerBucket)),
 			))
 		}
 	} else {
 		switch m.activeTab {
 		case 1: // TAB 2: CDC & VDIFF
-			lines = append(lines, titleStyle.Render("VITESS CDC VREPLICATION & CRYPTOGRAPHIC VDIFF"))
-			lines = append(lines, fmt.Sprintf(" Workflow:  %s  |  Status: [%s]", wf.Title, okStyle.Render(wf.Status)))
-			lines = append(lines, fmt.Sprintf(" Scope:     %s", wf.CurrentRangeText))
-			progFilled := int((wf.ProgressPct / 100.0) * 24.0)
-			if progFilled > 24 {
-				progFilled = 24
+			lines = append(lines, titleStyle.Render(" VITESS CDC VREPLICATION & SHA-256 PARITY LEDGER"))
+			lines = append(lines, fmt.Sprintf(
+				" Stream: %-28s %s Status: %s %s Lag: %.2f ms",
+				truncateStr(wf.Title, 28),
+				ruleStyle.Render("│"),
+				okStyle.Render(wf.Status),
+				ruleStyle.Render("│"),
+				wf.ReplicationLagMs,
+			))
+			progFilled := int((wf.ProgressPct / 100.0) * 26.0)
+			if progFilled > 26 {
+				progFilled = 26
 			}
 			if progFilled < 0 {
 				progFilled = 0
 			}
-			progBar := migBarStyle.Render(strings.Repeat("#", progFilled)) + dimStyle.Render(strings.Repeat(".", 24-progFilled))
+			progBar := migBarStyle.Render(strings.Repeat("█", progFilled)) + barEmptyStyle.Render(strings.Repeat("░", 26-progFilled))
 			lines = append(lines, fmt.Sprintf(
-				" Progress:  [%s] %.0f%% (%s rows migrated)",
+				" Progress: %s %3.0f%% (%s rows · %s)",
 				progBar,
 				wf.ProgressPct,
 				formatUintComma(uint64(wf.RowsMigrated)),
+				okStyle.Render(wf.VDiffStatus),
 			))
-			lines = append(lines, fmt.Sprintf(" CDC Lag:   %.2f ms  |  Parity: %s", wf.ReplicationLagMs, okStyle.Render(wf.VDiffStatus)))
-			lines = append(lines, dimStyle.Render(strings.Repeat(".", 74)))
-			lines = append(lines, colHdrStyle.Render(" BUCKET RANGE    SHARD ROUTE   ROWS MOVED   XOR-SHA256 PARITY DIGEST   STATUS"))
+			lines = append(lines, ruleStyle.Render(strings.Repeat("─", 74)))
+			lines = append(lines, colHdrStyle.Render("  BUCKET RANGE    SHARD ROUTE    ROWS MOVED   SHA-256 PARITY DIGEST    STATE"))
 			history := m.qr.CDC.GetVDiffHistory()
 			if len(history) == 0 {
-				lines = append(lines, dimStyle.Render(" Press [s] Split Cluster, [+/-] Resize Buckets, or [n] New Shard to stream CDC."))
+				lines = append(lines, dimStyle.Render("  No migrations yet · Press [s] Split +1, [+/-] Buckets, or [n] New Shard."))
 			} else {
 				for i, vd := range history {
-					if i >= 6 {
+					if i >= 8 {
 						break
 					}
 					lines = append(lines, fmt.Sprintf(
-						" Bkt [%03d..%03d]  S%-2d -> S%-2d    %10s   %-24s   %s",
+						"  Bkt [%03d..%03d]  S%-2d -> S%-2d     %10s   %-22s   %s",
 						vd.StartBucket, vd.EndBucket, vd.SourceShard, vd.TargetShard,
 						formatUintComma(uint64(vd.TargetRows)),
-						dimStyle.Render(vd.TargetDigest[:22]+".."),
-						okStyle.Render("[OK]"),
+						dimStyle.Render(vd.TargetDigest[:20]+".."),
+						okStyle.Render("VERIFIED"),
 					))
 				}
 			}
 
 		case 2: // TAB 3: EWMA HOTSPOTS
-			lines = append(lines, titleStyle.Render("AUTONOMOUS EWMA HOTSPOT ENGINE (Press [h] to Spike Bucket #412)"))
 			if len(alerts) > 0 {
-				for i := 0; i < len(alerts) && i < 2; i++ {
-					a := alerts[i]
-					lines = append(lines, hotStyle.Render(fmt.Sprintf(
-						" [ISOLATED] Bucket #%d (%d QPS) moved Shard %d -> Shard %d (0ms lag)",
-						a.BucketID, a.MeasuredQPS, a.FromShard, a.ToShard,
-					)))
-				}
+				a := alerts[0]
+				lines = append(lines, hotStyle.Render(fmt.Sprintf(
+					" ● ISOLATED: Bucket #%d (%d QPS) auto-migrated Shard %d -> Shard %d (0ms lag)",
+					a.BucketID, a.MeasuredQPS, a.FromShard, a.ToShard,
+				)))
 			} else {
-				lines = append(lines, okStyle.Render(" [OK] All 1,024 Virtual Buckets Within Normal Thermal Envelope (<5x Mean)"))
+				lines = append(lines, okStyle.Render(" ● HEALTHY: All 1,024 Virtual Buckets Within Thermal Envelope ([h] Spike #412)"))
 			}
-			lines = append(lines, dimStyle.Render(strings.Repeat(".", 74)))
-			lines = append(lines, colHdrStyle.Render(" RANK   VIRTUAL BUCKET   OWNER SHARD (PORT)   DECAYED EWMA QPS   STATUS"))
-			top := m.qr.HotspotTracker.GetTopHotBuckets(8)
+			lines = append(lines, ruleStyle.Render(strings.Repeat("─", 74)))
+			lines = append(lines, colHdrStyle.Render("  RANK   VIRTUAL BUCKET   OWNER SHARD     EWMA QPS    THERMAL LOAD     STATE"))
+			top := m.qr.HotspotTracker.GetTopHotBuckets(9)
 			for i, h := range top {
+				heatCells := int(h.EWMAQPS / 400)
+				if heatCells > 8 {
+					heatCells = 8
+				}
+				if heatCells < 1 && h.EWMAQPS > 0 {
+					heatCells = 1
+				}
+				heatBar := barFillStyle.Render(strings.Repeat("█", heatCells)) + barEmptyStyle.Render(strings.Repeat("░", 8-heatCells))
+				stateBadge := okStyle.Render("NORMAL")
+				if h.EWMAQPS >= 1500 {
+					heatBar = hotStyle.Render(strings.Repeat("█", heatCells)) + barEmptyStyle.Render(strings.Repeat("░", 8-heatCells))
+					stateBadge = hotStyle.Render("HOT   ")
+				}
 				lines = append(lines, fmt.Sprintf(
-					"  #%-3d  Bucket #%-6d   Shard %-2d (:%-5d)    %10s QPS     %s",
+					"  #%-4d  Bucket #%-6d   Shard %-2d (:%-4d) %7s/s   %s     %s",
 					i+1, h.BucketID, h.OwnerShard, 5432+h.OwnerShard,
-					formatUintComma(h.EWMAQPS),
-					okStyle.Render("[READY]"),
+					formatCompactUint(h.EWMAQPS),
+					heatBar,
+					stateBadge,
 				))
 			}
 
 		case 3: // TAB 4: SQL EXPLORER (WITH SHARD PINNING & CUSTOM SQL INPUT)
-			scopeBadge := okStyle.Render("[Scope: ALL SHARDS]")
+			scopeBadge := okStyle.Render("ALL SHARDS")
 			if m.pinnedShardID >= 0 {
 				if ps, ok := m.qr.Cluster.GetShard(uint32(m.pinnedShardID)); ok {
-					scopeBadge = selStyle.Render(fmt.Sprintf("[PINNED: S%d %s]", ps.ShardID, ps.DisplayName()))
+					scopeBadge = selStyle.Render(fmt.Sprintf("PINNED: S%d %s", ps.ShardID, ps.DisplayName()))
 				}
 			}
 			q := presetQueries[m.queryIdx%len(presetQueries)]
-			headerTitle := fmt.Sprintf("SQL [%d/%d]: %s", m.queryIdx+1, len(presetQueries), q.title)
+			headerTitle := fmt.Sprintf(" preset %d/%d: %s", m.queryIdx+1, len(presetQueries), q.title)
 			if m.usingCustomSQL {
-				headerTitle = "SQL [CUSTOM QUERY]"
+				headerTitle = " custom sql query"
 			}
 			lines = append(lines, fmt.Sprintf(
-				"%s  %s  %s",
+				"%s  %s  %s  %s",
 				titleStyle.Render(headerTitle),
+				ruleStyle.Render("│"),
 				scopeBadge,
-				dimStyle.Render("([p/n] Preset [f] Scope [/] Type)"),
+				dimStyle.Render("[p/n] Preset [f] Scope [/] Type"),
 			))
 			if m.modalMode == modalSQLInput {
-				lines = append(lines, " "+selStyle.Render("SQL> "+m.customSQLInput+"_"))
+				lines = append(lines, " "+selStyle.Render("SQL ▸ "+m.customSQLInput+"_"))
 			} else if m.usingCustomSQL {
 				lines = append(lines, " "+warnStyle.Render(truncateStr(m.customSQLInput, 72)))
 			} else {
 				lines = append(lines, " "+warnStyle.Render(truncateStr(q.sql, 72)))
 			}
 			if m.activeQueryRes != nil {
-				lines = append(lines, renderAlignedTUIRows(m.activeQueryRes, barFillStyle, dimStyle, 72)...)
+				lines = append(lines, renderAlignedTUIRows(m.activeQueryRes, colHdrStyle, ruleStyle, 72)...)
 			}
 		}
 	}
 
 	if m.activeTab == 0 && m.modalMode == modalNone {
-		// Tab 0 handles its own 8-shard window so headers & bottom inspector stay pinned
 		for len(lines) < viewLines {
 			lines = append(lines, "")
 		}
@@ -1096,25 +1178,31 @@ func (m *DashboardModel) View() string {
 		}
 	}
 
-	// 4. Minimalist 2-Line Context-Aware Footer (Strictly <= 72 chars so it NEVER wraps)
-	b.WriteString(dimStyle.Render(strings.Repeat("-", 74)) + "\n")
+	// 4. Minimalist 2-Line Footer (Strictly <= 74 visible chars)
+	b.WriteString(ruleStyle.Render(strings.Repeat("─", 74)) + "\n")
 	scrollHint := ""
 	if maxScroll > 0 {
-		scrollHint = fmt.Sprintf(" [Up/Dn %d/%d]", m.scrollOffset+1, maxScroll+1)
+		scrollHint = fmt.Sprintf(" [%d/%d]", m.scrollOffset+1, maxScroll+1)
 	}
-	b.WriteString(" " + warnStyle.Render(truncateStr(m.statusBanner, 60)) + dimStyle.Render(scrollHint) + "\n")
+	b.WriteString(" " + warnStyle.Render(truncateStr(m.statusBanner, 64)) + dimStyle.Render(scrollHint) + "\n")
 	if m.modalMode == modalEditShard || m.modalMode == modalCreateShard {
-		b.WriteString(dimStyle.Render(" [Up/Dn] Field  [Type] Edit  [L/R] Nudge  [Ctrl+U] Clear  [Enter] Save"))
+		b.WriteString(fmt.Sprintf(" %s Field  %s Edit  %s Nudge  %s Clear  %s Save",
+			keyStyle.Render("Up/Dn"), keyStyle.Render("Type"), keyStyle.Render("L/R"), keyStyle.Render("Ctrl+U"), keyStyle.Render("Enter")))
 	} else if m.activeTab == 3 {
-		b.WriteString(dimStyle.Render(" [p/n] Preset  [L/R] Tab  [f] Pin Shard  [/] Custom SQL  [q] Back"))
+		b.WriteString(fmt.Sprintf(" %s Preset  %s Tab  %s Pin Shard  %s Type SQL  %s Quit",
+			keyStyle.Render("p/n"), keyStyle.Render("L/R"), keyStyle.Render("f"), keyStyle.Render("/"), keyStyle.Render("q")))
 	} else {
-		b.WriteString(dimStyle.Render(" [e] Customize  [n] New  [+/-] Buckets  [s] Split +1  [b] Load  [q] Back"))
+		b.WriteString(fmt.Sprintf(" %s Edit  %s New  %s Buckets  %s Split+1  %s Traffic  %s Burst  %s Quit",
+			keyStyle.Render("e"), keyStyle.Render("n"), keyStyle.Render("+/-"), keyStyle.Render("s"), keyStyle.Render("b"), keyStyle.Render("m"), keyStyle.Render("q")))
 	}
 
 	return borderStyle.Render(b.String())
 }
 
 func formatCompactUint(n uint64) string {
+	if n >= 1000000 {
+		return fmt.Sprintf("%.1fM", float64(n)/1000000.0)
+	}
 	if n >= 1000 {
 		return fmt.Sprintf("%.1fk", float64(n)/1000.0)
 	}
@@ -1160,7 +1248,7 @@ func maxInt(a, b int) int {
 	return b
 }
 
-func renderAlignedTUIRows(res *router.ResultSet, hdrStyle, dimStyle lipgloss.Style, maxWidth int) []string {
+func renderAlignedTUIRows(res *router.ResultSet, hdrStyle, sepStyle lipgloss.Style, maxWidth int) []string {
 	if res == nil || len(res.Columns) == 0 {
 		return nil
 	}
@@ -1199,7 +1287,7 @@ func renderAlignedTUIRows(res *router.ResultSet, hdrStyle, dimStyle lipgloss.Sty
 	hdr.WriteString(" ")
 	for i := 0; i < numCols; i++ {
 		if i > 0 {
-			hdr.WriteString(" | ")
+			hdr.WriteString(" │ ")
 		}
 		hdr.WriteString(fmt.Sprintf("%-*s", widths[i], truncateStr(res.Columns[i], widths[i])))
 	}
@@ -1210,7 +1298,7 @@ func renderAlignedTUIRows(res *router.ResultSet, hdrStyle, dimStyle lipgloss.Sty
 		rowStr.WriteString(" ")
 		for i := 0; i < numCols; i++ {
 			if i > 0 {
-				rowStr.WriteString(dimStyle.Render(" | "))
+				rowStr.WriteString(sepStyle.Render(" │ "))
 			}
 			val := ""
 			if i < len(r) {

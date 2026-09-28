@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	sqlite "modernc.org/sqlite"
@@ -123,15 +124,18 @@ type txBucketSnapshot struct {
 // GROUP BY / HAVING, CASE WHEN, Transactions, and arbitrary DDL/DML) backed by
 // a pure-Go relational engine synchronized with the distributed ShardMaster cluster.
 type RelationalEngine struct {
-	mu              sync.Mutex
-	db              *sql.DB
-	dir             *directory.ShardDirectory
-	cluster         *storage.ClusterStorage
-	cdcEngine       *cdc.Engine
-	catalog         *SchemaCatalog
-	customTables    map[string]string
-	inTx            bool
-	txBucketBackups map[uint16]txBucketSnapshot
+	mu               sync.Mutex
+	db               *sql.DB
+	dir              *directory.ShardDirectory
+	cluster          *storage.ClusterStorage
+	cdcEngine        *cdc.Engine
+	catalog          *SchemaCatalog
+	customTables     map[string]string
+	inTx             bool
+	txBucketBackups  map[uint16]txBucketSnapshot
+	nonUserTotalRows atomic.Int64
+	nonUserShardRows [64]atomic.Int64
+	appTableCount    atomic.Int64
 }
 
 func NewRelationalEngine(
@@ -540,8 +544,115 @@ func (re *RelationalEngine) seedInitialRelationalRows() {
 	}
 
 	_ = tx.Commit()
+	re.refreshNonUserRowCountsLocked()
+	for _, s := range re.cluster.GetAllShards() {
+		s.ResetQPSCounter()
+	}
 }
 
+// NonUserTotalRows returns the live total row count across all non-user application tables (orders, payments, custom tables).
+func (re *RelationalEngine) NonUserTotalRows() int64 {
+	return re.nonUserTotalRows.Load()
+}
+
+// NonUserShardRows returns the live row count on a specific shard across all non-user application tables.
+func (re *RelationalEngine) NonUserShardRows(shardID uint32) int64 {
+	if int(shardID) < len(re.nonUserShardRows) {
+		return re.nonUserShardRows[shardID].Load()
+	}
+	return 0
+}
+
+// ApplicationTableCount returns the live number of application tables (users, orders, payments, and any custom tables).
+func (re *RelationalEngine) ApplicationTableCount() int {
+	c := int(re.appTableCount.Load())
+	if c <= 0 {
+		return 3
+	}
+	return c
+}
+
+func (re *RelationalEngine) refreshNonUserRowCountsLocked() {
+	var total int64
+	var byShard [64]int64
+	appTables := int64(1) // `users` is always present
+
+	rows, err := re.db.Query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name != 'users' AND name NOT LIKE 'sqlite_%';`)
+	if err == nil {
+		var tables []string
+		for rows.Next() {
+			var tbl string
+			if err := rows.Scan(&tbl); err == nil && tbl != "" {
+				tables = append(tables, tbl)
+			}
+		}
+		rows.Close()
+		appTables += int64(len(tables))
+
+		for _, tbl := range tables {
+			if tbl == "orders" || tbl == "payments" {
+				qRows, qErr := re.db.Query(fmt.Sprintf(`SELECT shard_id, COUNT(*) FROM "%s" GROUP BY shard_id;`, tbl))
+				if qErr == nil {
+					for qRows.Next() {
+						var sidStr string
+						var cnt int64
+						if err := qRows.Scan(&sidStr, &cnt); err == nil {
+							total += cnt
+							cleanID := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(sidStr)), "shard_")
+							if sid, pErr := strconv.Atoi(cleanID); pErr == nil && sid >= 0 && sid < len(byShard) {
+								byShard[sid] += cnt
+							} else {
+								byShard[0] += cnt
+							}
+						}
+					}
+					qRows.Close()
+				}
+				continue
+			}
+
+			var customSum int64
+			for _, s := range re.cluster.GetAllShards() {
+				_, rCount := s.GetCustomTableTotalBytesAndRows(tbl)
+				if rCount > 0 {
+					customSum += int64(rCount)
+					if int(s.ShardID) < len(byShard) {
+						byShard[s.ShardID] += int64(rCount)
+					}
+				}
+			}
+			if customSum > 0 {
+				total += customSum
+			} else {
+				var c int64
+				if err := re.db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM "%s";`, tbl)).Scan(&c); err == nil && c > 0 {
+					total += c
+					byShard[0] += c
+				}
+			}
+		}
+	}
+
+	re.nonUserTotalRows.Store(total)
+	re.appTableCount.Store(appTables)
+	for i := 0; i < len(re.nonUserShardRows); i++ {
+		re.nonUserShardRows[i].Store(byShard[i])
+	}
+}
+
+func (re *RelationalEngine) recordShardOps(elapsedNs int64) {
+	if elapsedNs <= 0 {
+		elapsedNs = 1000
+	}
+	shards := re.cluster.GetAllShards()
+	perShardNs := elapsedNs / int64(max(1, len(shards)))
+	if perShardNs <= 0 {
+		perShardNs = 500
+	}
+	for _, s := range shards {
+		s.RecordOp(perShardNs)
+	}
+}
 
 // SyncUserUpsert mirrors a point upsert on `users` into the relational SQL engine.
 func (re *RelationalEngine) SyncUserUpsert(shardID uint32, user storage.UserRow) {
@@ -628,6 +739,7 @@ func (re *RelationalEngine) AbortTransaction() {
 	if re.inTx {
 		_, _ = re.db.Exec(`ROLLBACK;`)
 		re.restoreTxBucketsLocked()
+		re.refreshNonUserRowCountsLocked()
 		re.inTx = false
 	}
 }
@@ -640,6 +752,7 @@ func (re *RelationalEngine) SyncBucketRangeCutover(startBucket, endBucket uint16
 	_, _ = re.db.Exec(`UPDATE users SET shard_id = ? WHERE bucket_id >= ? AND bucket_id <= ?;`, shardLabel, int(startBucket), int(endBucket))
 	_, _ = re.db.Exec(`UPDATE orders SET shard_id = ? WHERE bucket_id >= ? AND bucket_id <= ?;`, shardLabel, int(startBucket), int(endBucket))
 	_, _ = re.db.Exec(`UPDATE payments SET shard_id = ? WHERE order_id IN (SELECT order_id FROM orders WHERE bucket_id >= ? AND bucket_id <= ?);`, shardLabel, int(startBucket), int(endBucket))
+	re.refreshNonUserRowCountsLocked()
 }
 
 // EnsureUserIDsMaterialized materializes any specific user_id literals mentioned in a SQL query
@@ -717,11 +830,13 @@ func (re *RelationalEngine) ExecuteFullSQL(rawSQL string) (*ResultSet, error) {
 		}
 		if _, err := re.db.Exec(`COMMIT;`); err != nil {
 			re.restoreTxBucketsLocked()
+			re.refreshNonUserRowCountsLocked()
 			re.inTx = false
 			return nil, fmt.Errorf("SQL execution error on COMMIT: %v", err)
 		}
 		re.txBucketBackups = make(map[uint16]txBucketSnapshot)
 		re.inTx = false
+		re.refreshNonUserRowCountsLocked()
 		re.cluster.SaveStateFile(re.dir.SnapshotBuckets())
 		return &ResultSet{
 			Title:         "DISTRIBUTED ACID TRANSACTION COMMIT",
@@ -751,6 +866,7 @@ func (re *RelationalEngine) ExecuteFullSQL(rawSQL string) (*ResultSet, error) {
 		_, _ = re.db.Exec(`ROLLBACK;`)
 		restoredBuckets := len(re.txBucketBackups)
 		re.restoreTxBucketsLocked()
+		re.refreshNonUserRowCountsLocked()
 		re.inTx = false
 		return &ResultSet{
 			Title:         "DISTRIBUTED ACID TRANSACTION ROLLBACK",
@@ -778,7 +894,11 @@ func (re *RelationalEngine) ExecuteFullSQL(rawSQL string) (*ResultSet, error) {
 		strings.Contains(upper, "RETURNING ")
 
 	if isQuery && !isDML {
-		return re.executeQueryRowsLocked(normSQL, upper, start)
+		res, err := re.executeQueryRowsLocked(normSQL, upper, start)
+		if err == nil {
+			re.recordShardOps(time.Since(start).Nanoseconds())
+		}
+		return res, err
 	}
 
 	var preUsers map[int64]storage.UserRow
@@ -803,6 +923,8 @@ func (re *RelationalEngine) ExecuteFullSQL(rawSQL string) (*ResultSet, error) {
 			return nil, err
 		}
 		_, _ = re.db.Exec(`RELEASE SAVEPOINT _sm_dml_guard;`)
+		re.refreshNonUserRowCountsLocked()
+		re.recordShardOps(time.Since(start).Nanoseconds())
 		return res, nil
 	}
 
@@ -843,6 +965,8 @@ func (re *RelationalEngine) ExecuteFullSQL(rawSQL string) (*ResultSet, error) {
 		re.syncDynamicTableSchemaFromSQLite(trimmed)
 	}
 
+	re.refreshNonUserRowCountsLocked()
+	re.recordShardOps(time.Since(start).Nanoseconds())
 	if !re.inTx {
 		re.cluster.SaveStateFile(re.dir.SnapshotBuckets())
 	}

@@ -658,6 +658,12 @@ func (s *PhysicalShard) TickQPS(intervalSec float64) uint64 {
 	return qps
 }
 
+// ResetQPSCounter clears the transient QPS counter after internal bootstrap seeding.
+func (s *PhysicalShard) ResetQPSCounter() {
+	s.qpsCounter.Store(0)
+	s.lastQPS.Store(0)
+}
+
 func (s *PhysicalShard) CurrentQPS() uint64    { return s.lastQPS.Load() }
 func (s *PhysicalShard) RowCount() int64       { return s.rowCount.Load() }
 func (s *PhysicalShard) AvgLatencyMs() float64 { return float64(s.latencyNs.Load()) / 1e6 }

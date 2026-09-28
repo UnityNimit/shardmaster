@@ -73,6 +73,38 @@ func (qr *QueryRouter) RouteFastPoint(userID int64) (shardID uint32, bucket uint
 	return shardID, bucket
 }
 
+// TotalClusterRows returns the exact live row count across all application tables (users, orders, payments, custom tables).
+func (qr *QueryRouter) TotalClusterRows() int64 {
+	var total int64
+	for _, s := range qr.Cluster.GetAllShards() {
+		total += s.RowCount()
+	}
+	if qr.SQL != nil {
+		total += qr.SQL.NonUserTotalRows()
+	}
+	return total
+}
+
+// ShardTotalRows returns the exact live row count on a single physical shard across all application tables.
+func (qr *QueryRouter) ShardTotalRows(shardID uint32) int64 {
+	var rows int64
+	if s, ok := qr.Cluster.GetShard(shardID); ok {
+		rows += s.RowCount()
+	}
+	if qr.SQL != nil {
+		rows += qr.SQL.NonUserShardRows(shardID)
+	}
+	return rows
+}
+
+// ApplicationTableCount returns the live number of application tables in the cluster.
+func (qr *QueryRouter) ApplicationTableCount() int {
+	if qr.SQL != nil {
+		return qr.SQL.ApplicationTableCount()
+	}
+	return 3
+}
+
 // ExecuteSQL parses, routes, and executes any SQL statement (or multi-statement SQL script)
 // coming over PGWire (:6000) or the interactive CLI.
 func (qr *QueryRouter) ExecuteSQL(sql string) (*ResultSet, error) {
@@ -150,15 +182,13 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 		rows := [][]string{
 			{"public", "shardmaster_admin", strconv.Itoa(pubCount), "HASH (xxHash64 & 1023)", "Application Distributed Sharded Tables"},
 			{"shardmaster", "shardmaster_system", strconv.Itoa(sysCount), "CONTROL PLANE + LOCAL", "Internal Topology, L1 Ring, CDC & VDiff Catalog"},
-			{"information_schema", "postgres", "4", "VIRTUAL CATALOG", "ANSI SQL Metadata & Column Introspection Views"},
-			{"pg_catalog", "postgres", "8", "VIRTUAL CATALOG", "PostgreSQL v15.0 Wire Protocol Compatibility Catalog"},
 		}
 		return &ResultSet{
 			Title:         "DATABASE SCHEMAS & NAMESPACES",
 			Columns:       []string{"schema_name", "owner", "tables", "default_sharding", "description"},
 			ColumnTypes:   []string{"VARCHAR(64)", "VARCHAR(64)", "INT4", "VARCHAR(32)", "TEXT"},
 			Rows:          rows,
-			CommandTag:    "SHOW SCHEMAS 4",
+			CommandTag:    "SHOW SCHEMAS 2",
 			LatencyUs:     time.Since(start).Microseconds(),
 			RoutedShard:   "SCHEMA_CATALOG",
 			ExecutionPlan: "In-Memory Catalog Namespace Scan",
@@ -396,7 +426,7 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 				fmt.Sprintf("%d B/bkt", cfg.SlabBytesPerBucket),
 				fmt.Sprintf("%d%%", cfg.Weight),
 				strconv.Itoa(bucketCounts[s.ShardID]),
-				strconv.FormatInt(s.RowCount(), 10),
+				strconv.FormatInt(qr.ShardTotalRows(s.ShardID), 10),
 				cfg.AccessMode,
 				cfg.ReplicationMode,
 			})
@@ -595,14 +625,11 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 		var mem runtime.MemStats
 		runtime.ReadMemStats(&mem)
 		shards := qr.Cluster.GetAllShards()
-		var totalRows int64
-		for _, s := range shards {
-			totalRows += s.RowCount()
-		}
+		totalRows := qr.TotalClusterRows()
 		rows := [][]string{
 			{"cluster.active_physical_shards", strconv.Itoa(len(shards)), "Active PostgreSQL / Columnar Shard Nodes"},
 			{"cluster.virtual_buckets", "1024", "Fixed Virtual Bucket Indirection Ring (xxHash64 & 1023)"},
-			{"cluster.total_seeded_rows", strconv.FormatInt(totalRows, 10), "Zero-GC Columnar Bucket Slabs + Delta Overlay"},
+			{"cluster.total_seeded_rows", strconv.FormatInt(totalRows, 10), "Live Rows Across All Distributed Application Tables"},
 			{"catalog.registered_tables", strconv.Itoa(len(qr.Schema.ListTables())), "Distributed application & system catalog tables"},
 			{"directory.l1_cache_footprint", "4096 Bytes (4 KB)", "[1024]atomic.Uint32 lock-free routing array"},
 			{"router.total_queries_executed", strconv.FormatUint(qr.TotalQueries.Load(), 10), "Cumulative queries routed since startup"},
@@ -1089,7 +1116,9 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 		var globalMax int64 = 0
 
 		for _, s := range shards {
+			t0 := time.Now()
 			r, sumC, minC, maxC := s.ComputeShardBalanceStats()
+			s.RecordOp(max(int64(500), time.Since(t0).Nanoseconds()))
 			totalRows += r
 			totalCents += sumC
 			if r > 0 && minC < globalMin {
@@ -1149,7 +1178,9 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 		case "shard_id", "shard":
 			rows := make([][]string, 0, len(shards))
 			for _, s := range shards {
+				t0 := time.Now()
 				r, sumC, minC, maxC := s.ComputeShardBalanceStats()
+				s.RecordOp(max(int64(500), time.Since(t0).Nanoseconds()))
 				avgUSD := 0.0
 				if r > 0 {
 					avgUSD = (float64(sumC) / float64(r)) / 100.0
@@ -1184,7 +1215,9 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 			byTenant := make(map[string]*tenantAcc)
 			var tOrder []string
 			for _, s := range shards {
+				t0 := time.Now()
 				tMap := s.ComputeShardTenantStats()
+				s.RecordOp(max(int64(500), time.Since(t0).Nanoseconds()))
 				for tName, pair := range tMap {
 					acc, exists := byTenant[tName]
 					if !exists {
@@ -1235,7 +1268,9 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 			byReg := make(map[string]*regAcc)
 			var order []string
 			for _, s := range shards {
+				t0 := time.Now()
 				r, sumC, _, _ := s.ComputeShardBalanceStats()
+				s.RecordOp(max(int64(500), time.Since(t0).Nanoseconds()))
 				acc, exists := byReg[s.Region]
 				if !exists {
 					acc = &regAcc{region: s.Region}
@@ -1281,6 +1316,10 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 		qr.ScatterQueries.Add(1)
 		shards := qr.Cluster.GetAllShards()
 		merged := ExecuteScatterGatherKWayMerge(shards, cq.Email, cq.RegionFilter, cq.Limit)
+		perShardNs := max(int64(500), time.Since(start).Nanoseconds()/int64(max(1, len(shards))))
+		for _, s := range shards {
+			s.RecordOp(perShardNs)
+		}
 
 		outRows := make([][]string, 0, len(merged))
 		for _, item := range merged {
