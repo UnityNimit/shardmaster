@@ -18,6 +18,7 @@ import (
 
 type tickMsg time.Time
 type peakBurstDoneMsg bench.BenchmarkResult
+type asyncOpDoneMsg string
 
 const (
 	modalNone        = 0
@@ -36,7 +37,7 @@ var presetQueries = []struct {
 	{"Count & Balance Stats", "SELECT COUNT(*), SUM(balance_usd), AVG(balance_usd), MIN(balance_usd), MAX(balance_usd) FROM users;"},
 	{"Group By Shard", "SELECT shard_id, COUNT(*), SUM(balance_usd), AVG(balance_usd) FROM users GROUP BY shard_id;"},
 	{"Group By Region", "SELECT region, COUNT(*), SUM(balance_usd), AVG(balance_usd) FROM users GROUP BY region;"},
-	{"3-Table Relational JOIN", "SELECT u.user_id, u.name, o.order_id, o.product, p.provider, o.amount_usd FROM users u JOIN orders o ON u.user_id = o.user_id JOIN payments p ON o.order_id = p.order_id ORDER BY o.amount_usd DESC LIMIT 5;"},
+	{"3-Table Relational JOIN", "SELECT u.user_id, u.name, o.order_id, o.product_name, p.payment_method, o.amount_usd FROM users u JOIN orders o ON u.user_id = o.user_id JOIN payments p ON o.order_id = p.order_id ORDER BY o.amount_usd DESC LIMIT 5;"},
 	{"Window Function RANK()", "SELECT name, region, balance_usd, RANK() OVER (PARTITION BY region ORDER BY balance_usd DESC) AS reg_rank FROM users LIMIT 6;"},
 	{"Bucket Ranges", "SHOW BUCKETS;"},
 	{"CDC Log Journal", "SELECT * FROM _shardmaster_cdc LIMIT 6;"},
@@ -77,22 +78,20 @@ type DashboardModel struct {
 
 func NewDashboardModel(qr *router.QueryRouter) *DashboardModel {
 	stop := &atomic.Bool{}
+	stop.Store(true)
 	m := &DashboardModel{
 		qr:            qr,
-		loadGenActive: true,
+		loadGenActive: false,
 		stopLoadFlag:  stop,
 		activeTab:     0,
 		pinnedShardID: -1,
-		statusBanner:  "Select shard [Up/Dn] | [e] Customize Shard  [n] New Shard  [f] Pin SQL",
+		statusBanner:  "Select shard [Up/Dn] | [e] Customize  [n] New  [s] Split +1  [b] Stress Load",
 	}
-	m.runLoadBatch(1)
-	var sumQPS uint64
-	for _, s := range qr.Cluster.GetAllShards() {
-		sumQPS += s.TickQPS(0.015)
-	}
-	m.globalQPS = sumQPS
 	m.refreshActiveQuery()
-	m.startBackgroundLoad()
+	for _, s := range qr.Cluster.GetAllShards() {
+		_ = s.TickQPS(1.0)
+	}
+	m.globalQPS = 0
 	return m
 }
 
@@ -436,12 +435,21 @@ func (m *DashboardModel) applyFreeFormShardModal() (tea.Model, tea.Cmd) {
 		m.qr.Dir.RegisterShard(newShard.ShardID)
 		m.selectedShardIdx = int(newShard.ShardID)
 		m.statusBanner = fmt.Sprintf("Created S%d [%s] (Max: %s) -> Streaming %d Buckets...", newShard.ShardID, newShard.DisplayName(), storage.FormatBytesExact(maxBytes), targetBuckets)
-		go func(id uint32, b int, maxB int64, slabB int) {
-			_, _ = m.qr.CDC.ResizeShardBuckets(id, b, 15*time.Millisecond)
+		id := newShard.ShardID
+		alias := newShard.DisplayName()
+		b := targetBuckets
+		maxB := maxBytes
+		slabB := slabBytes
+		return m, func() tea.Msg {
+			_, err := m.qr.CDC.ResizeShardBuckets(id, b, 15*time.Millisecond)
 			if s, ok := m.qr.Cluster.GetShard(id); ok {
 				s.ResizeMemorySlabs(maxB, slabB)
 			}
-		}(newShard.ShardID, targetBuckets, maxBytes, slabBytes)
+			if err != nil {
+				return asyncOpDoneMsg(fmt.Sprintf("Create S%d [%s] Error: %v", id, alias, err))
+			}
+			return asyncOpDoneMsg(fmt.Sprintf("Provisioned S%d [%s]: %d Buckets Active (VDiff Verified)", id, alias, b))
+		}
 	} else {
 		if s, ok := m.qr.Cluster.GetShard(sid); ok {
 			counts := m.qr.Dir.BucketCountsByShard()
@@ -493,14 +501,14 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		shards := m.qr.Cluster.GetAllShards()
 
 		switch key {
-		case "tab":
+		case "tab", "right":
 			m.activeTab = (m.activeTab + 1) % 4
 			m.scrollOffset = 0
 			if m.activeTab == 3 {
 				m.refreshActiveQuery()
 			}
 			return m, nil
-		case "shift+tab":
+		case "shift+tab", "left":
 			m.activeTab = (m.activeTab + 3) % 4
 			m.scrollOffset = 0
 			if m.activeTab == 3 {
@@ -521,26 +529,20 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.scrollOffset++
 			}
 			return m, nil
-		case "left", "p":
+		case "[", "p":
 			if m.activeTab == 3 {
 				m.usingCustomSQL = false
 				m.queryIdx = (m.queryIdx + len(presetQueries) - 1) % len(presetQueries)
 				m.scrollOffset = 0
 				m.refreshActiveQuery()
-			} else {
-				m.activeTab = (m.activeTab + 3) % 4
-				m.scrollOffset = 0
 			}
 			return m, nil
-		case "right":
+		case "]":
 			if m.activeTab == 3 {
 				m.usingCustomSQL = false
 				m.queryIdx = (m.queryIdx + 1) % len(presetQueries)
 				m.scrollOffset = 0
 				m.refreshActiveQuery()
-			} else {
-				m.activeTab = (m.activeTab + 1) % 4
-				m.scrollOffset = 0
 			}
 			return m, nil
 		case "enter", "e":
@@ -552,29 +554,41 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.activeTab == 0 && len(shards) > 0 {
 				s := shards[m.selectedShardIdx%len(shards)]
 				counts := m.qr.Dir.BucketCountsByShard()
-				newB := counts[s.ShardID] + 16
+				oldB := counts[s.ShardID]
+				newB := oldB + 16
 				if newB > 1024 {
 					newB = 1024
 				}
-				m.statusBanner = fmt.Sprintf("Growing S%d [%s]: %d -> %d Buckets via Live CDC...", s.ShardID, s.DisplayName(), counts[s.ShardID], newB)
-				go func(id uint32, b int) {
-					_, _ = m.qr.CDC.ResizeShardBuckets(id, b, 18*time.Millisecond)
-				}(s.ShardID, newB)
-				return m, nil
+				m.statusBanner = fmt.Sprintf("Growing S%d [%s]: %d -> %d Buckets via Live CDC...", s.ShardID, s.DisplayName(), oldB, newB)
+				id := s.ShardID
+				alias := s.DisplayName()
+				return m, func() tea.Msg {
+					_, err := m.qr.CDC.ResizeShardBuckets(id, newB, 18*time.Millisecond)
+					if err != nil {
+						return asyncOpDoneMsg(fmt.Sprintf("Grow S%d [%s] Rejected: %v", id, alias, err))
+					}
+					return asyncOpDoneMsg(fmt.Sprintf("Resized S%d [%s]: %d -> %d Buckets (0ms Downtime, VDiff OK)", id, alias, oldB, newB))
+				}
 			}
 		case "-", "_", "<":
 			if m.activeTab == 0 && len(shards) > 0 {
 				s := shards[m.selectedShardIdx%len(shards)]
 				counts := m.qr.Dir.BucketCountsByShard()
-				newB := counts[s.ShardID] - 16
+				oldB := counts[s.ShardID]
+				newB := oldB - 16
 				if newB < 0 {
 					newB = 0
 				}
-				m.statusBanner = fmt.Sprintf("Shrinking S%d [%s]: %d -> %d Buckets via Live CDC...", s.ShardID, s.DisplayName(), counts[s.ShardID], newB)
-				go func(id uint32, b int) {
-					_, _ = m.qr.CDC.ResizeShardBuckets(id, b, 18*time.Millisecond)
-				}(s.ShardID, newB)
-				return m, nil
+				m.statusBanner = fmt.Sprintf("Shrinking S%d [%s]: %d -> %d Buckets via Live CDC...", s.ShardID, s.DisplayName(), oldB, newB)
+				id := s.ShardID
+				alias := s.DisplayName()
+				return m, func() tea.Msg {
+					_, err := m.qr.CDC.ResizeShardBuckets(id, newB, 18*time.Millisecond)
+					if err != nil {
+						return asyncOpDoneMsg(fmt.Sprintf("Shrink S%d [%s] Rejected: %v", id, alias, err))
+					}
+					return asyncOpDoneMsg(fmt.Sprintf("Resized S%d [%s]: %d -> %d Buckets (0ms Downtime, VDiff OK)", id, alias, oldB, newB))
+				}
 			}
 		case "/", "i":
 			if m.activeTab == 3 {
@@ -625,18 +639,27 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(shards) > 0 {
 				s := shards[m.selectedShardIdx%len(shards)]
 				m.statusBanner = fmt.Sprintf("Draining S%d [%s] -> Evacuating all Buckets via CDC...", s.ShardID, s.DisplayName())
-				go func(id uint32) {
-					_, _ = m.qr.CDC.DrainShard(id, 18*time.Millisecond)
-				}(s.ShardID)
+				id := s.ShardID
+				alias := s.DisplayName()
+				return m, func() tea.Msg {
+					_, err := m.qr.CDC.DrainShard(id, 18*time.Millisecond)
+					if err != nil {
+						return asyncOpDoneMsg(fmt.Sprintf("Drain S%d [%s] Rejected: %v", id, alias, err))
+					}
+					return asyncOpDoneMsg(fmt.Sprintf("Drained S%d [%s]: 0 Buckets Remaining (All Data Evacuated)", id, alias))
+				}
 			}
 			return m, nil
 
 		case "w":
 			m.statusBanner = "Rebalancing 1,024 Buckets across Shards by Custom Weight..."
-			go func() {
-				_, _ = m.qr.CDC.RebalanceByWeights(18 * time.Millisecond)
-			}()
-			return m, nil
+			return m, func() tea.Msg {
+				_, err := m.qr.CDC.RebalanceByWeights(18 * time.Millisecond)
+				if err != nil {
+					return asyncOpDoneMsg(fmt.Sprintf("Weighted Rebalance Error: %v", err))
+				}
+				return asyncOpDoneMsg("Weighted Rebalance Complete: 1,024 Buckets Matched to Shard Weights")
+			}
 
 		case "f":
 			if m.activeTab == 0 && len(shards) > 0 {
@@ -667,14 +690,18 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "s":
 			cur := m.qr.Dir.ActiveShards()
 			target := cur + 1
-			if cur >= 5 && cur < 8 {
-				target = 8
-			}
 			m.statusBanner = fmt.Sprintf("Splitting %d -> %d Shards via Zero-Downtime CDC...", cur, target)
-			go func(t uint32) {
-				_, _ = m.qr.CDC.RebalanceToShards(t, 30*time.Millisecond)
-			}(target)
-			return m, nil
+			return m, func() tea.Msg {
+				snap, err := m.qr.CDC.RebalanceToShards(target, 25*time.Millisecond)
+				if err != nil {
+					return asyncOpDoneMsg(fmt.Sprintf("Split %d -> %d Error: %v", cur, target, err))
+				}
+				moved := int64(0)
+				if snap != nil {
+					moved = snap.RowsMigrated
+				}
+				return asyncOpDoneMsg(fmt.Sprintf("Split Complete: %d -> %d Shards (%s rows migrated, 0ms Downtime)", cur, target, formatUintComma(uint64(moved))))
+			}
 
 		case "h":
 			m.qr.HotspotTracker.InjectBucketTrafficSpike(412, 6800)
@@ -689,11 +716,11 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.loadGenActive {
 				m.stopLoadFlag.Store(true)
 				m.loadGenActive = false
-				m.statusBanner = "Background Load PAUSED."
+				m.statusBanner = "Background Stress Load: OFF (Idle QPS = 0/s)."
 			} else {
 				m.loadGenActive = true
 				m.startBackgroundLoad()
-				m.statusBanner = "Background Load RESUMED."
+				m.statusBanner = "Background Stress Load: ON (Generating Live Queries)."
 			}
 			return m, nil
 
@@ -708,6 +735,9 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.qr.Cluster.InitializeShards(4)
 			m.qr.Dir.Reset(4)
 			m.qr.Cluster.SeedCluster(0, m.qr.Dir.GetBucketOwner)
+			if m.qr.SQL != nil {
+				m.qr.SQL.ReseedFromCluster()
+			}
 			m.qr.Cluster.SaveStateFile(m.qr.Dir.SnapshotBuckets())
 			m.selectedShardIdx = 0
 			m.pinnedShardID = -1
@@ -716,6 +746,13 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusBanner = fmt.Sprintf("Reset to 4 Local Shards (1,024 Buckets, %s rows).", formatUintComma(uint64(m.qr.Cluster.TotalRows())))
 			return m, nil
 		}
+
+	case asyncOpDoneMsg:
+		m.statusBanner = string(msg)
+		if m.activeTab == 3 && m.modalMode == modalNone {
+			m.refreshActiveQuery()
+		}
+		return m, nil
 
 	case peakBurstDoneMsg:
 		m.peakBurstQPS = msg.RoutingThroughputQPS
@@ -1012,7 +1049,7 @@ func (m *DashboardModel) View() string {
 				"%s  %s  %s",
 				titleStyle.Render(headerTitle),
 				scopeBadge,
-				dimStyle.Render("([f] Scope [/] Type)"),
+				dimStyle.Render("([p/n] Preset [f] Scope [/] Type)"),
 			))
 			if m.modalMode == modalSQLInput {
 				lines = append(lines, " "+selStyle.Render("SQL> "+m.customSQLInput+"_"))
@@ -1069,9 +1106,9 @@ func (m *DashboardModel) View() string {
 	if m.modalMode == modalEditShard || m.modalMode == modalCreateShard {
 		b.WriteString(dimStyle.Render(" [Up/Dn] Field  [Type] Edit  [L/R] Nudge  [Ctrl+U] Clear  [Enter] Save"))
 	} else if m.activeTab == 3 {
-		b.WriteString(dimStyle.Render(" [L/R] Preset  [f] Pin Shard  [/] Custom SQL  [Up/Dn] Scroll  [q] Back"))
+		b.WriteString(dimStyle.Render(" [p/n] Preset  [L/R] Tab  [f] Pin Shard  [/] Custom SQL  [q] Back"))
 	} else {
-		b.WriteString(dimStyle.Render(" [e] Customize  [n] New  [+/-] Buckets  [s] Split  [f] Pin SQL  [q] Back"))
+		b.WriteString(dimStyle.Render(" [e] Customize  [n] New  [+/-] Buckets  [s] Split +1  [b] Load  [q] Back"))
 	}
 
 	return borderStyle.Render(b.String())

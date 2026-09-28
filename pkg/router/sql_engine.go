@@ -361,29 +361,123 @@ func (re *RelationalEngine) registerInitialRelationalSchemas() {
 	})
 }
 
+// ReseedFromCluster synchronizes the relational SQL engine with the current physical shards in re.cluster.
+func (re *RelationalEngine) ReseedFromCluster() {
+	re.mu.Lock()
+	defer re.mu.Unlock()
+	_, _ = re.db.Exec(`DELETE FROM payments; DELETE FROM orders; DELETE FROM users;`)
+	re.seedInitialRelationalRows()
+}
+
+// TableRowCount queries the live row count of any table or view in the relational SQL engine.
+func (re *RelationalEngine) TableRowCount(tableName string) int64 {
+	re.mu.Lock()
+	defer re.mu.Unlock()
+	clean := cleanTableIdentifier(tableName)
+	if clean == "" {
+		return 0
+	}
+	var count int64
+	if err := re.db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM "%s";`, clean)).Scan(&count); err != nil {
+		return 0
+	}
+	return count
+}
+
 func (re *RelationalEngine) seedInitialRelationalRows() {
 	tx, err := re.db.Begin()
 	if err != nil {
 		return
 	}
-	userStmt, err := tx.Prepare(`INSERT OR REPLACE INTO users (
-		shard_id, bucket_id, user_id, user_key, name, email, tenant_id, region, balance_cents, balance_usd, created_at, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`)
-	if err != nil {
-		_ = tx.Rollback()
-		return
-	}
-	defer userStmt.Close()
 
-	// Seed initial relational rows from the live physical shards
-	var seedIDs []int64
-	for id := int64(1); id <= 240; id++ {
-		seedIDs = append(seedIDs, id)
+	// Seed 100% of all physical shard users into the relational engine in fast multi-row batches
+	// so there is zero split-brain between ShardCluster and RelationalEngine.
+	maxUID := int64(0)
+	for _, s := range re.cluster.GetAllShards() {
+		if sm := s.SeededMaxUserID(); sm > maxUID {
+			maxUID = sm
+		}
 	}
-	seedIDs = append(seedIDs, 500, 777, 1000, 8888, 9999, 10000)
+	if maxUID <= 0 {
+		maxUID = re.cluster.TotalRows()
+	}
 
-	for _, uid := range seedIDs {
-		re.insertUserFromClusterTx(userStmt, uid)
+	const batchSize = 250
+	var args []any
+	var placeholders []string
+	flushUsers := func() {
+		if len(placeholders) == 0 {
+			return
+		}
+		q := `INSERT OR REPLACE INTO users (
+			shard_id, bucket_id, user_id, user_key, name, email, tenant_id, region, balance_cents, balance_usd, created_at, updated_at
+		) VALUES ` + strings.Join(placeholders, ",") + `;`
+		_, _ = tx.Exec(q, args...)
+		args = args[:0]
+		placeholders = placeholders[:0]
+	}
+
+	for uid := int64(1); uid <= maxUID; uid++ {
+		shardID, bucket := re.dir.LookupInt64Fast(uid)
+		shard, ok := re.cluster.GetShard(shardID)
+		if !ok {
+			continue
+		}
+		user, found := shard.GetUser(uid)
+		if !found {
+			continue
+		}
+		placeholders = append(placeholders, "(?,?,?,?,?,?,?,?,?,?,?,?)")
+		args = append(args,
+			fmt.Sprintf("shard_%d", shardID),
+			int(bucket),
+			user.UserID,
+			user.UserKey,
+			user.Name,
+			user.Email,
+			user.TenantID,
+			user.Region,
+			user.BalanceCents,
+			float64(user.BalanceCents)/100.0,
+			user.CreatedAt.Format("2006-01-02 15:04:05"),
+			user.UpdatedAt.Format("2006-01-02 15:04:05"),
+		)
+		if len(placeholders) >= batchSize {
+			flushUsers()
+		}
+	}
+	flushUsers()
+
+	// Seed 21 100% unique orders (each order has a distinct order_id, distinct user_id, distinct product_name, distinct price, and distinct timestamp)
+	uniqueOrders := []struct {
+		uid    int64
+		name   string
+		cat    string
+		cents  int64
+		status string
+		method string
+	}{
+		{1, "ShardMaster Enterprise Core v1", "Database_Engine", 499900, "COMPLETED", "STRIPE_WIRE"},
+		{2, "Vitess CDC VReplication Streamer", "Replication", 249900, "COMPLETED", "ACH_INSTANT"},
+		{3, "L1-Cache Atomic Ring Accelerator", "Performance", 149900, "COMPLETED", "CORPORATE_AMEX"},
+		{5, "Cryptographic SHA256 VDiff Suite", "Security_Compliance", 199900, "COMPLETED", "SEPA_DIRECT"},
+		{10, "Autonomous EWMA Hotspot Shield", "AI_Operations", 349900, "COMPLETED", "STRIPE_WIRE"},
+		{15, "Zero-Downtime Columnar Slab Pack", "Storage_Slab", 899900, "PENDING", "ACH_INSTANT"},
+		{20, "PGWire v3.0 Protocol Gateway", "Networking", 179900, "COMPLETED", "CORPORATE_AMEX"},
+		{25, "Min-Heap K-Way Merge Optimizer", "Query_Planner", 229900, "COMPLETED", "SEPA_DIRECT"},
+		{30, "Multi-Core xxHash64 Router Pro", "Performance", 159900, "COMPLETED", "STRIPE_WIRE"},
+		{42, "Distributed ACID Savepoint Guard", "Transactions", 549900, "COMPLETED", "ACH_INSTANT"},
+		{45, "Dynamic Bucket Split Controller", "Control_Plane", 289900, "COMPLETED", "CORPORATE_AMEX"},
+		{50, "NVMe Atomic Snapshot Persister", "Storage_Slab", 319900, "COMPLETED", "SEPA_DIRECT"},
+		{75, "Shard-Pinned SQL Telemetry Agent", "Observability", 129900, "COMPLETED", "STRIPE_WIRE"},
+		{100, "Weighted Bucket Rebalancer Engine", "Control_Plane", 269900, "COMPLETED", "ACH_INSTANT"},
+		{120, "Zero-Alloc Int64 FastPath License", "Performance", 389900, "COMPLETED", "CORPORATE_AMEX"},
+		{150, "Live Byte-Cap Evacuator Module", "Storage_Slab", 419900, "COMPLETED", "SEPA_DIRECT"},
+		{180, "Sub-Millisecond Cutover Gate", "Replication", 299900, "COMPLETED", "STRIPE_WIRE"},
+		{200, "Co-Located 3-Way Join Accelerator", "Query_Planner", 459900, "COMPLETED", "ACH_INSTANT"},
+		{300, "Window Function Partition Engine", "Analytics", 369900, "COMPLETED", "CORPORATE_AMEX"},
+		{400, "256-Bit Commutative Parity Verifier", "Security_Compliance", 519900, "COMPLETED", "SEPA_DIRECT"},
+		{500, "Enterprise 1024-Bucket Cluster Key", "Database_Engine", 949900, "COMPLETED", "STRIPE_WIRE"},
 	}
 
 	orderStmt, err := tx.Prepare(`INSERT OR REPLACE INTO orders (
@@ -391,40 +485,28 @@ func (re *RelationalEngine) seedInitialRelationalRows() {
 	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`)
 	if err == nil {
 		defer orderStmt.Close()
-		products := []struct {
-			name   string
-			cat    string
-			cents  int64
-			status string
-		}{
-			{"ShardMaster Enterprise Cluster", "Database_Engine", 499900, "COMPLETED"},
-			{"Vitess CDC VReplication Stream", "Replication", 249900, "COMPLETED"},
-			{"L1-Cache Routing Accelerator", "Performance", 149900, "COMPLETED"},
-			{"Cryptographic VDiff Auditor", "Security_Compliance", 199900, "COMPLETED"},
-			{"Autonomous EWMA Hotspot Shield", "AI_Operations", 349900, "COMPLETED"},
-			{"Zero-Downtime Columnar Slab Pack", "Storage_Slab", 899900, "PENDING"},
-		}
-		orderUsers := []int64{1, 2, 3, 5, 10, 15, 20, 25, 30, 42, 42, 50, 75, 100, 120, 150, 180, 200, 500, 777, 8888}
-		for i, uid := range orderUsers {
+		for i, o := range uniqueOrders {
+			if o.uid > maxUID && maxUID > 0 {
+				continue
+			}
 			orderID := int64(1001 + i)
-			b := hash.ComputeBucket(strconv.FormatInt(uid, 10))
+			b := hash.ComputeBucketInt64(o.uid)
 			shardID := re.dir.GetBucketOwner(b)
 			reg := "local-node-0"
 			if sh, ok := re.cluster.GetShard(shardID); ok {
 				reg = sh.Region
 			}
-			p := products[i%len(products)]
-			ts := fmt.Sprintf("2026-09-%02d %02d:15:00", 10+(i%15), 8+(i%12))
+			ts := fmt.Sprintf("2026-09-%02d %02d:%02d:00", 5+i, 8+(i%12), 10+i)
 			_, _ = orderStmt.Exec(
 				orderID,
-				uid,
+				o.uid,
 				fmt.Sprintf("shard_%d", shardID),
 				int(b),
-				p.name,
-				p.cat,
-				p.cents,
-				float64(p.cents)/100.0,
-				p.status,
+				o.name,
+				o.cat,
+				o.cents,
+				float64(o.cents)/100.0,
+				o.status,
 				reg,
 				ts,
 			)
@@ -436,22 +518,22 @@ func (re *RelationalEngine) seedInitialRelationalRows() {
 	) VALUES (?, ?, ?, ?, ?, ?, 'USD', 'SETTLED', ?);`)
 	if err == nil {
 		defer payStmt.Close()
-		methods := []string{"STRIPE_WIRE", "ACH_INSTANT", "CORPORATE_AMEX", "SEPA_DIRECT"}
-		orderUsers := []int64{1, 2, 3, 5, 10, 15, 20, 25, 30, 42, 42, 50, 75, 100, 120, 150, 180, 200, 500, 777, 8888}
-		prices := []float64{4999.00, 2499.00, 1499.00, 1999.00, 3499.00, 8999.00}
-		for i, uid := range orderUsers {
+		for i, o := range uniqueOrders {
+			if o.uid > maxUID && maxUID > 0 {
+				continue
+			}
 			orderID := int64(1001 + i)
 			payID := int64(5001 + i)
-			b := hash.ComputeBucket(strconv.FormatInt(uid, 10))
+			b := hash.ComputeBucketInt64(o.uid)
 			shardID := re.dir.GetBucketOwner(b)
-			ts := fmt.Sprintf("2026-09-%02d %02d:15:05", 10+(i%15), 8+(i%12))
+			ts := fmt.Sprintf("2026-09-%02d %02d:%02d:05", 5+i, 8+(i%12), 10+i)
 			_, _ = payStmt.Exec(
 				payID,
 				orderID,
-				uid,
+				o.uid,
 				fmt.Sprintf("shard_%d", shardID),
-				methods[i%len(methods)],
-				prices[i%len(prices)],
+				o.method,
+				float64(o.cents)/100.0,
 				ts,
 			)
 		}
@@ -460,32 +542,6 @@ func (re *RelationalEngine) seedInitialRelationalRows() {
 	_ = tx.Commit()
 }
 
-func (re *RelationalEngine) insertUserFromClusterTx(stmt *sql.Stmt, uid int64) {
-	ukey := strconv.FormatInt(uid, 10)
-	shardID, bucket := re.dir.LookupFast(ukey)
-	shard, ok := re.cluster.GetShard(shardID)
-	if !ok {
-		return
-	}
-	user, found := shard.GetUser(uid)
-	if !found {
-		return
-	}
-	_, _ = stmt.Exec(
-		fmt.Sprintf("shard_%d", shardID),
-		int(bucket),
-		user.UserID,
-		user.UserKey,
-		user.Name,
-		user.Email,
-		user.TenantID,
-		user.Region,
-		user.BalanceCents,
-		float64(user.BalanceCents)/100.0,
-		user.CreatedAt.Format("2006-01-02 15:04:05"),
-		user.UpdatedAt.Format("2006-01-02 15:04:05"),
-	)
-}
 
 // SyncUserUpsert mirrors a point upsert on `users` into the relational SQL engine.
 func (re *RelationalEngine) SyncUserUpsert(shardID uint32, user storage.UserRow) {
@@ -583,8 +639,7 @@ func (re *RelationalEngine) SyncBucketRangeCutover(startBucket, endBucket uint16
 	shardLabel := fmt.Sprintf("shard_%d", targetShard)
 	_, _ = re.db.Exec(`UPDATE users SET shard_id = ? WHERE bucket_id >= ? AND bucket_id <= ?;`, shardLabel, int(startBucket), int(endBucket))
 	_, _ = re.db.Exec(`UPDATE orders SET shard_id = ? WHERE bucket_id >= ? AND bucket_id <= ?;`, shardLabel, int(startBucket), int(endBucket))
-	_, _ = re.db.Exec(`UPDATE payments SET shard_id = ? WHERE bucket_id >= ? AND bucket_id <= ?;`, shardLabel, int(startBucket), int(endBucket))
-	_, _ = re.db.Exec(`UPDATE audit_events SET shard_id = ? WHERE bucket_id >= ? AND bucket_id <= ?;`, shardLabel, int(startBucket), int(endBucket))
+	_, _ = re.db.Exec(`UPDATE payments SET shard_id = ? WHERE order_id IN (SELECT order_id FROM orders WHERE bucket_id >= ? AND bucket_id <= ?);`, shardLabel, int(startBucket), int(endBucket))
 }
 
 // EnsureUserIDsMaterialized materializes any specific user_id literals mentioned in a SQL query
@@ -1065,17 +1120,12 @@ func (re *RelationalEngine) syncCustomTableToShardsLocked(tableName string) erro
 		return nil
 	}
 
-	// For pre-seeded demo tables, only track rows inserted beyond the initial startup seed
 	whereFilter := ""
 	switch clean {
 	case "orders":
-		whereFilter = " WHERE order_id > 900512"
+		whereFilter = " WHERE order_id > 1021"
 	case "payments":
-		whereFilter = " WHERE payment_id > 700512"
-	case "audit_events":
-		whereFilter = " WHERE event_id > 500512"
-	case "products":
-		whereFilter = " WHERE product_id > 1008"
+		whereFilter = " WHERE payment_id > 5021"
 	}
 
 	rows, err := re.db.Query(fmt.Sprintf(`SELECT rowid, * FROM "%s"%s;`, clean, whereFilter))

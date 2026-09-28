@@ -181,7 +181,7 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 		rows := make([][]string, 0, len(tables))
 		for _, t := range tables {
 			rc := FormatRowCountForTable(t.TableName, usersRows, cdcCount, len(shards), vdiffCount)
-			if strings.HasPrefix(rc, "0 (Custom") {
+			if rc == "" {
 				var customRows int
 				var customBytes int64
 				for _, s := range shards {
@@ -189,8 +189,17 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 					customBytes += bBytes
 					customRows += rCount
 				}
-				if customRows > 0 {
-					rc = fmt.Sprintf("%d (%s)", customRows, storage.FormatBytesCompact(customBytes))
+				var sqlRows int64
+				if qr.SQL != nil {
+					sqlRows = qr.SQL.TableRowCount(t.TableName)
+				}
+				if int64(customRows) > sqlRows {
+					sqlRows = int64(customRows)
+				}
+				if customBytes > 0 {
+					rc = fmt.Sprintf("%d (%s)", sqlRows, storage.FormatBytesCompact(customBytes))
+				} else {
+					rc = strconv.FormatInt(sqlRows, 10)
 				}
 			}
 			rows = append(rows, []string{
@@ -681,40 +690,86 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 		if innerSQL == "" {
 			innerSQL = "SELECT * FROM users WHERE user_id = 42"
 		}
+		tParseStart := time.Now()
 		innerCQ := ClassifySQL(innerSQL)
+		parseNs := time.Since(tParseStart).Nanoseconds()
+		if parseNs <= 0 {
+			parseNs = 1
+		}
 		shardsCount := qr.Dir.ActiveShards()
 
 		var rows [][]string
 		planSummary := ""
 		if innerCQ.HasShardKey && len(innerCQ.UserIDs) == 0 {
 			info := qr.Dir.LookupDetailed(innerCQ.UserKey)
+			tProbeStart := time.Now()
+			if sh, ok := qr.Cluster.GetShard(info.ShardID); ok {
+				_, _ = sh.GetUser(innerCQ.UserID)
+			}
+			probeNs := time.Since(tProbeStart).Nanoseconds()
+			if probeNs <= 0 {
+				probeNs = 1
+			}
 			planSummary = fmt.Sprintf("Single-Shard O(1) Point Execution Plan -> Shard %d (:%d)", info.ShardID, 5432+info.ShardID)
 			rows = [][]string{
-				{"1", "SQL Lexer & AST Classifier", "Proxy Coordinator", "1", "2 us", fmt.Sprintf("Extracted predicate: user_id = %s", info.Key)},
-				{"2", "xxHash64 Digest Engine", "CPU Register", "1", "4 ns", fmt.Sprintf("xxHash64('%s') = 0x%016x", info.Key, info.HashValue)},
+				{"1", "SQL Lexer & AST Classifier", "Proxy Coordinator", "1", fmt.Sprintf("%d ns", parseNs), fmt.Sprintf("Extracted predicate: user_id = %s", info.Key)},
+				{"2", "xxHash64 Digest Engine", "CPU Register", "1", fmt.Sprintf("%d ns", info.LookupTimeNs), fmt.Sprintf("xxHash64('%s') = 0x%016x", info.Key, info.HashValue)},
 				{"3", "L1 Atomic Bucket Ring Probe", "L1 Cache (4 KB)", "1", fmt.Sprintf("%d ns", info.LookupTimeNs), fmt.Sprintf("0x%016x & 1023 -> Bucket #%d -> Shard %d", info.HashValue, info.VirtualBucket, info.ShardID)},
-				{"4", "Single-Shard Columnar Slab Get", fmt.Sprintf("Shard %d (:%d)", info.ShardID, 5432+info.ShardID), "1", "12 us", fmt.Sprintf("Probed Bucket #%d Delta Overlay + Columnar Slab", info.VirtualBucket)},
+				{"4", "Single-Shard Columnar Slab Get", fmt.Sprintf("Shard %d (:%d)", info.ShardID, 5432+info.ShardID), "1", fmt.Sprintf("%d ns", probeNs), fmt.Sprintf("Probed Bucket #%d Delta Overlay + Columnar Slab", info.VirtualBucket)},
 			}
 		} else if len(innerCQ.UserIDs) > 0 {
+			tLookupStart := time.Now()
+			for _, uid := range innerCQ.UserIDs {
+				_, _ = qr.Dir.LookupInt64Fast(uid)
+			}
+			lookupNs := time.Since(tLookupStart).Nanoseconds()
+			if lookupNs <= 0 {
+				lookupNs = 1
+			}
+			tFetchStart := time.Now()
+			for _, uid := range innerCQ.UserIDs {
+				sid, _ := qr.Dir.LookupInt64Fast(uid)
+				if sh, ok := qr.Cluster.GetShard(sid); ok {
+					_, _ = sh.GetUser(uid)
+				}
+			}
+			fetchNs := time.Since(tFetchStart).Nanoseconds()
+			if fetchNs <= 0 {
+				fetchNs = 1
+			}
 			planSummary = fmt.Sprintf("Multi-Key Batch Point Fan-Out (%d Keys)", len(innerCQ.UserIDs))
 			rows = [][]string{
-				{"1", "Batch Key Extractor", "Proxy Coordinator", strconv.Itoa(len(innerCQ.UserIDs)), "3 us", fmt.Sprintf("Parsed %d shard keys from IN / BETWEEN clause", len(innerCQ.UserIDs))},
-				{"2", "Vectorized xxHash64 + L1 Lookup", "L1 Cache (4 KB)", strconv.Itoa(len(innerCQ.UserIDs)), "45 ns", "Grouped keys by owning physical shard"},
-				{"3", "Targeted Multi-Shard Point Batch", fmt.Sprintf("Target Shards (of %d)", shardsCount), strconv.Itoa(len(innerCQ.UserIDs)), "38 us", "Pruned non-owning shards; fetched exact bucket slabs"},
+				{"1", "Batch Key Extractor", "Proxy Coordinator", strconv.Itoa(len(innerCQ.UserIDs)), fmt.Sprintf("%d ns", parseNs), fmt.Sprintf("Parsed %d shard keys from IN / BETWEEN clause", len(innerCQ.UserIDs))},
+				{"2", "Vectorized xxHash64 + L1 Lookup", "L1 Cache (4 KB)", strconv.Itoa(len(innerCQ.UserIDs)), fmt.Sprintf("%d ns", lookupNs), "Grouped keys by owning physical shard"},
+				{"3", "Targeted Multi-Shard Point Batch", fmt.Sprintf("Target Shards (of %d)", shardsCount), strconv.Itoa(len(innerCQ.UserIDs)), fmt.Sprintf("%d ns", fetchNs), "Pruned non-owning shards; fetched exact bucket slabs"},
 			}
 		} else if innerCQ.Kind == QueryGroupByAggregate || innerCQ.Kind == QueryCountAggregate {
+			tAggStart := time.Now()
+			for _, sh := range qr.Cluster.GetAllShards() {
+				_, _, _, _ = sh.ComputeShardBalanceStats()
+			}
+			aggUs := time.Since(tAggStart).Microseconds()
+			if aggUs <= 0 {
+				aggUs = 1
+			}
 			planSummary = fmt.Sprintf("Distributed Two-Phase Map-Reduce Aggregation (%d Shards)", shardsCount)
 			rows = [][]string{
-				{"1", "Coordinator Map-Reduce Planner", "Proxy Coordinator", strconv.Itoa(int(shardsCount)), "4 us", "Decomposed aggregate into Shard-Local Map + Coordinator Reduce"},
-				{"2", "Parallel Shard Slab Aggregation", fmt.Sprintf("All %d Shards", shardsCount), strconv.FormatInt(qr.Cluster.TotalRows(), 10), "180 us", "Scanned 1,024 bucket columnar slabs in parallel"},
-				{"3", "Coordinator Final Merge", "Proxy Coordinator", strconv.Itoa(int(shardsCount)), "9 us", "Combined partial COUNT, SUM, MIN, MAX accumulators"},
+				{"1", "Coordinator Map-Reduce Planner", "Proxy Coordinator", strconv.Itoa(int(shardsCount)), fmt.Sprintf("%d ns", parseNs), "Decomposed aggregate into Shard-Local Map + Coordinator Reduce"},
+				{"2", "Parallel Shard Slab Aggregation", fmt.Sprintf("All %d Shards", shardsCount), strconv.FormatInt(qr.Cluster.TotalRows(), 10), fmt.Sprintf("%d us", aggUs), "Scanned 1,024 bucket columnar slabs in parallel"},
+				{"3", "Coordinator Final Merge", "Proxy Coordinator", strconv.Itoa(int(shardsCount)), fmt.Sprintf("%d us", time.Since(start).Microseconds()), "Combined partial COUNT, SUM, MIN, MAX accumulators"},
 			}
 		} else {
+			tScanStart := time.Now()
+			_, _ = qr.executeSingleSQL(innerSQL)
+			scanUs := time.Since(tScanStart).Microseconds()
+			if scanUs <= 0 {
+				scanUs = 1
+			}
 			planSummary = fmt.Sprintf("Distributed Scatter-Gather + Min-Heap K-Way Merge (%d Shards)", shardsCount)
 			rows = [][]string{
-				{"1", "Scatter Fan-Out Spawner", "Proxy Coordinator", strconv.Itoa(int(shardsCount)), "6 us", fmt.Sprintf("Spawned %d parallel worker Goroutines with bounded channels (cap=16)", shardsCount)},
-				{"2", "Shard-Local Top-K Index Scan", fmt.Sprintf("All %d Shards", shardsCount), strconv.Itoa(innerCQ.Limit * int(shardsCount)), "290 us", "Filtered local buckets & sorted by (created_at DESC, user_id DESC)"},
-				{"3", "Streaming Min-Heap K-Way Merge", "Priority Queue (RAM)", strconv.Itoa(innerCQ.Limit), "24 us", fmt.Sprintf("Merged %d ordered shard streams in O(N log K) time, O(K*batch) RAM", shardsCount)},
+				{"1", "Scatter Fan-Out Spawner", "Proxy Coordinator", strconv.Itoa(int(shardsCount)), fmt.Sprintf("%d ns", parseNs), fmt.Sprintf("Spawned %d parallel worker Goroutines with bounded channels (cap=16)", shardsCount)},
+				{"2", "Shard-Local Top-K Index Scan", fmt.Sprintf("All %d Shards", shardsCount), strconv.Itoa(innerCQ.Limit * int(shardsCount)), fmt.Sprintf("%d us", scanUs), "Filtered local buckets & sorted by (created_at DESC, user_id DESC)"},
+				{"3", "Streaming Min-Heap K-Way Merge", "Priority Queue (RAM)", strconv.Itoa(innerCQ.Limit), fmt.Sprintf("%d us", time.Since(start).Microseconds()), fmt.Sprintf("Merged %d ordered shard streams in O(N log K) time, O(K*batch) RAM", shardsCount)},
 			}
 		}
 

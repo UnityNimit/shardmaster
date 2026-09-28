@@ -921,6 +921,71 @@ func TestTUIDashboardLabelsAndLocalZones(t *testing.T) {
 	}
 }
 
+func TestAllRowsUniqueZeroSplitBrainAndLiveCatalog(t *testing.T) {
+	dir := directory.NewShardDirectory(4)
+	cluster := storage.NewClusterStorage(4, t.TempDir())
+	cluster.SeedCluster(10000, dir.GetBucketOwner)
+	cdcEngine := cdc.NewEngine(dir, cluster)
+	tracker := hotspot.NewTracker(dir, cluster, cdcEngine)
+	qr := router.NewQueryRouter(dir, cluster, cdcEngine, tracker)
+
+	// 1. Verify zero split-brain: physical shards AND SQLite relational engine both hold all 10,000 users
+	resFast, err := qr.ExecuteSQL("SELECT COUNT(*) FROM users;")
+	if err != nil || len(resFast.Rows) != 1 || resFast.Rows[0][0] != "10000" {
+		t.Fatalf("expected fast-path COUNT(*) = 10000, got err=%v rows=%v", err, resFast.Rows)
+	}
+	resRel, err := qr.ExecuteSQL("SELECT COUNT(*), COUNT(DISTINCT name), COUNT(DISTINCT email), COUNT(DISTINCT balance_cents), COUNT(DISTINCT created_at) FROM users WHERE balance_cents >= 0;")
+	if err != nil || len(resRel.Rows) != 1 {
+		t.Fatalf("expected relational uniqueness query to succeed, got err=%v", err)
+	}
+	for colIdx, val := range resRel.Rows[0] {
+		if val != "10000" {
+			t.Fatalf("expected 10,000 unique values in users column %d (%s), got %s (row=%v)",
+				colIdx, resRel.Columns[colIdx], val, resRel.Rows[0])
+		}
+	}
+
+	// 2. Verify every single row in orders and payments is 100% unique
+	resOrd, err := qr.ExecuteSQL("SELECT COUNT(*), COUNT(DISTINCT order_id), COUNT(DISTINCT user_id), COUNT(DISTINCT product_name), COUNT(DISTINCT amount_cents), COUNT(DISTINCT created_at) FROM orders;")
+	if err != nil || len(resOrd.Rows) != 1 {
+		t.Fatalf("orders uniqueness query failed: %v", err)
+	}
+	for colIdx, val := range resOrd.Rows[0] {
+		if val != "21" {
+			t.Fatalf("expected 21 unique values in orders column %d (%s), got %s", colIdx, resOrd.Columns[colIdx], val)
+		}
+	}
+
+	resPay, err := qr.ExecuteSQL("SELECT COUNT(*), COUNT(DISTINCT payment_id), COUNT(DISTINCT order_id), COUNT(DISTINCT user_id), COUNT(DISTINCT amount_usd), COUNT(DISTINCT settled_at) FROM payments;")
+	if err != nil || len(resPay.Rows) != 1 {
+		t.Fatalf("payments uniqueness query failed: %v", err)
+	}
+	for colIdx, val := range resPay.Rows[0] {
+		if val != "21" {
+			t.Fatalf("expected 21 unique values in payments column %d (%s), got %s", colIdx, resPay.Columns[colIdx], val)
+		}
+	}
+
+	// 3. Verify SHOW TABLES reports live row counts (not hardcoded strings) when rows are inserted into orders
+	_, err = qr.ExecuteSQL("INSERT INTO orders (order_id, user_id, shard_id, bucket_id, product_name, category, amount_cents, amount_usd, order_status, region) VALUES (2050, 42, 'shard_0', 10, 'Custom Order Live', 'Test', 77700, 777.00, 'COMPLETED', 'local-node-0');")
+	if err != nil {
+		t.Fatalf("INSERT INTO orders failed: %v", err)
+	}
+	showRes, err := qr.ExecuteSQL("SHOW TABLES;")
+	if err != nil {
+		t.Fatalf("SHOW TABLES failed: %v", err)
+	}
+	foundOrders22 := false
+	for _, r := range showRes.Rows {
+		if r[1] == "orders" && strings.HasPrefix(r[6], "22") {
+			foundOrders22 = true
+		}
+	}
+	if !foundOrders22 {
+		t.Fatalf("expected SHOW TABLES to report live row count 22 for orders after INSERT, got rows=%v", showRes.Rows)
+	}
+}
+
 func ShardRowCount(cs *storage.ClusterStorage, id uint32) int64 {
 	if s, ok := cs.GetShard(id); ok {
 		return s.RowCount()

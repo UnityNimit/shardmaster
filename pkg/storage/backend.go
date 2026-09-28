@@ -231,15 +231,70 @@ func CloneBucketSlab(src *BucketSlab) *BucketSlab {
 }
 
 var (
-	sampleNames = []string{
-		"Aarav Patel", "Sophia Chen", "Liam Smith", "Olivia Garcia",
-		"Noah Kumar", "Emma Kim", "Vikram Silva", "Mia Miller",
-		"Lucas Sato", "Zara Lopez", "Ethan Mehta", "Priya Shah",
+	uniqueFirstNames = [100]string{
+		"Aarav", "Sophia", "Liam", "Olivia", "Noah", "Emma", "Vikram", "Mia", "Lucas", "Zara",
+		"Ethan", "Priya", "Alexander", "Isabella", "Benjamin", "Amelia", "Sebastian", "Harper", "Mateo", "Evelyn",
+		"Daniel", "Abigail", "Michael", "Emily", "logan", "Elizabeth", "Jackson", "Sofia", "Levi", "Avery",
+		"David", "Ella", "Joseph", "Scarlett", "Samuel", "Grace", "Henry", "Chloe", "Owen", "Victoria",
+		"Wyatt", "Riley", "John", "Aria", "Jack", "Lily", "Luke", "Aurora", "Jayden", "Zoey",
+		"Dylan", "Penelope", "Grayson", "Layla", "Isaac", "Nora", "Gabriel", "Camila", "Julian", "Hannah",
+		"Anthony", "Lillian", "Jaxon", "Addison", "Lincoln", "Eleanor", "Joshua", "Natalie", "Christopher", "Luna",
+		"Andrew", "Savannah", "Theodore", "Brooklyn", "Caleb", "Leah", "Ryan", "Zoe", "Asher", "Stella",
+		"Nathan", "Hazel", "Thomas", "Ellie", "Leo", "Paisley", "Isaiah", "Audrey", "Charles", "Skylar",
+		"Josiah", "Violet", "Hudson", "Claire", "Christian", "Bella", "Hunter", "Lucy", "Connor", "Anna",
+	}
+	uniqueLastNames = [100]string{
+		"Patel", "Chen", "Smith", "Garcia", "Kumar", "Kim", "Silva", "Miller", "Sato", "Lopez",
+		"Mehta", "Shah", "Johnson", "Williams", "Brown", "Jones", "Davis", "Rodriguez", "Martinez", "Hernandez",
+		"Gonzalez", "Wilson", "Anderson", "Thomas", "Taylor", "Moore", "Jackson", "Martin", "Lee", "Perez",
+		"Thompson", "White", "Harris", "Sanchez", "Clark", "Ramirez", "Lewis", "Robinson", "Walker", "Young",
+		"Allen", "King", "Wright", "Scott", "Torres", "Nguyen", "Hill", "Flores", "Green", "Adams",
+		"Nelson", "Baker", "Hall", "Rivera", "Campbell", "Mitchell", "Carter", "Roberts", "Gomez", "Phillips",
+		"Evans", "Turner", "Diaz", "Parker", "Cruz", "Edwards", "Collins", "Reyes", "Stewart", "Morris",
+		"Morales", "Murphy", "Cook", "Rogers", "Gutierrez", "Ortiz", "Morgan", "Cooper", "Peterson", "Bailey",
+		"Reed", "Kelly", "Howard", "Ramos", "Cox", "Ward", "Richardson", "Watson", "Brooks", "Chavez",
+		"Wood", "James", "Bennett", "Gray", "Mendoza", "Ruiz", "Hughes", "Price", "Alvarez", "Castillo",
 	}
 	sampleDomains = []string{"gmail.com", "stripe.com", "stanford.edu", "vercel.com", "cloudflare.com"}
 	sampleTenants = []string{"tenant_enterprise_1", "tenant_fintech", "tenant_saas", "tenant_core"}
 	epochBaseTime = time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
 )
+
+// SynthesizeSeededUserRow deterministically constructs a 100% unique UserRow for a seeded user_id.
+// Every single user_id has a unique full name, unique email, unique timestamp, and unique balance.
+func SynthesizeSeededUserRow(userID int64, bucket uint16, region string, balCents int64) UserRow {
+	u := userID - 1
+	if u < 0 {
+		u = -u
+	}
+	firstIdx := int(u % 100)
+	lastIdx := int(((u / 100) + int64(firstIdx)*7) % 100)
+	firstName := uniqueFirstNames[firstIdx]
+	if firstName == "logan" {
+		firstName = "Logan"
+	}
+	lastName := uniqueLastNames[lastIdx]
+	fullName := firstName + " " + lastName
+	if userID > 10000 {
+		fullName = fmt.Sprintf("%s %s #%d", firstName, lastName, userID)
+	}
+	domain := sampleDomains[int(userID)%len(sampleDomains)]
+	email := fmt.Sprintf("%s.%s.%d@%s", strings.ToLower(firstName), strings.ToLower(lastName), userID, domain)
+	ts := epochBaseTime.Add(time.Duration(userID) * time.Second)
+	return UserRow{
+		UserID:       userID,
+		UserKey:      strconv.FormatInt(userID, 10),
+		Name:         fullName,
+		Email:        email,
+		TenantID:     sampleTenants[int(userID)%len(sampleTenants)],
+		Region:       region,
+		BalanceCents: balCents,
+		BucketID:     bucket,
+		CreatedAt:    ts,
+		UpdatedAt:    ts,
+	}
+}
+
 
 // ShardSettings holds 100% free-form, byte-exact customizable parameters for a physical shard.
 type ShardSettings struct {
@@ -809,25 +864,7 @@ func (s *PhysicalShard) GetUser(userID int64) (UserRow, bool) {
 	balCents := int64(slab.SlabBalances[slot])
 	s.bucketMu[b].RUnlock()
 
-	idx := int(userID % 12)
-	if idx < 0 {
-		idx = -idx
-	}
-	domain := sampleDomains[int(userID)%len(sampleDomains)]
-	ts := epochBaseTime.Add(time.Duration(userID%864000) * time.Second)
-
-	row := UserRow{
-		UserID:       userID,
-		UserKey:      key,
-		Name:         sampleNames[idx],
-		Email:        fmt.Sprintf("user_%d@%s", userID, domain),
-		TenantID:     sampleTenants[int(userID)%len(sampleTenants)],
-		Region:       s.Region,
-		BalanceCents: balCents,
-		BucketID:     b,
-		CreatedAt:    ts,
-		UpdatedAt:    ts,
-	}
+	row := SynthesizeSeededUserRow(userID, b, s.Region, balCents)
 	s.RecordOp(time.Since(start).Nanoseconds())
 	return row, true
 }
@@ -1373,28 +1410,11 @@ func (s *PhysicalShard) QueryFilter(emailSubstring string, regionFilter string, 
 					if _, overridden := slab.DeltaOverrides[uid]; overridden {
 						continue
 					}
-					domain := sampleDomains[int(uid)%len(sampleDomains)]
-					email := fmt.Sprintf("user_%d@%s", uid, domain)
-					if emailSub != "" && !strings.Contains(strings.ToLower(email), emailSub) {
+					row := SynthesizeSeededUserRow(uid, b, s.Region, int64(slab.SlabBalances[i]))
+					if emailSub != "" && !strings.Contains(strings.ToLower(row.Email), emailSub) {
 						continue
 					}
-					idx := int(uid % 12)
-					if idx < 0 {
-						idx = -idx
-					}
-					ts := epochBaseTime.Add(time.Duration(uid%864000) * time.Second)
-					matched = append(matched, UserRow{
-						UserID:       uid,
-						UserKey:      strconv.FormatInt(uid, 10),
-						Name:         sampleNames[idx],
-						Email:        email,
-						TenantID:     sampleTenants[int(uid)%len(sampleTenants)],
-						Region:       s.Region,
-						BalanceCents: int64(slab.SlabBalances[i]),
-						BucketID:     b,
-						CreatedAt:    ts,
-						UpdatedAt:    ts,
-					})
+					matched = append(matched, row)
 				}
 			}
 			s.bucketMu[b].RUnlock()
@@ -1567,8 +1587,9 @@ func (cs *ClusterStorage) SeedCluster(
 				count := int64(len(uids))
 				balances := make([]uint32, len(uids))
 				var baseSum int64
-				for i := range uids {
-					val := uint32(10000 + ((int(b)*17389 + i*7919) % 900000))
+				for i, uid := range uids {
+					// Bijective permutation modulo 900,000 (gcd(499979, 900000) == 1) so every single uid has a unique balance
+					val := uint32(10000 + ((uint64(uid) * 499979) % 900000))
 					balances[i] = val
 					baseSum += int64(val)
 				}

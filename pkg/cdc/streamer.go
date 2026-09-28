@@ -793,6 +793,7 @@ func (e *Engine) executeBucketMigrations(title string, ranges []hash.BucketMigra
 		totalRowsToMove = 1
 	}
 
+	workflowStart := time.Now()
 	e.updateState(func(s *WorkflowSnapshot) {
 		s.Active = true
 		s.Title = title
@@ -801,7 +802,7 @@ func (e *Engine) executeBucketMigrations(title string, ranges []hash.BucketMigra
 		s.RowsMigrated = 0
 		s.TotalRows = totalRowsToMove
 		s.CDCEventsApplied = 0
-		s.ReplicationLagMs = 0.85
+		s.ReplicationLagMs = float64(time.Since(workflowStart).Nanoseconds()) / 1e6
 		s.VDiffStatus = "PENDING_BACKFILL"
 		s.RangesCompleted = 0
 		s.TotalRanges = len(ranges)
@@ -812,6 +813,7 @@ func (e *Engine) executeBucketMigrations(title string, ranges []hash.BucketMigra
 	var totalCDCEvents uint64
 
 	for idx, rng := range ranges {
+		rangeStart := time.Now()
 		srcShard, ok1 := e.cluster.GetShard(rng.FromShard)
 		dstShard, ok2 := e.cluster.GetShard(rng.ToShard)
 		if !ok1 || !ok2 {
@@ -833,6 +835,7 @@ func (e *Engine) executeBucketMigrations(title string, ranges []hash.BucketMigra
 		minWatermarkLSN := srcShard.CurrentLSN()
 
 		// PHASE A: Columnar Keyset Backfill (Bucket-by-Bucket Non-Blocking Copy)
+		batchStart := time.Now()
 		for b := rng.StartBucket; b <= rng.EndBucket; b++ {
 			slabCopy, exportedLSN := srcShard.ExportBucketSlabWithLSN(b)
 			bucketWatermarks[b] = exportedLSN
@@ -856,13 +859,15 @@ func (e *Engine) executeBucketMigrations(title string, ranges []hash.BucketMigra
 				if pct > 99.0 {
 					pct = 99.0
 				}
+				measuredLagMs := float64(time.Since(batchStart).Nanoseconds()) / 1e6
+				batchStart = time.Now()
 				e.updateState(func(s *WorkflowSnapshot) {
 					s.CurrentRangeText = rangeLabel
 					s.Status = "CATCHUP_STREAMING"
 					s.RowsMigrated = rowsMovedSoFar
 					s.ProgressPct = pct
 					s.CDCEventsApplied = totalCDCEvents
-					s.ReplicationLagMs = 0.42
+					s.ReplicationLagMs = measuredLagMs
 					s.VDiffStatus = "STREAMING_MERKLE_HASH"
 				})
 
@@ -874,6 +879,7 @@ func (e *Engine) executeBucketMigrations(title string, ranges []hash.BucketMigra
 
 		// PHASE B: Zero-Lag CDC Drain Gate (<50us) & VDiff Parity Verification
 		// Acquire write-gate locks in ascending bucket order so no writer is mid-flight on srcShard during VDiff & Cutover
+		cutoverStart := time.Now()
 		e.dir.LockBucketRangeForCutover(rng.StartBucket, rng.EndBucket)
 
 		for b := rng.StartBucket; b <= rng.EndBucket; b++ {
@@ -906,6 +912,8 @@ func (e *Engine) executeBucketMigrations(title string, ranges []hash.BucketMigra
 		}
 
 		e.dir.UnlockBucketRangeForCutover(rng.StartBucket, rng.EndBucket)
+		cutoverLagMs := float64(time.Since(cutoverStart).Nanoseconds()) / 1e6
+		_ = rangeStart
 
 		vdiffCopy := vdiff
 		e.mu.Lock()
@@ -919,7 +927,7 @@ func (e *Engine) executeBucketMigrations(title string, ranges []hash.BucketMigra
 			s.CurrentRangeText = rangeLabel
 			s.Status = "CATCHUP_STREAMING"
 			s.RangesCompleted = idx + 1
-			s.ReplicationLagMs = 0.18
+			s.ReplicationLagMs = cutoverLagMs
 			s.VDiffStatus = "VERIFIED (VDiff Match)"
 			s.LastVDiff = &vdiffCopy
 		})

@@ -443,17 +443,11 @@ func (sc *SchemaCatalog) DropCustomTable(name string) (string, error) {
 	return clean, nil
 }
 
-// FormatRowCountForTable returns the live row count string for a catalog table.
+// FormatRowCountForTable returns the live row count string for a system or core catalog table.
 func FormatRowCountForTable(tableName string, usersRows int64, cdcEntries int, activeShards int, vdiffCount int) string {
 	switch strings.ToLower(tableName) {
 	case "users":
 		return strconv.FormatInt(usersRows, 10)
-	case "orders":
-		return "21"
-	case "payments":
-		return "21"
-	case "vip_users_view":
-		return "132"
 	case "_shardmaster_cdc":
 		return strconv.Itoa(cdcEntries)
 	case "_shardmaster_buckets":
@@ -463,7 +457,7 @@ func FormatRowCountForTable(tableName string, usersRows int64, cdcEntries int, a
 	case "_shardmaster_vdiff":
 		return strconv.Itoa(vdiffCount)
 	default:
-		return "0"
+		return ""
 	}
 }
 

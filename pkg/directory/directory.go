@@ -135,7 +135,7 @@ func (d *ShardDirectory) LookupDetailed(key string) LookupResult {
 	return LookupResult{
 		Key:           key,
 		ShardID:       shardID,
-		ShardName:     fmt.Sprintf("shard_%d", shardID+1),
+		ShardName:     fmt.Sprintf("shard_%d", shardID),
 		VirtualBucket: bucket,
 		HashValue:     h,
 		LookupTimeNs:  elapsedNs,
