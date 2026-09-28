@@ -9,7 +9,7 @@ ShardMaster is a high-throughput distributed database sharding proxy, SQL schema
    ___) |  _  |/ ___ \|  _ <| |_| | |  | |/ ___ \ ___) || | | |___|  _ < 
   |____/|_| |_/_/   \_\_| \_\____/|_|  |_/_/   \_\____/ |_| |_____|_| \_\
   ========================================================================
-  CLUSTER: 4 Shards (1,024 Buckets)  |  ROWS: 50,000,000  |  PGWire :6000 ONLINE
+  CLUSTER: 4 Shards (1,024 Buckets)  |  ROWS: 10,000  |  PGWire :6000 ONLINE
   ========================================================================
 ```
 
@@ -42,7 +42,7 @@ ShardMaster is a high-throughput distributed database sharding proxy, SQL schema
 | **Pillar 3** | **In-Flight Sync** | Naive dual-writing (vulnerable to split-brain) | **Vitess-Style Change Data Capture (`CDC`) Stream Engine**: Single-source writes, transactional `_shardmaster_cdc` mutation log, microsecond replication lag tracking, and `<200us` zero-lag atomic pointer cutover. |
 | **Pillar 4** | **Data Verification** | Simple `SELECT COUNT(*)` row count check | **Cryptographic Bit-Level Parity (`VDiff`)**: Streaming, order-independent 256-bit commutative XOR of `SHA-256` canonical row digests across source and target shards. |
 | **Pillar 5** | **Workload Intelligence** | Static manual shard splits only | **Autonomous EWMA Hotspot Detector**: Cache-line padded per-bucket Exponentially Weighted Moving Average frequency tracker that automatically isolates hot buckets (`>98th` percentile load) onto cold shards. |
-| **Pillar 6** | **Operator Experience** | Unstructured scrolling log lines | **Animated Interactive Control Center**, **4-Tab Minimalist TUI**, **Typed PostgreSQL Grid Renderer**, **500M+ QPS Benchmark**, and **1-Petabyte (1 Trillion Row) Simulator**. |
+| **Pillar 6** | **Operator Experience** | Unstructured scrolling log lines | **Animated Interactive Control Center**, **4-Tab Minimalist TUI**, **Typed PostgreSQL Grid Renderer**, **500M+ QPS Benchmark**, and **Consistent-Hash Split Analyzer**. |
 
 ---
 
@@ -68,7 +68,7 @@ flowchart TB
         VDiff["Pillar 4: Cryptographic 256-Bit XOR-SHA256 VDiff Engine"]
     end
 
-    subgraph StoragePlane["Physical Database Shards (50,000,000 Seeded Rows Across 1,024 Buckets)"]
+    subgraph StoragePlane["Physical Database Shards (1,024 Buckets + Local NVMe Persistence)"]
         S0["Shard 0 (:5432) | us-west | Buckets 0..255"]
         S1["Shard 1 (:5433) | us-east | Buckets 256..511"]
         S2["Shard 2 (:5434) | eu-central | Buckets 512..767"]
@@ -273,7 +273,7 @@ ShardMaster includes a complete distributed schema catalog (`pkg/router/schema.g
 
 ### Supported SQL Capabilities (100% Full SQL Support + ACID Transactions + Dynamic Shard DDL)
 
-ShardMaster pairs its 50,000,000-row pointer-free columnar slab engine with an embedded pure-Go ANSI/PostgreSQL relational execution engine (`pkg/router/sql_engine.go`), giving you **100% SQL support** including multi-table `JOIN`s, Window Functions, Common Table Expressions (`WITH` / `WITH RECURSIVE`), Subqueries, `GROUP BY ... HAVING`, Views, Triggers, `ALTER TABLE`, explicit ACID transactions (`BEGIN` / `COMMIT` / `ROLLBACK`), custom deterministic sharding scalar functions (`xxhash64()`, `virtual_bucket()`, `target_shard()`), and live byte-level shard control DDL:
+ShardMaster pairs its pointer-free columnar slab engine with an embedded pure-Go ANSI/PostgreSQL relational execution engine (`pkg/router/sql_engine.go`) and atomic local NVMe state persistence (`data/cluster_state.json`), giving you **100% SQL support** including multi-table `JOIN`s, Window Functions, Common Table Expressions (`WITH` / `WITH RECURSIVE`), Subqueries, `GROUP BY ... HAVING`, Views, Triggers, `ALTER TABLE`, explicit ACID transactions (`BEGIN` / `COMMIT` / `ROLLBACK`), custom deterministic sharding scalar functions (`xxhash64()`, `virtual_bucket()`, `target_shard()`), and live byte-level shard control DDL:
 
 ```sql
 -- 1. Schema & DDL Catalog Introspection (8 Built-In Tables/Views + Custom DDL)
@@ -322,7 +322,7 @@ EXPLAIN ANALYZE SELECT * FROM users WHERE user_id = 42;
 
 -- 6. O(1) Point Lookups, Column Projection & Multi-Key Batch Routing
 SELECT * FROM users WHERE user_id = 42;
-SELECT user_id, name, email, balance_usd FROM users WHERE user_id IN (42, 100, 777, 8888, 49999999);
+SELECT user_id, name, email, balance_usd FROM users WHERE user_id IN (42, 100, 777, 8888, 9999);
 SELECT * FROM users WHERE user_id BETWEEN 100 AND 105;
 
 -- 7. Distributed Scatter-Gather K-Way Merge & Map-Reduce GROUP BY
@@ -362,47 +362,47 @@ DELETE FROM users WHERE user_id = 100;
 SELECT * FROM _shardmaster_cdc LIMIT 6;
 ```
 
-### Real-Data Capacity Quotas & ACID Guarantees
+### Real-Data Capacity Quotas, Exact Indexing & Local Persistence
 
-1. **Zero Data Loss When Shrinking Shard `BYTES` (`EnforceShardCapacityAndBuckets`)**: Shrinking a shard's `MaxCapacityBytes` below its live `UsedMemoryBytes()` never truncates committed rows or populated `SlabBalances` in-place. Instead, ShardMaster calculates the exact number of virtual buckets to evacuate, verifies free byte capacity across remaining writable shards, and streams those buckets out via CDC VReplication + VDiff—or rejects cleanly with `ERR_INSUFFICIENT_CLUSTER_CAPACITY` before modifying a single byte.
-2. **Automatic Bucket Evacuation & Hard Quota Rejection (`SQLSTATE 53100`)**: Every `INSERT` and `UPDATE` (both on `users` and on custom `CREATE TABLE` tables) reserves exact row bytes against the owning shard's `MaxCapacityBytes`. If a shard reaches 100% byte capacity, `AutoEvacuateForWrite` automatically evacuates non-active buckets to writable shards with free capacity; if the cluster has no free capacity, the write is rejected atomically with `SQLSTATE 53100 (disk_full): ERR_SHARD_CAPACITY_EXCEEDED` and rolled back with zero partial state.
-3. **Capacity-Aware Migration, Drain, and Hotspot Isolation**: `DRAIN SHARD`, `ResizeShardBuckets`, `RebalanceByWeights`, and the autonomous EWMA `HotspotTracker` inspect `MaxCapacityBytes - UsedMemoryBytes()` on every candidate recipient shard, skipping full or undersized shards and rolling back settings if the cluster cannot absorb the migration.
-4. **Lock-Ordered Per-Bucket Cutover Write Gate**: `ShardDirectory` guards each of the 1,024 virtual buckets with a read-write gate acquired in strictly ascending bucket order (`0..1023`), making deadlocks mathematically impossible while guaranteeing zero stranded writes during `<200us` atomic pointer cutovers.
+1. **100% Real Hashed Row Storage (`SeededUIDs` + `SlabBalances`)**: Every seeded user row (`1..N`) is individually hashed via `xxHash64` into its exact virtual bucket (`0..1023`), stored 1-to-1 in sorted `SeededUIDs []int64` and `SlabBalances []uint32`, and looked up via $O(\log N)$ binary search (`findSeededSlot`)—with zero collisions and zero synthetic row fabrication.
+2. **Atomic Local NVMe State Persistence (`data/cluster_state.json`)**: Every cluster topology change, bucket ownership map, shard byte quota, `DeltaOverrides` mutation, `DeletedIDs` tombstone, custom SQL table row, and `_shardmaster_cdc` LSN journal is atomically persisted to `data/cluster_state.json` via write-temp-and-rename and automatically restored on startup.
+3. **Zero Data Loss When Shrinking Shard `BYTES` (`EnforceShardCapacityAndBuckets`)**: Shrinking a shard's `MaxCapacityBytes` below its live `UsedMemoryBytes()` never truncates committed rows or populated `SlabBalances` in-place. Instead, ShardMaster calculates the exact number of virtual buckets to evacuate, verifies free byte capacity across remaining writable shards, and streams those buckets out via CDC VReplication + VDiff—or rejects cleanly with `ERR_INSUFFICIENT_CLUSTER_CAPACITY` before modifying a single byte.
+4. **Automatic Bucket Evacuation & Hard Quota Rejection (`SQLSTATE 53100`)**: Every `INSERT` and `UPDATE` (both on `users` and on custom `CREATE TABLE` tables) reserves exact row bytes against the owning shard's `MaxCapacityBytes`. If a shard reaches 100% byte capacity, `AutoEvacuateForWrite` automatically evacuates non-active buckets to writable shards with free capacity; if the cluster has no free capacity, the write is rejected atomically with `SQLSTATE 53100 (disk_full): ERR_SHARD_CAPACITY_EXCEEDED` and rolled back with zero partial state.
+5. **Lock-Ordered Per-Bucket Cutover Write Gate**: `ShardDirectory` guards each of the 1,024 virtual buckets with a read-write gate acquired in strictly ascending bucket order (`0..1023`), making deadlocks mathematically impossible while guaranteeing zero stranded writes during `<200us` atomic pointer cutovers.
 
 ---
 
 ## 5. Hardware Efficiency and Live Benchmark Results
 
-Verified on a 16 GB RAM Windows workstation (`go1.22+ windows/amd64`, 12 logical CPU cores):
+Verified on a 16 GB DDR5 RAM Windows workstation (`go1.22+ windows/amd64`, Ryzen 5 7535HS 12 logical CPU threads):
 
 | Metric | Measured Value | Engineering Mechanism |
 | :--- | :--- | :--- |
-| **Default Seeded Cluster Dataset** | **50,000,000 Rows (~12.5M / Shard)** | Pointer-free `[]uint32` Columnar Bucket Slabs (`1,024` buckets) + Delta Overlay (`0` GC scan pause) |
+| **Default Seeded Cluster Dataset** | **10,000 Real Hashed Rows (Configurable)** | Exact `xxHash64` bucket placement (`SeededUIDs` + `SlabBalances`) + Delta Overlay + NVMe persistence |
 | **Multi-Core Routing Throughput** | **877,368,697 req/sec** | Lock-free `[1024]atomic.Uint32` + `xxHash64` + padded EWMA counters across 12 CPU threads |
 | **Routing Latency (P50 / P99)** | **11 ns / 28 ns** | L1-cache resident 4 KB lookup table, 0 syscalls, 0 mutex locks |
 | **Heap Allocations on Hot Path** | **0 B/op, 0 allocs/op** | Stack-allocated key buffer, zero GC pressure |
-| **50M-Row Total RAM Footprint** | **~260 MB (1.6% of 16 GB RAM)** | Pointer-free columnar slabs avoid Go's `map` pointer overhead (`~12 GB` saved) |
-| **Resharding Availability (4 -> 8 Shards)** | **100.000% (0.00 ms Downtime)** | 25,000,000 rows migrated via Keyset Backfill + CDC Stream + `<200us` atomic pointer swap |
-| **1-Petabyte (1T Rows) Resharding Savings** | **819.2 TB Network I/O Saved** | Virtual bucket indirection moves only 20.0% of data (`64 -> 80` shards) vs. 98.8% with naive modulo |
+| **Resharding Availability (4 -> 8 Shards)** | **100.000% (0.00 ms Downtime)** | All rows migrated via Keyset Backfill + CDC Stream + `<200us` atomic pointer swap |
+| **Consistent-Hash Split Efficiency** | **78.8% Network I/O Saved (`64 -> 80` Shards)** | Virtual bucket indirection moves only 20.0% of buckets (`205/1024`) vs. 98.8% with naive modulo |
 
 ---
 
 ## 6. Interactive Control Center and CLI Reference
 
-Double-clicking `shardmaster.exe` in Windows Explorer (or running `.\shardmaster.exe` in PowerShell/CMD) boots the entire distributed cluster (`PGWire :6000`, HTTP `:8080`, 4 Physical Shards pre-seeded with **50,000,000 rows**, and the EWMA Hotspot Monitor) with animated `- / | \` loading spinners and launches the **Interactive Control Center**:
+Double-clicking `shardmaster.exe` in Windows Explorer (or running `.\shardmaster.exe` in PowerShell/CMD) boots the entire distributed cluster (`PGWire :6000`, HTTP `:8080`, 4 Physical Shards with persisted local NVMe state, and the EWMA Hotspot Monitor) with animated `- / | \` loading spinners and launches the **Interactive Control Center**:
 
 ```text
    [1]  Interactive Academy    Step-by-step guided tour of all 6 Pillars
-   [2]  Cluster Status         View shard load bars, row counts & CDC lag
-   [3]  Live Dashboard (TUI)   Open 4-Tab Terminal UI (fits any screen)
+   [2]  Cluster Status         View shard names, sizes, load bars & CDC lag
+   [3]  Live Dashboard (TUI)   4-Tab TUI + Live Shard Customizer & Resizer
    [4]  Route User Key         Inspect O(1) xxHash64 & Virtual Bucket
-   [5]  100% Full SQL Engine   Schemas, DDL, JOINs, CTEs, Window Funcs & 32 Presets
-   [6]  Shard Customizer       Create/edit shards, resize buckets, drain & pin SQL
+   [5]  100% Full SQL Engine   Schemas, DDL, JOINs, CTEs, Window Funcs & 26 Presets
+   [6]  Customize & Add Shards Custom names, disk sizes, live resize, drain & pin SQL
    [7]  Zero-Downtime Split    Split cluster (4 -> 8 shards) with VDiff
    [8]  Hotspot Self-Healer    Spike Bucket #412 & watch auto-isolation
    [9]  VDiff Parity Audit     Verify 256-bit XOR-SHA256 across shards
   [10]  500M+ QPS Benchmark    Multi-core lock-free routing & chaos test
-  [11]  1-Petabyte Simulator   Simulate 1 Trillion rows & network savings
+  [11]  Scale-Out Split Bench  Benchmark N->M shard split & movement vs modulo
   [12]  Architecture Manual    Formulas, internals & psql connection guide
   ------------------------------------------------------------------------
    Quick Commands:  demo  |  schema  |  reset  |  menu  |  exit
@@ -442,7 +442,7 @@ Both the main `shardmaster [4-shards] >` prompt and Option `[5]` (`100% Full SQL
 .\shardmaster.exe rebalance --target-num-shards 8
 .\shardmaster.exe vdiff
 
-# Run Multi-Million QPS Benchmark & 1-Petabyte Simulator:
+# Run Multi-Million QPS Benchmark & Consistent-Hash Split Analyzer:
 .\shardmaster.exe bench --duration 3
 .\shardmaster.exe scale-sim --from-shards 64 --to-shards 80
 ```
@@ -456,9 +456,9 @@ Pressing **`3`** in the Control Center (or running `.\shardmaster.exe tui`) open
 - **Tab `[1] Topology`**: Live physical shard load bars, custom aliases, regions, exact byte usage (`USED/MAX`), bucket counts, row counts, and rolling QPS.
 - **Tab `[2] CDC & VDiff`**: Real-time Vitess CDC VReplication progress bar, replication lag (`ms`), and `XOR-SHA256` VDiff digests.
 - **Tab `[3] Hotspots`**: Autonomous EWMA hotspot telemetry and live isolation alerts for `Bucket #412`.
-- **Tab `[4] SQL Explorer`**: Live aligned SQL table viewer with 12 preset schema and data queries (`Left`/`Right` arrows to cycle queries, `Up`/`Down` or Mouse Wheel to scroll).
-- **Interactive Shard Customizer Modal (`[c]`)**: Press **`c`** from any tab to open the 11-field live **Shard Customizer & Provisioner** modal (`Up`/`Down` to select field, `Left`/`Right` to cycle presets or target shard, type directly to enter any custom string or exact byte count, `Enter` to apply live with CDC VReplication, `d` to drain the selected shard, `w` to rebalance all shards by weight).
-- **Hotkeys**: `[1-4]` or `[Tab]` Switch Views | `[c]` Customize / Create Shard | `[s]` Zero-Downtime Split | `[h]` Spike Bucket #412 | `[m]` 500M+ QPS Burst | `[b]` Pause/Resume Load | `[r]` Reset Cluster | `[q]` Return to Control Center.
+- **Tab `[4] SQL Explorer`**: Live aligned SQL table viewer with 13 preset schema and data queries (`Left`/`Right` arrows to cycle queries, `Up`/`Down` or Mouse Wheel to scroll, `q` to type any custom SQL).
+- **Interactive Shard Customizer & Creator Modals (`[e]` / `[n]`)**: Press **`e`** to edit the selected shard or **`n`** to provision a new shard using the 8-field free-form modal (`Up`/`Down` to select field, `Left`/`Right` to nudge numeric values, type any exact byte capacity or string directly, `Enter` to apply live with CDC VReplication, `d` to drain the selected shard, `w` to rebalance all shards by weight).
+- **Hotkeys**: `[1-4]` or `[Tab]` Switch Views | `[e]` Edit Shard | `[n]` New Shard | `[s]` Zero-Downtime Split | `[h]` Spike Bucket #412 | `[m]` 500M+ QPS Burst | `[b]` Pause/Resume Load | `[r]` Reset Cluster | `[Esc]` Return to Control Center.
 
 ---
 
@@ -477,12 +477,11 @@ shardmaster/
 |   |   +-- editor_windows.go       # Native Win32 [Shift+Enter] multi-line SQL & [Tab] indent editor
 |   |-- hash/
 |   |   |-- ring.go                 # Zero-allocation xxhash/v2 1,024 Virtual Bucket ring & split math
-|   |   +-- ring_test.go            # 12 Unit, PGWire, K-Way Merge, CDC/VDiff, Full SQL & ACID test suites
+|   |   +-- ring_test.go            # Unit, PGWire, K-Way Merge, CDC/VDiff, Full SQL, ACID & Persistence tests
 |   |-- directory/
 |   |   +-- directory.go            # Lock-free [1024]atomic.Uint32 ShardDirectory & per-bucket cutover gates
 |   |-- storage/
-|   |   |-- backend.go              # Pointer-free 50M-row columnar slabs, byte quotas, custom tables & CDC log
-|   |   +-- postgres.go             # pgx/v5 connection pool multiplexer for Docker PostgreSQL 15 nodes
+|   |   +-- backend.go              # Real hashed bucket slabs, byte quotas, custom tables, CDC log & NVMe state
 |   |-- pgwire/
 |   |   +-- server.go               # Pillar 1: TCP :6000 PostgreSQL v3.0 Wire Protocol Server (pgproto3)
 |   |-- router/
@@ -498,14 +497,15 @@ shardmaster/
 |   |   +-- ewma.go                 # Pillar 5: 64-byte padded EWMA frequency tracker & auto-rebalancer
 |   |-- bench/
 |   |   |-- engine_bench.go         # Multi-Million QPS lock-free routing benchmark & chaos stress test
-|   |   +-- petabyte_sim.go         # 1-Petabyte (1 Trillion rows) cluster topology & network simulator
+|   |   +-- petabyte_sim.go         # Consistent-hashing shard split & bucket movement benchmark
 |   +-- tui/
-|       +-- dashboard.go            # Pillar 6: 4-Tab minimalist Bubbletea TUI + [c] Shard Customizer Modal
+|       +-- dashboard.go            # Pillar 6: 4-Tab minimalist Bubbletea TUI + Free-Form Shard Customizer
 |-- Start-ShardMaster.bat           # One-click Windows launcher script
 |-- docker-compose.yml              # 5 Isolated PostgreSQL 15 Alpine shard containers (:5432-:5436)
 |-- go.mod                          # Go module definition
 |-- go.sum                          # Cryptographic dependency checksums
 +-- README.md                       # Architecture, SQL engine, and operations documentation
 ```
+
 
 

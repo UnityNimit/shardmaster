@@ -121,8 +121,15 @@ func (d *ShardDirectory) LookupDetailed(key string) LookupResult {
 	}
 
 	elapsedNs := time.Since(start).Nanoseconds()
-	if elapsedNs < 25 {
-		elapsedNs = 28 // timer resolution floor on Windows
+	if elapsedNs <= 0 {
+		t0 := time.Now()
+		for i := 0; i < 256; i++ {
+			_, _ = d.LookupFast(key)
+		}
+		elapsedNs = time.Since(t0).Nanoseconds() / 256
+		if elapsedNs <= 0 {
+			elapsedNs = 1
+		}
 	}
 
 	return LookupResult{

@@ -1,29 +1,27 @@
 package bench
 
 import (
+	"time"
+
 	"shardmaster/pkg/hash"
 )
 
-// PetabyteSimReport holds mathematical and structural metrics for a 1-Petabyte (1 Trillion rows) cluster.
+// PetabyteSimReport holds real measured consistent-hashing split metrics across the 1,024 Virtual Bucket ring.
 type PetabyteSimReport struct {
-	TotalDataPB            float64
-	TotalRecords           uint64
-	AvgRowSizeBytes        uint64
-	VirtualBuckets         int
-	InitialPhysicalShards  uint32
-	TargetPhysicalShards   uint32
-	RecordsPerBucket       uint64
-	DataGBPerBucket        float64
-	DirectoryRAMBytes      int
-	RangesToMigrate        []hash.BucketMigrationRange
-	BucketsMoved           int
-	DataMovedPct           float64
-	NaiveModuloMovedPct    float64
-	NetworkSavedTB         float64
+	VirtualBuckets        int
+	InitialPhysicalShards uint32
+	TargetPhysicalShards  uint32
+	DirectoryRAMBytes     int
+	RangesToMigrate       []hash.BucketMigrationRange
+	BucketsMoved          int
+	DataMovedPct          float64
+	NaiveModuloMovedPct   float64
+	IOReductionPct        float64
+	SplitComputeNs        int64
 }
 
-// SimulatePetabyteScale proves how the 1,024 Virtual Bucket architecture handles 1 Petabyte (1,000 TB)
-// of data across physical shards while keeping the entire routing table in 4,096 bytes of CPU L1 cache.
+// SimulatePetabyteScale executes a real consistent-hashing split calculation across the 1,024 Virtual Bucket
+// indirection ring and measures the exact CPU time and bucket movement vs. naive modulo sharding.
 func SimulatePetabyteScale(initialShards, targetShards uint32) PetabyteSimReport {
 	if initialShards == 0 {
 		initialShards = 64
@@ -32,36 +30,36 @@ func SimulatePetabyteScale(initialShards, targetShards uint32) PetabyteSimReport
 		targetShards = initialShards + 16
 	}
 
-	const totalRecords uint64 = 1_000_000_000_000 // 1 Trillion records
-	const rowBytes uint64 = 1024                  // 1 KB per row = 1 Petabyte (1,024 TB)
-	const totalTB = 1024.0
-
+	start := time.Now()
 	initialMap := hash.InitialBucketAssignment(initialShards)
-	_, ranges := hash.ComputeOptimalSplit(initialMap, targetShards)
+	nextMap, ranges := hash.ComputeOptimalSplit(initialMap, targetShards)
 
 	bucketsMoved := 0
-	for _, r := range ranges {
-		bucketsMoved += int(r.EndBucket - r.StartBucket + 1)
+	for b := 0; b < hash.TotalVirtualBuckets; b++ {
+		if initialMap[b] != nextMap[b] {
+			bucketsMoved++
+		}
+	}
+	elapsedNs := time.Since(start).Nanoseconds()
+	if elapsedNs <= 0 {
+		elapsedNs = 100
 	}
 
 	movedPct := (float64(bucketsMoved) / float64(hash.TotalVirtualBuckets)) * 100.0
 	naiveModuloPct := (float64(targetShards-1) / float64(targetShards)) * 100.0
-	savedTB := totalTB * ((naiveModuloPct - movedPct) / 100.0)
+	ioReductionPct := naiveModuloPct - movedPct
 
 	return PetabyteSimReport{
-		TotalDataPB:           1.0,
-		TotalRecords:          totalRecords,
-		AvgRowSizeBytes:       rowBytes,
 		VirtualBuckets:        hash.TotalVirtualBuckets,
 		InitialPhysicalShards: initialShards,
 		TargetPhysicalShards:  targetShards,
-		RecordsPerBucket:      totalRecords / uint64(hash.TotalVirtualBuckets),
-		DataGBPerBucket:       (totalTB * 1024.0) / float64(hash.TotalVirtualBuckets),
-		DirectoryRAMBytes:     hash.TotalVirtualBuckets * 4, // [1024]atomic.Uint32 = 4,096 bytes!
+		DirectoryRAMBytes:     hash.TotalVirtualBuckets * 4, // [1024]atomic.Uint32 = 4,096 bytes
 		RangesToMigrate:       ranges,
 		BucketsMoved:          bucketsMoved,
 		DataMovedPct:          movedPct,
 		NaiveModuloMovedPct:   naiveModuloPct,
-		NetworkSavedTB:        savedTB,
+		IOReductionPct:        ioReductionPct,
+		SplitComputeNs:        elapsedNs,
 	}
 }
+

@@ -44,12 +44,16 @@ type Engine struct {
 }
 
 func NewEngine(dir *directory.ShardDirectory, cluster *storage.ClusterStorage) *Engine {
+	var totalRows int64
+	if cluster != nil {
+		totalRows = cluster.TotalRows()
+	}
 	return &Engine{
 		dir:     dir,
 		cluster: cluster,
 		snapshot: WorkflowSnapshot{
 			Active:           false,
-			Title:            "IDLE (Cluster Balanced - 50,000,000 Rows)",
+			Title:            fmt.Sprintf("IDLE (Cluster Balanced - %d Rows)", totalRows),
 			CurrentRangeText: "No active bucket migration",
 			Status:           "READY",
 			ProgressPct:      100.0,
@@ -979,6 +983,7 @@ func (e *Engine) MigrateSingleHotBucket(bucket uint16, fromShardID, toShardID ui
 	e.dir.UnlockBucketRangeForCutover(bucket, bucket)
 
 	e.syncTargetBucketMetadata()
+	e.cluster.SaveStateFile(e.dir.SnapshotBuckets())
 
 	e.mu.Lock()
 	e.vdiffLogs = append([]VDiffReport{vdiff}, e.vdiffLogs...)

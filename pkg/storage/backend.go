@@ -20,8 +20,8 @@ import (
 	"shardmaster/pkg/hash"
 )
 
-// DefaultInitialRows is 50,000,000 (50 Million) rows across the cluster on startup.
-const DefaultInitialRows = 50_000_000
+// DefaultInitialRows is 10,000 real, hashed, indexed rows across the cluster on startup.
+const DefaultInitialRows = 10_000
 
 // DefaultShardCapacityBytes is 64 MB (67,108,864 bytes) per shard so 4 shards use only ~256 MB on a 16 GB RAM PC.
 const DefaultShardCapacityBytes int64 = 64 * 1024 * 1024
@@ -103,12 +103,12 @@ type MutationLogEntry struct {
 }
 
 // BucketSlab stores the columnar slab, delta overlay, and custom SQL table rows for a single virtual bucket on a physical shard.
-// Using pointer-free []uint32 slabs allows holding 50,000,000 rows in ~200 MB of RAM with 0 GC overhead.
 type BucketSlab struct {
 	BucketID         uint16
 	RowCount         int64
 	SeededMaxID      int64
 	BaseSlabSumCents int64
+	SeededUIDs       []int64                         // Sorted slice of exact user_ids seeded into this bucket (1-to-1 with SlabBalances)
 	SlabBalances     []uint32                        // Real allocated memory slab for this bucket's rows (never truncated in-place)
 	SlabChecksum     [32]byte                        // Pre-computed rolling 256-bit SHA256 digest of SlabBalances
 	DeltaOverrides   map[int64]UserRow               // Hot point inserts/updates on top of the columnar slab
@@ -117,14 +117,29 @@ type BucketSlab struct {
 	CustomBytes      int64                           // Exact byte sum of all CustomTables rows in this bucket
 }
 
-// SeededBalanceCents returns the initial seeded balance (in cents) for a seeded user_id in this bucket.
+// findSeededSlot performs an O(log N) binary search on the sorted SeededUIDs slice to locate the exact 1-to-1 index of uid.
+func (slab *BucketSlab) findSeededSlot(uid int64) int {
+	n := len(slab.SeededUIDs)
+	if n == 0 {
+		return -1
+	}
+	idx := sort.Search(n, func(i int) bool { return slab.SeededUIDs[i] >= uid })
+	if idx < n && slab.SeededUIDs[idx] == uid {
+		return idx
+	}
+	return -1
+}
+
+// SeededBalanceCents returns the exact stored balance (in cents) for a seeded user_id in this bucket.
 func (slab *BucketSlab) SeededBalanceCents(uid int64) int64 {
+	if idx := slab.findSeededSlot(uid); idx >= 0 && idx < len(slab.SlabBalances) {
+		return int64(slab.SlabBalances[idx])
+	}
 	if len(slab.SlabBalances) > 0 {
 		slot := int((uint64(uid) / uint64(hash.TotalVirtualBuckets)) % uint64(len(slab.SlabBalances)))
 		return int64(slab.SlabBalances[slot])
 	}
-	slot := int((uint64(uid) / uint64(hash.TotalVirtualBuckets)) % 65536)
-	return int64(10000 + ((int(slab.BucketID)*17389 + slot*7919) % 900000))
+	return 0
 }
 
 // BucketMemoryBytesLocked computes the exact byte footprint of a BucketSlab while holding its lock.
@@ -172,6 +187,9 @@ func CloneBucketSlab(src *BucketSlab) *BucketSlab {
 	if src == nil {
 		return nil
 	}
+	uidsCopy := make([]int64, len(src.SeededUIDs))
+	copy(uidsCopy, src.SeededUIDs)
+
 	balancesCopy := make([]uint32, len(src.SlabBalances))
 	copy(balancesCopy, src.SlabBalances)
 
@@ -202,6 +220,7 @@ func CloneBucketSlab(src *BucketSlab) *BucketSlab {
 		RowCount:         src.RowCount,
 		SeededMaxID:      src.SeededMaxID,
 		BaseSlabSumCents: src.BaseSlabSumCents,
+		SeededUIDs:       uidsCopy,
 		SlabBalances:     balancesCopy,
 		SlabChecksum:     src.SlabChecksum,
 		DeltaOverrides:   deltasCopy,
@@ -299,7 +318,6 @@ func NewPhysicalShard(shardID uint32, region string) *PhysicalShard {
 		},
 		cdcJournal: make([]MutationLogEntry, 0, 4096),
 	}
-	s.latencyNs.Store(380_000) // 0.38ms baseline
 	for b := uint16(0); b < hash.TotalVirtualBuckets; b++ {
 		s.buckets[b] = &BucketSlab{
 			BucketID:       b,
@@ -653,7 +671,10 @@ func (s *PhysicalShard) UpdateSlabBalanceInPlace(userID int64, newBalanceCents u
 	if len(slab.SlabBalances) == 0 || slab.RowCount == 0 {
 		return false
 	}
-	slot := int((uint64(userID) / uint64(hash.TotalVirtualBuckets)) % uint64(len(slab.SlabBalances)))
+	slot := slab.findSeededSlot(userID)
+	if slot < 0 || slot >= len(slab.SlabBalances) {
+		return false
+	}
 	oldVal := slab.SlabBalances[slot]
 	slab.SlabBalances[slot] = newBalanceCents
 	slab.BaseSlabSumCents += int64(newBalanceCents) - int64(oldVal)
@@ -715,11 +736,7 @@ func (s *PhysicalShard) TryUpsertUser(row UserRow, recordCDC bool, enforceQuota 
 		s.usedBytes.Add(deltaBytes)
 	}
 
-	seededMax := slab.SeededMaxID
-	if seededMax <= 0 {
-		seededMax = s.seededMaxID.Load()
-	}
-	existedInSeeded := row.UserID >= 1 && row.UserID <= seededMax && slab.RowCount > 0
+	existedInSeeded := slab.findSeededSlot(row.UserID) >= 0
 	existedBefore := !wasDeleted && (existedDelta || existedInSeeded)
 
 	delete(slab.DeletedIDs, row.UserID)
@@ -750,7 +767,7 @@ func (s *PhysicalShard) TryUpsertUser(row UserRow, recordCDC bool, enforceQuota 
 	}
 	s.bucketMu[b].Unlock()
 
-	s.RecordOp(time.Since(start).Nanoseconds() + 180_000)
+	s.RecordOp(time.Since(start).Nanoseconds())
 	return row, nil
 }
 
@@ -773,26 +790,23 @@ func (s *PhysicalShard) GetUser(userID int64) (UserRow, bool) {
 	slab := s.buckets[b]
 	if slab.DeletedIDs[userID] {
 		s.bucketMu[b].RUnlock()
-		s.RecordOp(time.Since(start).Nanoseconds() + 120_000)
+		s.RecordOp(time.Since(start).Nanoseconds())
 		return UserRow{}, false
 	}
 	if deltaRow, ok := slab.DeltaOverrides[userID]; ok {
 		s.bucketMu[b].RUnlock()
-		s.RecordOp(time.Since(start).Nanoseconds() + 120_000)
+		s.RecordOp(time.Since(start).Nanoseconds())
 		return deltaRow, true
 	}
 
-	seededMax := slab.SeededMaxID
-	if seededMax <= 0 {
-		seededMax = s.seededMaxID.Load()
-	}
-	if slab.RowCount == 0 || (seededMax > 0 && userID > seededMax) || (seededMax == 0 && len(slab.SlabBalances) == 0) {
+	slot := slab.findSeededSlot(userID)
+	if slab.RowCount == 0 || slot < 0 || slot >= len(slab.SlabBalances) {
 		s.bucketMu[b].RUnlock()
-		s.RecordOp(time.Since(start).Nanoseconds() + 120_000)
+		s.RecordOp(time.Since(start).Nanoseconds())
 		return UserRow{}, false
 	}
 
-	balCents := slab.SeededBalanceCents(userID)
+	balCents := int64(slab.SlabBalances[slot])
 	s.bucketMu[b].RUnlock()
 
 	idx := int(userID % 12)
@@ -814,7 +828,7 @@ func (s *PhysicalShard) GetUser(userID int64) (UserRow, bool) {
 		CreatedAt:    ts,
 		UpdatedAt:    ts,
 	}
-	s.RecordOp(time.Since(start).Nanoseconds() + 120_000)
+	s.RecordOp(time.Since(start).Nanoseconds())
 	return row, true
 }
 
@@ -841,11 +855,7 @@ func (s *PhysicalShard) TryDeleteUser(userID int64, recordCDC bool, enforceQuota
 	}
 
 	oldDelta, existedDelta := slab.DeltaOverrides[userID]
-	seededMax := slab.SeededMaxID
-	if seededMax <= 0 {
-		seededMax = s.seededMaxID.Load()
-	}
-	existedSeeded := userID >= 1 && userID <= seededMax && slab.RowCount > 0
+	existedSeeded := slab.findSeededSlot(userID) >= 0
 	if !existedDelta && !existedSeeded {
 		s.bucketMu[b].Unlock()
 		return false, nil
@@ -882,7 +892,7 @@ func (s *PhysicalShard) TryDeleteUser(userID int64, recordCDC bool, enforceQuota
 	}
 	s.bucketMu[b].Unlock()
 
-	s.RecordOp(time.Since(start).Nanoseconds() + 150_000)
+	s.RecordOp(time.Since(start).Nanoseconds())
 	return true, nil
 }
 
@@ -1211,38 +1221,19 @@ func (s *PhysicalShard) GetRecentCDCEntries(limit int) []MutationLogEntry {
 		}
 	}
 	s.cdcMu.RUnlock()
-
-	if len(out) == 0 {
-		for k := int64(1); k <= 64; k++ {
-			candidateUID := int64(s.ShardID+1)*100 + k
-			if row, ok := s.GetUser(candidateUID); ok {
-				out = append(out, MutationLogEntry{
-					LSN:         s.lsnSeq.Load() + 1,
-					BucketID:    row.BucketID,
-					Op:          MutationInsertOrUpdate,
-					UserID:      row.UserID,
-					Row:         row,
-					TimestampUs: epochBaseTime.UnixMicro() + candidateUID*1000,
-				})
-				break
-			}
-		}
-	}
 	return out
 }
 
-// CDCEntryCount returns the number of recorded entries in the shard's CDC ring buffer.
+// CDCEntryCount returns the exact number of recorded entries in the shard's CDC ring buffer.
 func (s *PhysicalShard) CDCEntryCount() int {
 	s.cdcMu.RLock()
 	defer s.cdcMu.RUnlock()
-	if len(s.cdcJournal) == 0 {
-		return 1
-	}
 	return len(s.cdcJournal)
 }
 
 // ComputeShardBalanceStats aggregates exact row count, sum, min, and max balance (in cents) across all owned buckets.
 func (s *PhysicalShard) ComputeShardBalanceStats() (rows int64, sumCents int64, minCents int64, maxCents int64) {
+	start := time.Now()
 	minCents = 1<<62 - 1
 	maxCents = 0
 	for b := uint16(0); b < hash.TotalVirtualBuckets; b++ {
@@ -1251,43 +1242,34 @@ func (s *PhysicalShard) ComputeShardBalanceStats() (rows int64, sumCents int64, 
 		rc := slab.RowCount
 		if rc > 0 {
 			rows += rc
-			bucketSum := slab.BaseSlabSumCents
-			seededMax := slab.SeededMaxID
-			if seededMax <= 0 {
-				seededMax = s.seededMaxID.Load()
+			if len(slab.SeededUIDs) > 0 && len(slab.SeededUIDs) == len(slab.SlabBalances) {
+				for idx, uid := range slab.SeededUIDs {
+					if slab.DeletedIDs[uid] {
+						continue
+					}
+					if _, overridden := slab.DeltaOverrides[uid]; overridden {
+						continue
+					}
+					bal := int64(slab.SlabBalances[idx])
+					sumCents += bal
+					if bal < minCents {
+						minCents = bal
+					}
+					if bal > maxCents {
+						maxCents = bal
+					}
+				}
 			}
 			for uid, dr := range slab.DeltaOverrides {
 				if slab.DeletedIDs[uid] {
 					continue
 				}
-				if uid >= 1 && uid <= seededMax && len(slab.SlabBalances) > 0 {
-					bucketSum -= slab.SeededBalanceCents(uid)
-				}
-				bucketSum += dr.BalanceCents
+				sumCents += dr.BalanceCents
 				if dr.BalanceCents < minCents {
 					minCents = dr.BalanceCents
 				}
 				if dr.BalanceCents > maxCents {
 					maxCents = dr.BalanceCents
-				}
-			}
-			for uid, deleted := range slab.DeletedIDs {
-				if deleted && uid >= 1 && uid <= seededMax && len(slab.SlabBalances) > 0 {
-					bucketSum -= slab.SeededBalanceCents(uid)
-				}
-			}
-			sumCents += bucketSum
-			if len(slab.SlabBalances) > 0 {
-				low := int64(slab.SlabBalances[0])
-				high := int64(slab.SlabBalances[len(slab.SlabBalances)-1])
-				if low > high {
-					low, high = high, low
-				}
-				if low < minCents {
-					minCents = low
-				}
-				if high > maxCents {
-					maxCents = high
 				}
 			}
 		}
@@ -1296,7 +1278,51 @@ func (s *PhysicalShard) ComputeShardBalanceStats() (rows int64, sumCents int64, 
 	if rows == 0 || minCents == 1<<62-1 {
 		minCents = 0
 	}
+	s.RecordOp(time.Since(start).Nanoseconds())
 	return rows, sumCents, minCents, maxCents
+}
+
+// ComputeShardTenantStats scans all active buckets on this shard and returns exact (count, sumCents) grouped by tenant_id.
+func (s *PhysicalShard) ComputeShardTenantStats() map[string][2]int64 {
+	start := time.Now()
+	out := make(map[string][2]int64, 8)
+	for b := uint16(0); b < hash.TotalVirtualBuckets; b++ {
+		s.bucketMu[b].RLock()
+		slab := s.buckets[b]
+		if slab.RowCount > 0 {
+			if len(slab.SeededUIDs) > 0 && len(slab.SeededUIDs) == len(slab.SlabBalances) {
+				for idx, uid := range slab.SeededUIDs {
+					if slab.DeletedIDs[uid] {
+						continue
+					}
+					if _, overridden := slab.DeltaOverrides[uid]; overridden {
+						continue
+					}
+					tenant := sampleTenants[int(uid)%len(sampleTenants)]
+					cur := out[tenant]
+					cur[0]++
+					cur[1] += int64(slab.SlabBalances[idx])
+					out[tenant] = cur
+				}
+			}
+			for uid, dr := range slab.DeltaOverrides {
+				if slab.DeletedIDs[uid] {
+					continue
+				}
+				tenant := dr.TenantID
+				if tenant == "" {
+					tenant = "tenant_core"
+				}
+				cur := out[tenant]
+				cur[0]++
+				cur[1] += dr.BalanceCents
+				out[tenant] = cur
+			}
+		}
+		s.bucketMu[b].RUnlock()
+	}
+	s.RecordOp(time.Since(start).Nanoseconds())
+	return out
 }
 
 // QueryFilter executes a local top-K filter & sort scan on this physical shard (used by Pillar 2 Scatter-Gather).
@@ -1311,7 +1337,7 @@ func (s *PhysicalShard) QueryFilter(emailSubstring string, regionFilter string, 
 	var matched []UserRow
 	seenUIDs := make(map[int64]bool)
 
-	// 1. First scan all committed DeltaOverrides on owned buckets so newly inserted/updated rows are always included
+	// 1. Scan all committed DeltaOverrides on owned buckets so newly inserted/updated rows are always included
 	for b := uint16(0); b < hash.TotalVirtualBuckets; b++ {
 		s.bucketMu[b].RLock()
 		slab := s.buckets[b]
@@ -1333,36 +1359,45 @@ func (s *PhysicalShard) QueryFilter(emailSubstring string, regionFilter string, 
 		s.bucketMu[b].RUnlock()
 	}
 
-	// 2. If shard region matches (or no region filter), scan from highest seeded ID downward
+	// 2. Scan real SeededUIDs across all buckets owned by this shard
 	if regSub == "" || strings.ToLower(s.Region) == regSub {
-		maxUserID := s.findHighestSeededID()
-		step := int64(1)
-		if maxUserID > 100000 {
-			step = 5
-		}
-		for uid := maxUserID; uid >= 1 && len(matched) < limit*2; uid -= step {
-			if seenUIDs[uid] {
-				continue
-			}
-			key := fmt.Sprintf("%d", uid)
-			b := hash.ComputeBucket(key)
-
+		for b := uint16(0); b < hash.TotalVirtualBuckets; b++ {
 			s.bucketMu[b].RLock()
-			ownsBucket := s.buckets[b].RowCount > 0
+			slab := s.buckets[b]
+			if slab.RowCount > 0 && len(slab.SeededUIDs) > 0 {
+				for i := len(slab.SeededUIDs) - 1; i >= 0; i-- {
+					uid := slab.SeededUIDs[i]
+					if seenUIDs[uid] || slab.DeletedIDs[uid] {
+						continue
+					}
+					if _, overridden := slab.DeltaOverrides[uid]; overridden {
+						continue
+					}
+					domain := sampleDomains[int(uid)%len(sampleDomains)]
+					email := fmt.Sprintf("user_%d@%s", uid, domain)
+					if emailSub != "" && !strings.Contains(strings.ToLower(email), emailSub) {
+						continue
+					}
+					idx := int(uid % 12)
+					if idx < 0 {
+						idx = -idx
+					}
+					ts := epochBaseTime.Add(time.Duration(uid%864000) * time.Second)
+					matched = append(matched, UserRow{
+						UserID:       uid,
+						UserKey:      strconv.FormatInt(uid, 10),
+						Name:         sampleNames[idx],
+						Email:        email,
+						TenantID:     sampleTenants[int(uid)%len(sampleTenants)],
+						Region:       s.Region,
+						BalanceCents: int64(slab.SlabBalances[i]),
+						BucketID:     b,
+						CreatedAt:    ts,
+						UpdatedAt:    ts,
+					})
+				}
+			}
 			s.bucketMu[b].RUnlock()
-			if !ownsBucket {
-				continue
-			}
-
-			if row, ok := s.GetUser(uid); ok {
-				if regSub != "" && strings.ToLower(row.Region) != regSub {
-					continue
-				}
-				if emailSub != "" && !strings.Contains(strings.ToLower(row.Email), emailSub) {
-					continue
-				}
-				matched = append(matched, row)
-			}
 		}
 	}
 
@@ -1376,12 +1411,8 @@ func (s *PhysicalShard) QueryFilter(emailSubstring string, regionFilter string, 
 	if len(matched) > limit {
 		matched = matched[:limit]
 	}
-	s.RecordOp(time.Since(start).Nanoseconds() + 350_000)
+	s.RecordOp(time.Since(start).Nanoseconds())
 	return matched
-}
-
-func (s *PhysicalShard) findHighestSeededID() int64 {
-	return s.SeededMaxUserID()
 }
 
 // ClusterStorage manages the pool of all physical shards.
@@ -1475,8 +1506,24 @@ func (cs *ClusterStorage) GetAllShards() []*PhysicalShard {
 	return list
 }
 
-// SeedCluster populates the cluster with `totalRows` (default: 50,000,000 rows!)
-// in parallel across all CPU cores using pointer-free columnar slabs.
+func (cs *ClusterStorage) TotalRows() int64 {
+	var total int64
+	for _, s := range cs.GetAllShards() {
+		total += s.RowCount()
+	}
+	return total
+}
+
+func (cs *ClusterStorage) TotalUsedBytes() int64 {
+	var total int64
+	for _, s := range cs.GetAllShards() {
+		total += s.UsedMemoryBytes()
+	}
+	return total
+}
+
+// SeedCluster populates the cluster with `totalRows` (default: 10,000 real rows)
+// in parallel across all CPU cores, hashing every single user_id into its exact virtual bucket.
 func (cs *ClusterStorage) SeedCluster(
 	totalRows int,
 	bucketLookup func(bucket uint16) uint32,
@@ -1489,18 +1536,11 @@ func (cs *ClusterStorage) SeedCluster(
 	for _, s := range cs.GetAllShards() {
 		s.seededMaxID.Store(totalInt64)
 	}
-	basePerBucket := totalInt64 / int64(hash.TotalVirtualBuckets)
-	remainder := totalInt64 % int64(hash.TotalVirtualBuckets)
 
-	var exactCounts [hash.TotalVirtualBuckets]int64
 	var exactUIDs [hash.TotalVirtualBuckets][]int64
-	useExact := totalInt64 <= 100000
-	if useExact {
-		for uid := int64(1); uid <= totalInt64; uid++ {
-			b := hash.ComputeBucket(strconv.FormatInt(uid, 10))
-			exactCounts[b]++
-			exactUIDs[b] = append(exactUIDs[b], uid)
-		}
+	for uid := int64(1); uid <= totalInt64; uid++ {
+		b := hash.ComputeBucketInt64(uid)
+		exactUIDs[b] = append(exactUIDs[b], uid)
 	}
 
 	workers := runtime.NumCPU()
@@ -1523,74 +1563,83 @@ func (cs *ClusterStorage) SeedCluster(
 					shard.seededMaxID.Store(totalInt64)
 				}
 
-				var count int64
-				if useExact {
-					count = exactCounts[b]
-				} else {
-					// Deterministic realistic variance around basePerBucket while summing to exact totalRows
-					count = basePerBucket
-					if int64(b) < remainder {
-						count++
-					}
-					if totalInt64 >= 10240 {
-						delta := int64((uint32(b/2)*73)%41) - 20
-						if b%2 == 0 {
-							count += delta
-						} else {
-							count -= delta
-						}
-					}
-					if count < 0 {
-						count = 0
-					}
-				}
-
-				// Allocate real pointer-free columnar balance slab in RAM (~200 MB for 50,000,000 rows)
-				slabSize := int(count)
-				if slabSize > 65536 {
-					slabSize = 65536
-				}
-				balances := make([]uint32, slabSize)
+				uids := exactUIDs[b]
+				count := int64(len(uids))
+				balances := make([]uint32, len(uids))
 				var baseSum int64
-				for i := 0; i < slabSize; i++ {
+				for i := range uids {
 					val := uint32(10000 + ((int(b)*17389 + i*7919) % 900000))
 					balances[i] = val
-					if !useExact {
-						baseSum += int64(val)
-					}
-				}
-				if !useExact && count > int64(slabSize) && slabSize > 0 {
-					baseSum += (count - int64(slabSize)) * int64(balances[0])
+					baseSum += int64(val)
 				}
 
 				slab := &BucketSlab{
-					BucketID:       b,
-					RowCount:       count,
-					SeededMaxID:    totalInt64,
-					SlabBalances:   balances,
-					DeltaOverrides: make(map[int64]UserRow),
-					DeletedIDs:     make(map[int64]bool),
-					CustomTables:   make(map[string]map[string]CustomRow),
+					BucketID:         b,
+					RowCount:         count,
+					SeededMaxID:      totalInt64,
+					BaseSlabSumCents: baseSum,
+					SeededUIDs:       uids,
+					SlabBalances:     balances,
+					SlabChecksum:     ComputeSlabArrayChecksum(b, count, balances),
+					DeltaOverrides:   make(map[int64]UserRow),
+					DeletedIDs:       make(map[int64]bool),
+					CustomTables:     make(map[string]map[string]CustomRow),
 				}
-				if useExact {
-					for _, uid := range exactUIDs[b] {
-						baseSum += slab.SeededBalanceCents(uid)
-					}
-				}
-				slab.BaseSlabSumCents = baseSum
-				slab.SlabChecksum = ComputeSlabArrayChecksum(b, count, balances)
 				shard.InstallBucketSlab(slab)
 			}
 		}()
 	}
 	wg.Wait()
+
+	// Record initial seed LSN checkpoint on each populated shard so _shardmaster_cdc contains real events
+	nowUs := time.Now().UnixMicro()
+	for _, s := range cs.GetAllShards() {
+		s.cdcMu.Lock()
+		emptyCDC := len(s.cdcJournal) == 0
+		s.cdcMu.Unlock()
+		if !emptyCDC {
+			continue
+		}
+		for b := uint16(0); b < hash.TotalVirtualBuckets; b++ {
+			s.bucketMu[b].RLock()
+			uids := s.buckets[b].SeededUIDs
+			s.bucketMu[b].RUnlock()
+			if len(uids) > 0 {
+				if firstRow, ok := s.GetUser(uids[0]); ok {
+					lsn := s.lsnSeq.Add(1)
+					s.cdcMu.Lock()
+					s.cdcJournal = append(s.cdcJournal, MutationLogEntry{
+						LSN:         lsn,
+						BucketID:    b,
+						Op:          MutationInsertOrUpdate,
+						UserID:      firstRow.UserID,
+						Row:         firstRow,
+						TimestampUs: nowUs,
+					})
+					s.cdcMu.Unlock()
+					break
+				}
+			}
+		}
+	}
+}
+
+type PersistedBucketDelta struct {
+	BucketID       uint16                          `json:"bucket_id"`
+	DeltaOverrides map[int64]UserRow               `json:"delta_overrides,omitempty"`
+	DeletedIDs     map[int64]bool                  `json:"deleted_ids,omitempty"`
+	CustomTables   map[string]map[string]CustomRow `json:"custom_tables,omitempty"`
+	CustomBytes    int64                           `json:"custom_bytes,omitempty"`
 }
 
 type PersistedShardMeta struct {
-	ShardID  uint32        `json:"shard_id"`
-	Region   string        `json:"region"`
-	RowCount int64         `json:"row_count"`
-	Settings ShardSettings `json:"settings"`
+	ShardID    uint32                 `json:"shard_id"`
+	Region     string                 `json:"region"`
+	RowCount   int64                  `json:"row_count"`
+	Settings   ShardSettings          `json:"settings"`
+	BucketData []PersistedBucketDelta `json:"bucket_data,omitempty"`
+	CDCJournal []MutationLogEntry     `json:"cdc_journal,omitempty"`
+	LSNSeq     uint64                 `json:"lsn_seq,omitempty"`
 }
 
 type PersistedClusterState struct {
@@ -1609,16 +1658,44 @@ func (cs *ClusterStorage) SaveStateFile(buckets [hash.TotalVirtualBuckets]uint32
 		UpdatedAt: time.Now().UTC(),
 	}
 	for i, s := range shards {
+		var bDeltas []PersistedBucketDelta
+		for b := uint16(0); b < hash.TotalVirtualBuckets; b++ {
+			s.bucketMu[b].RLock()
+			slab := s.buckets[b]
+			if len(slab.DeltaOverrides) > 0 || len(slab.DeletedIDs) > 0 || len(slab.CustomTables) > 0 {
+				cloned := CloneBucketSlab(slab)
+				bDeltas = append(bDeltas, PersistedBucketDelta{
+					BucketID:       b,
+					DeltaOverrides: cloned.DeltaOverrides,
+					DeletedIDs:     cloned.DeletedIDs,
+					CustomTables:   cloned.CustomTables,
+					CustomBytes:    cloned.CustomBytes,
+				})
+			}
+			s.bucketMu[b].RUnlock()
+		}
+		s.cdcMu.RLock()
+		cdcCopy := make([]MutationLogEntry, len(s.cdcJournal))
+		copy(cdcCopy, s.cdcJournal)
+		s.cdcMu.RUnlock()
+
 		state.Shards[i] = PersistedShardMeta{
-			ShardID:  s.ShardID,
-			Region:   s.Region,
-			RowCount: s.RowCount(),
-			Settings: s.GetSettings(),
+			ShardID:    s.ShardID,
+			Region:     s.Region,
+			RowCount:   s.RowCount(),
+			Settings:   s.GetSettings(),
+			BucketData: bDeltas,
+			CDCJournal: cdcCopy,
+			LSNSeq:     s.lsnSeq.Load(),
 		}
 	}
 	raw, err := json.MarshalIndent(state, "", "  ")
 	if err == nil {
-		_ = os.WriteFile(filepath.Join(cs.dataDir, "cluster_state.json"), raw, 0644)
+		tmpPath := filepath.Join(cs.dataDir, "cluster_state.json.tmp")
+		finalPath := filepath.Join(cs.dataDir, "cluster_state.json")
+		if err := os.WriteFile(tmpPath, raw, 0644); err == nil {
+			_ = os.Rename(tmpPath, finalPath)
+		}
 	}
 }
 
@@ -1641,17 +1718,93 @@ func (cs *ClusterStorage) LoadStateFile(setBucketOwner func(bucket uint16, shard
 	if err := json.Unmarshal(raw, &state); err != nil || len(state.Shards) == 0 {
 		return false
 	}
-	cs.mu.Lock()
-	cs.shards = make(map[uint32]*PhysicalShard, len(state.Shards))
+
+	// Ensure all persisted shards exist
 	for _, sm := range state.Shards {
-		sh := NewPhysicalShard(sm.ShardID, sm.Region)
+		sh := cs.EnsureShard(sm.ShardID, sm.Region)
 		sh.UpdateSettings(sm.Settings)
-		cs.shards[sm.ShardID] = sh
 	}
-	cs.mu.Unlock()
-	if setBucketOwner != nil {
-		for b := uint16(0); b < hash.TotalVirtualBuckets; b++ {
-			setBucketOwner(b, state.Buckets[b])
+
+	// Move any seeded bucket slabs to their persisted owner shard if ownership changed
+	for b := uint16(0); b < hash.TotalVirtualBuckets; b++ {
+		targetSID := state.Buckets[b]
+		targetShard, ok := cs.GetShard(targetSID)
+		if !ok {
+			continue
+		}
+		targetShard.bucketMu[b].RLock()
+		alreadyHas := len(targetShard.buckets[b].SeededUIDs) > 0 || targetShard.buckets[b].RowCount > 0
+		targetShard.bucketMu[b].RUnlock()
+		if !alreadyHas {
+			for _, donor := range cs.GetAllShards() {
+				if donor.ShardID == targetSID {
+					continue
+				}
+				donor.bucketMu[b].RLock()
+				hasDonor := len(donor.buckets[b].SeededUIDs) > 0 || donor.buckets[b].RowCount > 0
+				donor.bucketMu[b].RUnlock()
+				if hasDonor {
+					slab := donor.ExportBucketSlab(b)
+					targetShard.InstallBucketSlab(slab)
+					donor.PurgeBucketRange(b, b)
+					break
+				}
+			}
+		}
+		if setBucketOwner != nil {
+			setBucketOwner(b, targetSID)
+		}
+	}
+
+	// Overlay persisted DeltaOverrides, DeletedIDs, CustomTables, and CDCJournal onto each shard
+	for _, sm := range state.Shards {
+		sh, ok := cs.GetShard(sm.ShardID)
+		if !ok {
+			continue
+		}
+		if sm.LSNSeq > 0 {
+			sh.lsnSeq.Store(sm.LSNSeq)
+		}
+		if len(sm.CDCJournal) > 0 {
+			sh.cdcMu.Lock()
+			sh.cdcJournal = sm.CDCJournal
+			sh.cdcMu.Unlock()
+		}
+		for _, bd := range sm.BucketData {
+			b := bd.BucketID & hash.BucketMask
+			sh.bucketMu[b].Lock()
+			slab := sh.buckets[b]
+			oldBytes := BucketMemoryBytesLocked(slab)
+			oldCount := slab.RowCount
+
+			if bd.DeltaOverrides != nil {
+				slab.DeltaOverrides = bd.DeltaOverrides
+			}
+			if bd.DeletedIDs != nil {
+				slab.DeletedIDs = bd.DeletedIDs
+			}
+			if bd.CustomTables != nil {
+				slab.CustomTables = bd.CustomTables
+			}
+			slab.CustomBytes = bd.CustomBytes
+
+			// Recompute exact RowCount for this bucket
+			var rc int64
+			for _, uid := range slab.SeededUIDs {
+				if !slab.DeletedIDs[uid] {
+					rc++
+				}
+			}
+			for uid := range slab.DeltaOverrides {
+				if !slab.DeletedIDs[uid] && slab.findSeededSlot(uid) < 0 {
+					rc++
+				}
+			}
+			slab.RowCount = rc
+			newBytes := BucketMemoryBytesLocked(slab)
+			sh.usedBytes.Add(newBytes - oldBytes)
+			sh.rowCount.Add(rc - oldCount)
+			sh.bucketMu[b].Unlock()
 		}
 	}
 	return true

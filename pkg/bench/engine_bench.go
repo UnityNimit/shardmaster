@@ -3,6 +3,7 @@ package bench
 import (
 	"fmt"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -50,6 +51,7 @@ func RunPeakBenchmark(qr *router.QueryRouter, duration time.Duration, workers in
 	var totalOps atomic.Uint64
 	var stopFlag atomic.Bool
 	var wg sync.WaitGroup
+	workerSamples := make([][]int64, workers)
 
 	start := time.Now()
 	for w := 0; w < workers; w++ {
@@ -57,17 +59,32 @@ func RunPeakBenchmark(qr *router.QueryRouter, duration time.Duration, workers in
 		go func(workerID int) {
 			defer wg.Done()
 			var localOps uint64
+			samples := make([]int64, 0, 256)
 			seed := int64(workerID*1_000_000 + 1)
+			batchCount := 0
 			for !stopFlag.Load() {
+				var bStart time.Time
+				measure := (batchCount&255 == 0) && len(samples) < 256
+				if measure {
+					bStart = time.Now()
+				}
 				// Unrolled batch of 64 zero-allocation routing + EWMA operations
 				for i := int64(0); i < 64; i++ {
 					bucket := uint16((uint64(seed+i) * 0x9e3779b97f4a7c15) & 1023)
 					_ = qr.Dir.GetBucketOwner(bucket)
 					qr.HotspotTracker.RecordHit(bucket)
 				}
+				if measure {
+					nsPerOp := time.Since(bStart).Nanoseconds() / 64
+					if nsPerOp > 0 {
+						samples = append(samples, nsPerOp)
+					}
+				}
 				seed += 64
 				localOps += 64
+				batchCount++
 			}
+			workerSamples[workerID] = samples
 			totalOps.Add(localOps)
 		}(w)
 	}
@@ -78,10 +95,29 @@ func RunPeakBenchmark(qr *router.QueryRouter, duration time.Duration, workers in
 	elapsed := time.Since(start)
 
 	ops := totalOps.Load()
+	if ops == 0 {
+		ops = 1
+	}
 	qps := uint64(float64(ops) / elapsed.Seconds())
 	avgNs := (float64(elapsed.Nanoseconds()) * float64(runtime.NumCPU())) / float64(ops)
-	if avgNs < 8 {
-		avgNs = 14.5
+	if avgNs < 1.0 {
+		avgNs = 1.0
+	}
+
+	var allSamples []int64
+	for _, ws := range workerSamples {
+		allSamples = append(allSamples, ws...)
+	}
+	sort.Slice(allSamples, func(i, j int) bool { return allSamples[i] < allSamples[j] })
+	p50Ns := int64(avgNs)
+	p99Ns := int64(avgNs)
+	if len(allSamples) > 0 {
+		p50Ns = allSamples[len(allSamples)*50/100]
+		p99Idx := len(allSamples) * 99 / 100
+		if p99Idx >= len(allSamples) {
+			p99Idx = len(allSamples) - 1
+		}
+		p99Ns = allSamples[p99Idx]
 	}
 
 	// ========================================================================
@@ -131,8 +167,8 @@ func RunPeakBenchmark(qr *router.QueryRouter, duration time.Duration, workers in
 		TotalRoutingOps:      ops,
 		RoutingThroughputQPS: qps,
 		AvgLatencyNs:         avgNs,
-		P50LatencyNs:         int64(avgNs * 0.85),
-		P99LatencyNs:         int64(avgNs * 2.1),
+		P50LatencyNs:         p50Ns,
+		P99LatencyNs:         p99Ns,
 		HeapAllocsPerOp:      0,
 		MemoryUsedMB:         memMB,
 		DataPlaneQueries:     dpTotal,
@@ -142,3 +178,4 @@ func RunPeakBenchmark(qr *router.QueryRouter, duration time.Duration, workers in
 		VDiffDigestMatched:   vdiffOK,
 	}
 }
+

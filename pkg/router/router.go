@@ -626,13 +626,13 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 			{"8", "CLUSTER_ADMIN", "SHOW CDC;", "Inspect active & historical CDC VReplication streams and VDiff status"},
 			{"9", "CLUSTER_ADMIN", "SHOW HOTSPOTS;", "Inspect Top EWMA hottest Virtual Buckets & self-healing isolations"},
 			{"10", "CLUSTER_ADMIN", "SHOW STATS;", "Inspect internal RAM, L1 directory, CPU threads & query counters"},
-			{"11", "CLUSTER_ADMIN", "RUN VDIFF;", "Compute 256-bit commutative XOR-SHA256 parity across all 50M rows"},
+			{"11", "CLUSTER_ADMIN", "RUN VDIFF;", "Compute 256-bit commutative XOR-SHA256 parity across all shards"},
 			{"12", "QUERY_PLANNER", "EXPLAIN ANALYZE SELECT * FROM users WHERE user_id = 42;", "Inspect step-by-step distributed execution plan & operator costs"},
 			{"13", "POINT_QUERY_O1", "SELECT * FROM users WHERE user_id = 42;", "O(1) point lookup routed to single owning shard in ~18ns"},
-			{"14", "MULTI_POINT_IN", "SELECT * FROM users WHERE user_id IN (42, 100, 777, 8888, 49999999);", "Batch multi-key routing across exact target shards"},
+			{"14", "MULTI_POINT_IN", "SELECT * FROM users WHERE user_id IN (42, 100, 777, 8888, 9999);", "Batch multi-key routing across exact target shards"},
 			{"15", "K_WAY_MERGE", "SELECT * FROM users WHERE email LIKE '%@gmail.com' ORDER BY created_at DESC LIMIT 5;", "Parallel Scatter-Gather + Min-Heap K-Way Merge Sort"},
 			{"16", "K_WAY_MERGE", "SELECT * FROM users WHERE region = 'us-west' ORDER BY created_at DESC LIMIT 5;", "Region-pruned Scatter-Gather K-Way Merge Sort"},
-			{"17", "MAP_REDUCE_AGG", "SELECT region, COUNT(*), SUM(balance_usd), AVG(balance_usd) FROM users GROUP BY region;", "Distributed Map-Reduce GROUP BY region across 50M rows"},
+			{"17", "MAP_REDUCE_AGG", "SELECT region, COUNT(*), SUM(balance_usd), AVG(balance_usd) FROM users GROUP BY region;", "Distributed Map-Reduce GROUP BY region across all shards"},
 			{"18", "MAP_REDUCE_AGG", "SELECT shard_id, COUNT(*), AVG(balance_usd) FROM users GROUP BY shard_id;", "Distributed Map-Reduce GROUP BY physical shard"},
 			{"19", "CDC_MUTATION", "INSERT INTO users (user_id, name, email, balance_cents) VALUES (42, 'Ada Lovelace', 'ada@gmail.com', 950000);", "Point Upsert + append LSN entry to _shardmaster_cdc log"},
 			{"20", "CDC_MUTATION", "UPDATE users SET name = 'Grace Hopper', balance_usd = 12500.00 WHERE user_id = 42;", "Point Update + append LSN entry to _shardmaster_cdc log"},
@@ -706,7 +706,7 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 			planSummary = fmt.Sprintf("Distributed Two-Phase Map-Reduce Aggregation (%d Shards)", shardsCount)
 			rows = [][]string{
 				{"1", "Coordinator Map-Reduce Planner", "Proxy Coordinator", strconv.Itoa(int(shardsCount)), "4 us", "Decomposed aggregate into Shard-Local Map + Coordinator Reduce"},
-				{"2", "Parallel Shard Slab Aggregation", fmt.Sprintf("All %d Shards", shardsCount), "50,000,000", "180 us", "Scanned 1,024 bucket columnar slabs in parallel"},
+				{"2", "Parallel Shard Slab Aggregation", fmt.Sprintf("All %d Shards", shardsCount), strconv.FormatInt(qr.Cluster.TotalRows(), 10), "180 us", "Scanned 1,024 bucket columnar slabs in parallel"},
 				{"3", "Coordinator Final Merge", "Proxy Coordinator", strconv.Itoa(int(shardsCount)), "9 us", "Combined partial COUNT, SUM, MIN, MAX accumulators"},
 			}
 		} else {
@@ -885,6 +885,9 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 		if qr.SQL != nil {
 			qr.SQL.SyncUserUpsert(shard.ShardID, saved)
 		}
+		if qr.SQL == nil || !qr.SQL.InTransaction() {
+			qr.Cluster.SaveStateFile(qr.Dir.SnapshotBuckets())
+		}
 
 		return &ResultSet{
 			Title:         fmt.Sprintf("POINT INSERT / UPSERT + CDC APPEND (user_id = %d)", cq.UserID),
@@ -963,6 +966,9 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 		if qr.SQL != nil {
 			qr.SQL.SyncUserUpsert(shard.ShardID, saved)
 		}
+		if qr.SQL == nil || !qr.SQL.InTransaction() {
+			qr.Cluster.SaveStateFile(qr.Dir.SnapshotBuckets())
+		}
 		return &ResultSet{
 			Title:         fmt.Sprintf("POINT UPDATE + CDC LOG APPEND (user_id = %d)", cq.UserID),
 			Columns:       userTableColumns(),
@@ -1001,6 +1007,9 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 		if qr.SQL != nil {
 			qr.SQL.SyncUserDelete(cq.UserID)
 		}
+		if qr.SQL == nil || !qr.SQL.InTransaction() {
+			qr.Cluster.SaveStateFile(qr.Dir.SnapshotBuckets())
+		}
 		return &ResultSet{
 			Title:         fmt.Sprintf("POINT TOMBSTONE DELETE + CDC APPEND (user_id = %d)", cq.UserID),
 			Columns:       []string{"deleted", "user_id", "bucket_id", "shard_id", "cdc_lsn_appended"},
@@ -1034,7 +1043,6 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 			if maxC > globalMax {
 				globalMax = maxC
 			}
-			s.RecordOp(220_000)
 		}
 		if totalRows == 0 {
 			globalMin = 0
@@ -1100,7 +1108,6 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 					fmt.Sprintf("$%.2f", avgUSD),
 					fmt.Sprintf("$%.2f / $%.2f", float64(minC)/100.0, float64(maxC)/100.0),
 				})
-				s.RecordOp(240_000)
 			}
 			return &ResultSet{
 				Title:         "DISTRIBUTED GROUP BY SHARD_ID AGGREGATION",
@@ -1114,27 +1121,40 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 			}, nil
 
 		case "tenant_id", "tenant":
-			var totalRows int64
-			for _, s := range shards {
-				totalRows += s.RowCount()
-				s.RecordOp(240_000)
+			type tenantAcc struct {
+				shards   int
+				rows     int64
+				sumCents int64
 			}
-			tenants := []string{"tenant_enterprise_1", "tenant_fintech", "tenant_saas", "tenant_core"}
-			rows := make([][]string, 0, len(tenants))
-			base := totalRows / int64(len(tenants))
-			rem := totalRows % int64(len(tenants))
-			for i, tName := range tenants {
-				cnt := base
-				if int64(i) < rem {
-					cnt++
+			byTenant := make(map[string]*tenantAcc)
+			var tOrder []string
+			for _, s := range shards {
+				tMap := s.ComputeShardTenantStats()
+				for tName, pair := range tMap {
+					acc, exists := byTenant[tName]
+					if !exists {
+						acc = &tenantAcc{}
+						byTenant[tName] = acc
+						tOrder = append(tOrder, tName)
+					}
+					acc.shards++
+					acc.rows += pair[0]
+					acc.sumCents += pair[1]
 				}
-				avgUSD := 4625.50 + float64(i)*142.25
-				sumUSD := float64(cnt) * avgUSD
+			}
+			sort.Strings(tOrder)
+			rows := make([][]string, 0, len(tOrder))
+			for _, tName := range tOrder {
+				acc := byTenant[tName]
+				avgUSD := 0.0
+				if acc.rows > 0 {
+					avgUSD = (float64(acc.sumCents) / float64(acc.rows)) / 100.0
+				}
 				rows = append(rows, []string{
 					tName,
-					strconv.Itoa(len(shards)),
-					strconv.FormatInt(cnt, 10),
-					fmt.Sprintf("$%.2f", sumUSD),
+					strconv.Itoa(acc.shards),
+					strconv.FormatInt(acc.rows, 10),
+					fmt.Sprintf("$%.2f", float64(acc.sumCents)/100.0),
 					fmt.Sprintf("$%.2f", avgUSD),
 				})
 			}
@@ -1171,7 +1191,6 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 				acc.buckets += bucketCounts[s.ShardID]
 				acc.rows += r
 				acc.sumCents += sumC
-				s.RecordOp(240_000)
 			}
 			sort.Strings(order)
 			rows := make([][]string, 0, len(order))
@@ -1355,7 +1374,6 @@ func (qr *QueryRouter) ExecuteSQLOnShard(sql string, targetShardID int) (*Result
 
 	case QueryCountAggregate:
 		r, sumC, minC, maxC := shard.ComputeShardBalanceStats()
-		shard.RecordOp(140_000)
 		avgUSD := 0.0
 		if r > 0 {
 			avgUSD = (float64(sumC) / float64(r)) / 100.0

@@ -807,6 +807,7 @@ func TestACIDPropertiesAndConcurrentReshardingZeroDeadlock(t *testing.T) {
 	cluster.SaveStateFile(dir.SnapshotBuckets())
 	reloadedCluster := storage.NewClusterStorage(4, cluster.DataDir())
 	reloadedDir := directory.NewShardDirectory(4)
+	reloadedCluster.SeedCluster(2000, reloadedDir.GetBucketOwner)
 	if !reloadedCluster.LoadStateFile(func(b uint16, sid uint32) {
 		reloadedDir.AtomicCutoverBucket(b, sid)
 	}) {
@@ -814,6 +815,80 @@ func TestACIDPropertiesAndConcurrentReshardingZeroDeadlock(t *testing.T) {
 	}
 	if len(reloadedCluster.GetAllShards()) != 6 {
 		t.Fatalf("expected 6 durably persisted shards after reload, got %d", len(reloadedCluster.GetAllShards()))
+	}
+}
+
+func TestRealSeededRowsAndFullDiskPersistence(t *testing.T) {
+	dataDir := t.TempDir()
+	dir := directory.NewShardDirectory(4)
+	cluster := storage.NewClusterStorage(4, dataDir)
+	cluster.SeedCluster(2000, dir.GetBucketOwner)
+	cdcEngine := cdc.NewEngine(dir, cluster)
+	tracker := hotspot.NewTracker(dir, cluster, cdcEngine)
+	qr := router.NewQueryRouter(dir, cluster, cdcEngine, tracker)
+
+	// 1. Verify every seeded user_id 1..2000 exists on its exact owning shard, and non-seeded IDs (e.g. 2001, 49999999) do NOT exist
+	for uid := int64(1); uid <= 2000; uid++ {
+		sid, _ := dir.LookupInt64Fast(uid)
+		sh, ok := cluster.GetShard(sid)
+		if !ok {
+			t.Fatalf("missing shard %d", sid)
+		}
+		if _, found := sh.GetUser(uid); !found {
+			t.Fatalf("expected seeded user_id %d to exist on shard %d", uid, sid)
+		}
+	}
+	for _, nonExistentID := range []int64{2001, 99999, 49999999} {
+		sid, _ := dir.LookupInt64Fast(nonExistentID)
+		sh, _ := cluster.GetShard(sid)
+		if _, found := sh.GetUser(nonExistentID); found {
+			t.Fatalf("expected non-seeded user_id %d to NOT exist before INSERT, but found=true", nonExistentID)
+		}
+	}
+
+	// 2. Execute real SQL INSERT, UPDATE, and DELETE, and rebalance 4 -> 6 shards
+	if _, err := qr.ExecuteSQL("INSERT INTO users (user_id, name, email, balance_cents) VALUES (777777, 'NVMe Persisted', 'nvme@gmail.com', 888800);"); err != nil {
+		t.Fatalf("INSERT 777777 failed: %v", err)
+	}
+	if _, err := qr.ExecuteSQL("UPDATE users SET balance_usd = 9999.00 WHERE user_id = 42;"); err != nil {
+		t.Fatalf("UPDATE 42 failed: %v", err)
+	}
+	if _, err := qr.ExecuteSQL("DELETE FROM users WHERE user_id = 10;"); err != nil {
+		t.Fatalf("DELETE 10 failed: %v", err)
+	}
+	if _, err := cdcEngine.RebalanceToShards(6, 0); err != nil {
+		t.Fatalf("RebalanceToShards(6) failed: %v", err)
+	}
+
+	// 3. Simulate process restart: create a brand-new ShardDirectory + ClusterStorage from dataDir
+	dir2 := directory.NewShardDirectory(4)
+	cluster2 := storage.NewClusterStorage(4, dataDir)
+	cluster2.SeedCluster(2000, dir2.GetBucketOwner)
+	if !cluster2.LoadStateFile(dir2.AtomicCutoverBucket) {
+		t.Fatalf("expected LoadStateFile to restore cluster_state.json")
+	}
+
+	// Verify 777777 was persisted and restored on its post-split owning shard
+	sid777, _ := dir2.LookupFast("777777")
+	sh777, _ := cluster2.GetShard(sid777)
+	u777, found777 := sh777.GetUser(777777)
+	if !found777 || u777.BalanceCents != 888800 || u777.Name != "NVMe Persisted" {
+		t.Fatalf("expected restored user 777777 with 888800 cents, got found=%v row=%+v", found777, u777)
+	}
+
+	// Verify user 42 update was persisted and restored
+	sid42, _ := dir2.LookupFast("42")
+	sh42, _ := cluster2.GetShard(sid42)
+	u42, found42 := sh42.GetUser(42)
+	if !found42 || u42.BalanceCents != 999900 {
+		t.Fatalf("expected restored user 42 with 999900 cents, got found=%v cents=%d", found42, u42.BalanceCents)
+	}
+
+	// Verify user 10 deletion tombstone was persisted and restored
+	sid10, _ := dir2.LookupFast("10")
+	sh10, _ := cluster2.GetShard(sid10)
+	if _, found10 := sh10.GetUser(10); found10 {
+		t.Fatalf("expected deleted user 10 to remain deleted after restart, got found=true")
 	}
 }
 
@@ -836,5 +911,6 @@ func BenchmarkZeroAllocRouting(b *testing.B) {
 		}
 	})
 }
+
 
 

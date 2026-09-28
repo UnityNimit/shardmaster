@@ -76,7 +76,7 @@ func (sc *SchemaCatalog) registerBuiltins() {
 		ShardingStrategy: "HASH (xxHash64 & 1023)",
 		VirtualBuckets:   1024,
 		StorageEngine:    "Columnar Slab + Delta Overlay",
-		Description:      "Primary 50,000,000-row distributed user accounts & balances table",
+		Description:      "Primary distributed user accounts & balances table",
 		Columns: []ColumnSchema{
 			{"user_id", "BIGINT", "NOT NULL", "PRIMARY KEY (SHARD KEY)", "nextval('users_id_seq')", "64-Bit Integer Ring Key"},
 			{"user_key", "VARCHAR(64)", "NOT NULL", "HASH RING KEY", "CAST(user_id AS TEXT)", "Inline UTF-8 Key"},

@@ -70,7 +70,9 @@ func (t *Tracker) InjectBucketTrafficSpike(bucket uint16, hits uint64) {
 	shardID := t.dir.GetBucketOwner(b)
 	if shard, ok := t.cluster.GetShard(shardID); ok {
 		for i := uint64(0); i < 50; i++ {
-			shard.RecordOp(850_000)
+			start := time.Now()
+			_ = shard.GetBucketRangeRowCount(b, b)
+			shard.RecordOp(time.Since(start).Nanoseconds())
 		}
 	}
 }
@@ -215,10 +217,6 @@ func (t *Tracker) GetTopHotBuckets(limit int) []BucketHeatStat {
 		ewma := t.counters[b].ewma.Load() / 100
 		hits := t.counters[b].hits.Load()
 		eff := ewma + hits
-		if eff == 0 {
-			// Baseline ambient traffic per bucket
-			eff = uint64(10 + ((int(b)*17)%8))
-		}
 		stats[b] = BucketHeatStat{
 			BucketID:    b,
 			OwnerShard:  t.dir.GetBucketOwner(b),

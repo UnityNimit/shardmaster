@@ -77,9 +77,6 @@ func VerifyBucketRangeVDiff(
 	dstHex, dstCount := targetShard.ComputeBucketRangeXORHash(startBucket, endBucket)
 
 	elapsedUs := time.Since(start).Microseconds()
-	if elapsedUs < 15 {
-		elapsedUs = 18
-	}
 
 	return VDiffReport{
 		StartBucket:  startBucket,

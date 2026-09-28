@@ -375,12 +375,12 @@ func (re *RelationalEngine) seedInitialRelationalRows() {
 	}
 	defer userStmt.Close()
 
-	// Seed a curated set of user IDs covering 1..240 plus special IDs (42, 100, 777, 8888, 49999995..50000000)
+	// Seed initial relational rows from the live physical shards
 	var seedIDs []int64
 	for id := int64(1); id <= 240; id++ {
 		seedIDs = append(seedIDs, id)
 	}
-	seedIDs = append(seedIDs, 777, 8888, 9999, 49999995, 49999996, 49999997, 49999998, 49999999, 50000000)
+	seedIDs = append(seedIDs, 500, 777, 1000, 8888, 9999, 10000)
 
 	for _, uid := range seedIDs {
 		re.insertUserFromClusterTx(userStmt, uid)
@@ -392,19 +392,19 @@ func (re *RelationalEngine) seedInitialRelationalRows() {
 	if err == nil {
 		defer orderStmt.Close()
 		products := []struct {
-			name     string
-			cat      string
-			cents    int64
-			status   string
+			name   string
+			cat    string
+			cents  int64
+			status string
 		}{
 			{"ShardMaster Enterprise Cluster", "Database_Engine", 499900, "COMPLETED"},
 			{"Vitess CDC VReplication Stream", "Replication", 249900, "COMPLETED"},
 			{"L1-Cache Routing Accelerator", "Performance", 149900, "COMPLETED"},
 			{"Cryptographic VDiff Auditor", "Security_Compliance", 199900, "COMPLETED"},
 			{"Autonomous EWMA Hotspot Shield", "AI_Operations", 349900, "COMPLETED"},
-			{"Petabyte Columnar Storage Pack", "Storage_Slab", 899900, "PENDING"},
+			{"Zero-Downtime Columnar Slab Pack", "Storage_Slab", 899900, "PENDING"},
 		}
-		orderUsers := []int64{1, 2, 3, 5, 10, 15, 20, 25, 30, 42, 42, 50, 75, 100, 120, 150, 180, 200, 777, 8888, 49999999}
+		orderUsers := []int64{1, 2, 3, 5, 10, 15, 20, 25, 30, 42, 42, 50, 75, 100, 120, 150, 180, 200, 500, 777, 8888}
 		for i, uid := range orderUsers {
 			orderID := int64(1001 + i)
 			b := hash.ComputeBucket(strconv.FormatInt(uid, 10))
@@ -437,7 +437,7 @@ func (re *RelationalEngine) seedInitialRelationalRows() {
 	if err == nil {
 		defer payStmt.Close()
 		methods := []string{"STRIPE_WIRE", "ACH_INSTANT", "CORPORATE_AMEX", "SEPA_DIRECT"}
-		orderUsers := []int64{1, 2, 3, 5, 10, 15, 20, 25, 30, 42, 42, 50, 75, 100, 120, 150, 180, 200, 777, 8888, 49999999}
+		orderUsers := []int64{1, 2, 3, 5, 10, 15, 20, 25, 30, 42, 42, 50, 75, 100, 120, 150, 180, 200, 500, 777, 8888}
 		prices := []float64{4999.00, 2499.00, 1499.00, 1999.00, 3499.00, 8999.00}
 		for i, uid := range orderUsers {
 			orderID := int64(1001 + i)
@@ -588,7 +588,7 @@ func (re *RelationalEngine) SyncBucketRangeCutover(startBucket, endBucket uint16
 }
 
 // EnsureUserIDsMaterialized materializes any specific user_id literals mentioned in a SQL query
-// from the 50,000,000-row columnar shard slabs into the relational `users` table before executing.
+// from the physical shard slabs into the relational `users` table before executing.
 var numberLiteralRe = regexp.MustCompile(`\b\d{1,9}\b`)
 
 func (re *RelationalEngine) EnsureUserIDsMaterialized(rawSQL string) {
@@ -598,7 +598,7 @@ func (re *RelationalEngine) EnsureUserIDsMaterialized(rawSQL string) {
 	}
 	for _, m := range matches {
 		id, err := strconv.ParseInt(m, 10, 64)
-		if err != nil || id <= 0 || id > storage.DefaultInitialRows {
+		if err != nil || id <= 0 {
 			continue
 		}
 		ukey := strconv.FormatInt(id, 10)
@@ -667,6 +667,7 @@ func (re *RelationalEngine) ExecuteFullSQL(rawSQL string) (*ResultSet, error) {
 		}
 		re.txBucketBackups = make(map[uint16]txBucketSnapshot)
 		re.inTx = false
+		re.cluster.SaveStateFile(re.dir.SnapshotBuckets())
 		return &ResultSet{
 			Title:         "DISTRIBUTED ACID TRANSACTION COMMIT",
 			Columns:       []string{"statement_type", "shards_committed", "status"},
@@ -785,6 +786,10 @@ func (re *RelationalEngine) ExecuteFullSQL(rawSQL string) (*ResultSet, error) {
 		re.cluster.DropCustomTableEverywhere(tblName)
 	} else if strings.HasPrefix(upper, "ALTER TABLE") {
 		re.syncDynamicTableSchemaFromSQLite(trimmed)
+	}
+
+	if !re.inTx {
+		re.cluster.SaveStateFile(re.dir.SnapshotBuckets())
 	}
 
 	cmdWord := strings.Fields(upper)[0]

@@ -40,7 +40,7 @@ func initNativeConsole() {
 
 	// 3. Set a clean window title when launched by double-clicking in Windows Explorer
 	setConsoleTitleW := kernel32.NewProc("SetConsoleTitleW")
-	if titlePtr, err := syscall.UTF16PtrFromString("ShardMaster - Unified Interactive Control Center (50,000,000 Rows)"); err == nil {
+	if titlePtr, err := syscall.UTF16PtrFromString("ShardMaster - Unified Interactive Control Center"); err == nil {
 		_, _, _ = setConsoleTitleW.Call(uintptr(unsafe.Pointer(titlePtr)))
 	}
 }

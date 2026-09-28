@@ -311,7 +311,7 @@ func RenderSQLResult(sql string, res *router.ResultSet) {
 
 	latUs := res.LatencyUs
 	if latUs <= 0 {
-		latUs = 18
+		latUs = 1
 	}
 	ms := float64(latUs) / 1000.0
 	fmt.Printf("  %s (%d rows)  |  Tag: %s  |  Route: %s  |  Time: %s\n",
@@ -467,7 +467,7 @@ func RunInteractiveShell(qr *router.QueryRouter) {
 			runBenchAction(qr, dur)
 
 		case "11", "petabyte", "scale-sim", "scale":
-			fromStr := promptDefault(reader, "Initial shards for 1-PB simulation [default: 64]", "64")
+			fromStr := promptDefault(reader, "Initial shards for scale-out split analysis [default: 64]", "64")
 			toStr := promptDefault(reader, "Target shards after scale-out [default: 80]", "80")
 			fromN, _ := strconv.Atoi(fromStr)
 			toN, _ := strconv.Atoi(toStr)
@@ -477,7 +477,7 @@ func RunInteractiveShell(qr *router.QueryRouter) {
 			if toN <= fromN {
 				toN = fromN + 16
 			}
-			runPetabyteAction(uint32(fromN), uint32(toN))
+			runPetabyteAction(qr, uint32(fromN), uint32(toN))
 
 		case "12", "help", "h", "?":
 			topic := ""
@@ -500,6 +500,7 @@ func RunInteractiveShell(qr *router.QueryRouter) {
 				qr.Cluster.InitializeShards(4)
 				qr.Dir.Reset(4)
 				qr.Cluster.SeedCluster(seedCount, qr.Dir.GetBucketOwner)
+				qr.Cluster.SaveStateFile(qr.Dir.SnapshotBuckets())
 			})
 			fmt.Printf("  %s Cluster reset to 4 Shards (1,024 Buckets, %s rows).\n",
 				okStyle.Render("[OK]"), FormatCommas(uint64(seedCount)))
@@ -541,7 +542,7 @@ func printMainMenu() {
 	fmt.Printf("   %s  %-22s %s\n", hotStyle.Render("[8]"), whiteBold.Render("Hotspot Self-Healer"), dimStyle.Render("Spike Bucket #412 & watch auto-isolation"))
 	fmt.Printf("   %s  %-22s %s\n", okStyle.Render("[9]"), whiteBold.Render("VDiff Parity Audit"), dimStyle.Render("Verify 256-bit XOR-SHA256 across shards"))
 	fmt.Printf("  %s  %-22s %s\n", okStyle.Render("[10]"), whiteBold.Render("500M+ QPS Benchmark"), dimStyle.Render("Multi-core lock-free routing & chaos test"))
-	fmt.Printf("  %s  %-22s %s\n", cyanStyle.Render("[11]"), whiteBold.Render("1-Petabyte Simulator"), dimStyle.Render("Simulate 1 Trillion rows & network savings"))
+	fmt.Printf("  %s  %-22s %s\n", cyanStyle.Render("[11]"), whiteBold.Render("Scale-Out Split Bench"), dimStyle.Render("Benchmark N->M shard split & movement vs modulo"))
 	fmt.Printf("  %s  %-22s %s\n", warnStyle.Render("[12]"), whiteBold.Render("Architecture Manual"), dimStyle.Render("Formulas, internals & psql connection guide"))
 	fmt.Println(dimStyle.Render("  ------------------------------------------------------------------------"))
 	fmt.Printf("   Quick Commands:  %s  |  %s  |  %s  |  %s  |  %s\n",
@@ -579,10 +580,10 @@ func runGuidedAcademy(qr *router.QueryRouter, reader *bufio.Reader) {
 	_ = promptDefault(reader, "Press Enter to inject a 6,800 QPS spike on Bucket #412", "")
 	runHotspotAction(qr, 412)
 
-	fmt.Println(cyanStyle.Render("\n  [Lesson 5/5] Pillar 6: Multi-Million QPS Benchmark & 1-Petabyte Proof"))
-	_ = promptDefault(reader, "Press Enter to run the 500M+ QPS Benchmark & 1-PB Simulator", "")
+	fmt.Println(cyanStyle.Render("\n  [Lesson 5/5] Pillar 6: Multi-Million QPS Benchmark & Consistent-Hash Split Proof"))
+	_ = promptDefault(reader, "Press Enter to run the 500M+ QPS Benchmark & Split Analyzer", "")
 	runBenchAction(qr, 2)
-	runPetabyteAction(64, 80)
+	runPetabyteAction(qr, 64, 80)
 
 	fmt.Println(okStyle.Render("\n  [OK] Academy Complete! Type '3' to open the 4-Tab TUI or 'menu' for options."))
 }
@@ -624,7 +625,7 @@ var sqlPresets = map[string]string{
 	"11": "RUN VDIFF;",
 	"12": "EXPLAIN ANALYZE SELECT * FROM users WHERE user_id = 42;",
 	"13": "SELECT * FROM users WHERE user_id = 42;",
-	"14": "SELECT * FROM users WHERE user_id IN (42, 100, 777, 8888, 49999999);",
+	"14": "SELECT * FROM users WHERE user_id IN (42, 100, 777, 8888, 9999);",
 	"15": "SELECT * FROM users WHERE email LIKE '%@gmail.com' ORDER BY created_at DESC LIMIT 5;",
 	"16": "SELECT * FROM users WHERE region = 'us-west' ORDER BY created_at DESC LIMIT 5;",
 	"17": "SELECT region, COUNT(*), SUM(balance_usd), AVG(balance_usd) FROM users GROUP BY region;",
@@ -1018,7 +1019,7 @@ func runHotspotAction(qr *router.QueryRouter, bucketID uint16) {
 
 func runVDiffAction(qr *router.QueryRouter) {
 	var res *router.ResultSet
-	RunSpinnerWhile("Computing 256-Bit Commutative XOR-SHA256 Across 50,000,000 Rows...", func() {
+	RunSpinnerWhile(fmt.Sprintf("Computing 256-Bit Commutative XOR-SHA256 Across %s Rows...", FormatCommas(uint64(qr.Cluster.TotalRows()))), func() {
 		res, _ = qr.ExecuteSQL("RUN VDIFF")
 	})
 	RenderSectionHeader("PILLAR 4: CRYPTOGRAPHIC VDIFF BIT-LEVEL PARITY AUDIT")
@@ -1059,21 +1060,27 @@ func runBenchAction(qr *router.QueryRouter, benchDuration int) {
 	)
 }
 
-func runPetabyteAction(simFrom, simTo uint32) {
+func runPetabyteAction(qr *router.QueryRouter, simFrom, simTo uint32) {
 	var rep bench.PetabyteSimReport
-	RunSpinnerWhile(fmt.Sprintf("Simulating 1-Petabyte (1,000,000,000,000 Rows) Scale-Out (%d -> %d Shards)...", simFrom, simTo), func() {
+	RunSpinnerWhile(fmt.Sprintf("Computing Consistent-Hash Split Plan (%d -> %d Shards) Across 1,024 Buckets...", simFrom, simTo), func() {
 		rep = bench.SimulatePetabyteScale(simFrom, simTo)
 	})
-	RenderSectionHeader("1-PETABYTE (1,000,000,000,000 ROWS) ARCHITECTURE PROOF")
+	liveRows := uint64(0)
+	liveBytes := int64(0)
+	if qr != nil && qr.Cluster != nil {
+		liveRows = uint64(qr.Cluster.TotalRows())
+		liveBytes = qr.Cluster.TotalUsedBytes()
+	}
+	RenderSectionHeader("CONSISTENT-HASH SCALE-OUT SPLIT & MOVEMENT BENCHMARK")
 	RenderTypedTable(
-		[]string{"simulation_parameter", "measured_value", "engineering_impact"},
-		[]string{"CAPACITY DIMENSION", "COMPUTED METRIC", "CLUSTER SCALABILITY"},
+		[]string{"split_metric", "measured_value", "architectural_impact"},
+		[]string{"BENCHMARK DIMENSION", "MEASURED METRIC", "CLUSTER SCALABILITY"},
 		[][]string{
-			{"Simulated Dataset Scale", "1.00 Petabyte (1,024 TB)", "1,000,000,000,000 Rows @ 1 KB/row"},
-			{"Virtual Bucket Density", FormatCommas(rep.RecordsPerBucket) + " rows/bucket", fmt.Sprintf("%.0f GB per Virtual Bucket", rep.DataGBPerBucket)},
+			{"Live Cluster Data Footprint", fmt.Sprintf("%s rows (%s)", FormatCommas(liveRows), storage.FormatBytesCompact(liveBytes)), fmt.Sprintf("%d Active Shards on Local NVMe State", qr.Dir.ActiveShards())},
+			{"Split Plan CPU Execution", fmt.Sprintf("%d ns (%.2f us)", rep.SplitComputeNs, float64(rep.SplitComputeNs)/1000.0), fmt.Sprintf("Computed %d -> %d Shard Optimal Bucket Split", simFrom, simTo)},
 			{"L1 Routing Table Footprint", fmt.Sprintf("%d Bytes (4 KB)", rep.DirectoryRAMBytes), "Fits 100% Inside CPU L1 Data Cache"},
-			{"Naive Modulo Data Movement", fmt.Sprintf("%.1f%% reshuffled", rep.NaiveModuloMovedPct), fmt.Sprintf("During %d -> %d Shard Scale-Out", simFrom, simTo)},
-			{"ShardMaster Bucket Movement", fmt.Sprintf("%.1f%% (%d/1024 buckets)", rep.DataMovedPct, rep.BucketsMoved), fmt.Sprintf("Saves %.1f Terabytes (TB) Network I/O", rep.NetworkSavedTB)},
+			{"Naive Modulo Key Movement", fmt.Sprintf("%.1f%% reshuffled", rep.NaiveModuloMovedPct), fmt.Sprintf("key %% %d -> key %% %d Reshuffles Almost All Keys", simFrom, simTo)},
+			{"Consistent-Hash Movement", fmt.Sprintf("%.1f%% (%d/1024 buckets)", rep.DataMovedPct, rep.BucketsMoved), fmt.Sprintf("%d Contiguous Ranges (%.1f%% Network I/O Saved)", len(rep.RangesToMigrate), rep.IOReductionPct)},
 		},
 	)
 }
@@ -1087,7 +1094,7 @@ func runHelpEncyclopedia(reader *bufio.Reader, topic string) {
 		fmt.Println("   [3] Pillar 3: Vitess-Style CDC VReplication & <200us Cutover")
 		fmt.Println("   [4] Pillar 4: Cryptographic VDiff (256-Bit Commutative XOR-SHA256)")
 		fmt.Println("   [5] Pillar 5: Autonomous EWMA Hotspot Detector & Self-Healer")
-		fmt.Println("   [6] Pillar 6: 4-Tab TUI, 500M+ QPS Benchmark & 1-PB Simulator")
+		fmt.Println("   [6] Pillar 6: 4-Tab TUI, 500M+ QPS Benchmark & Split Analyzer")
 		fmt.Println("   [7] Connecting External Clients (psql, DBeaver, curl)")
 		topic = promptDefault(reader, "Select topic [1-7, default: 1]", "1")
 	}
@@ -1113,8 +1120,8 @@ func runHelpEncyclopedia(reader *bufio.Reader, topic string) {
 		fmt.Println("   * 64-byte cache-line padded counters track EWMA QPS per bucket and isolate")
 		fmt.Println("     hot buckets (>5x cluster mean) onto the coldest shard automatically.")
 	case "6", "tui":
-		RenderSectionHeader("PILLAR 6: 4-TAB TUI, 500M+ QPS BENCH & 1-PB SIMULATOR")
-		fmt.Println("   * Type '3' for the 4-Tab TUI, '10' for 500M+ QPS bench, '11' for 1-PB sim.")
+		RenderSectionHeader("PILLAR 6: 4-TAB TUI, 500M+ QPS BENCH & SPLIT ANALYZER")
+		fmt.Println("   * Type '3' for the 4-Tab TUI, '10' for 500M+ QPS bench, '11' for split bench.")
 	case "7", "psql":
 		RenderSectionHeader("CONNECTING EXTERNAL POSTGRESQL CLIENTS")
 		fmt.Println("   * psql -h localhost -p 6000 -U admin -d shardmaster")
@@ -1185,7 +1192,7 @@ func RunSixPillarShowcase(qr *router.QueryRouter) {
 	runAddShardAction(qr, "us-west")
 	runHotspotAction(qr, 412)
 	runBenchAction(qr, 1)
-	runPetabyteAction(64, 80)
+	runPetabyteAction(qr, 64, 80)
 }
 
 func truncatePlain(s string, maxLen int) string {

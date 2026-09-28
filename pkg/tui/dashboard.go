@@ -113,9 +113,10 @@ func (m *DashboardModel) startBackgroundLoad() {
 		uid := int64(1)
 		for !stop.Load() {
 			for i := 0; i < 160; i++ {
-				shardID, bucket := m.qr.RouteFastPoint((uid % 10000) + 1)
+				targetUID := (uid % 10000) + 1
+				shardID, bucket := m.qr.RouteFastPoint(targetUID)
 				if s, ok := m.qr.Cluster.GetShard(shardID); ok {
-					s.RecordOp(360_000)
+					_, _ = s.GetUser(targetUID)
 				}
 				_ = bucket
 				uid++
@@ -697,11 +698,12 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.qr.Cluster.InitializeShards(4)
 			m.qr.Dir.Reset(4)
 			m.qr.Cluster.SeedCluster(0, m.qr.Dir.GetBucketOwner)
+			m.qr.Cluster.SaveStateFile(m.qr.Dir.SnapshotBuckets())
 			m.selectedShardIdx = 0
 			m.pinnedShardID = -1
 			m.scrollOffset = 0
 			m.refreshActiveQuery()
-			m.statusBanner = "Reset to 4 Shards (1,024 Buckets, 50,000,000 rows)."
+			m.statusBanner = fmt.Sprintf("Reset to 4 Shards (1,024 Buckets, %s rows).", formatUintComma(uint64(m.qr.Cluster.TotalRows())))
 			return m, nil
 		}
 

@@ -27,6 +27,7 @@ func bootstrapEngine(initialShards uint32, seedRows int) *router.QueryRouter {
 	dir := directory.NewShardDirectory(initialShards)
 	cluster := storage.NewClusterStorage(initialShards, "./data")
 	cluster.SeedCluster(seedRows, dir.GetBucketOwner)
+	cluster.LoadStateFile(dir.AtomicCutoverBucket)
 	cdcEngine := cdc.NewEngine(dir, cluster)
 	tracker := hotspot.NewTracker(dir, cluster, cdcEngine)
 	return router.NewQueryRouter(dir, cluster, cdcEngine, tracker)
@@ -53,7 +54,7 @@ func printMasterHelpScreen() {
 	fmt.Printf("    %-44s %s\n", okStyle.Render(".\\shardmaster.exe status"), "Display cluster shard topology & CDC status table")
 	fmt.Printf("    %-44s %s\n", okStyle.Render(".\\shardmaster.exe tui"), "Launch live interactive 4-Tab Bubbletea Terminal UI")
 	fmt.Printf("    %-44s %s\n", okStyle.Render(".\\shardmaster.exe bench --duration 3"), "Run Multi-Million QPS routing & resharding benchmark")
-	fmt.Printf("    %-44s %s\n", okStyle.Render(".\\shardmaster.exe scale-sim"), "Simulate 1-Petabyte (1 Trillion rows) cluster math")
+	fmt.Printf("    %-44s %s\n", okStyle.Render(".\\shardmaster.exe scale-sim"), "Benchmark consistent-hashing shard split & movement")
 	fmt.Printf("    %-44s %s\n", warnStyle.Render(".\\shardmaster.exe lookup 42"), "O(1) xxHash64 & Virtual Bucket directory lookup")
 	fmt.Printf("    %-44s %s\n", warnStyle.Render(".\\shardmaster.exe query \"SELECT ...\""), "Execute point SQL or K-Way Merge scatter-gather SQL")
 	fmt.Printf("    %-44s %s\n", warnStyle.Render(".\\shardmaster.exe add-shard --region us-west"), "Add a new physical shard & stream buckets via CDC")
@@ -73,7 +74,7 @@ func main() {
 		Long:  "ShardMaster - Distributed PostgreSQL Proxy, Zero-Downtime CDC Resharding & Bubbletea TUI",
 		Run: func(cmd *cobra.Command, args []string) {
 			var qr *router.QueryRouter
-			console.RunSpinnerWhile("Bootstrapping ShardMaster Engine (Seeding 50,000,000 Rows Across 1,024 Buckets)...", func() {
+			console.RunSpinnerWhile(fmt.Sprintf("Bootstrapping ShardMaster Engine (Seeding %s Real Rows Across 1,024 Buckets)...", console.FormatCommas(uint64(storage.DefaultInitialRows))), func() {
 				qr = bootstrapEngine(4, storage.DefaultInitialRows)
 			})
 			console.RunInteractiveShell(qr)
@@ -96,7 +97,7 @@ func main() {
 		Short: "Render the Pillar 6 Enterprise Cluster Topology & CDC Status Dashboard",
 		Run: func(cmd *cobra.Command, args []string) {
 			var qr *router.QueryRouter
-			console.RunSpinnerWhile("Loading Cluster Topology (50,000,000 Rows)...", func() {
+			console.RunSpinnerWhile("Loading Cluster Topology & Persisted State...", func() {
 				qr = bootstrapEngine(4, storage.DefaultInitialRows)
 			})
 			console.PrintStaticDashboard(qr, false)
@@ -133,11 +134,11 @@ func main() {
 		Short: "Start the Native PostgreSQL Wire Protocol Server (:6000) and HTTP Directory Bridge (:8080)",
 		Run: func(cmd *cobra.Command, args []string) {
 			var qr *router.QueryRouter
-			console.RunSpinnerWhile("Starting PGWire v3.0 Server & Seeding 50,000,000 Rows...", func() {
+			console.RunSpinnerWhile("Starting PGWire v3.0 Server & Loading Cluster State...", func() {
 				qr = bootstrapEngine(4, storage.DefaultInitialRows)
 			})
 			srv := pgwire.NewServer(pgPort, httpPort, qr)
-			console.RenderSectionHeader("SHARDMASTER PGWIRE SERVER ONLINE (50,000,000 ROWS)")
+			console.RenderSectionHeader(fmt.Sprintf("SHARDMASTER PGWIRE SERVER ONLINE (%s ROWS)", console.FormatCommas(uint64(qr.Cluster.TotalRows()))))
 			fmt.Printf("   * PostgreSQL Wire Protocol: %s  (Connect: %s)\n",
 				okStyle.Render("localhost"+pgPort),
 				cyanStyle.Render("psql -h localhost -p 6000 -U admin -d shardmaster"))
@@ -241,7 +242,7 @@ func main() {
 				snap, err = qr.CDC.RebalanceToShards(targetNumShards, 3*time.Millisecond)
 			})
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Rebalance failed: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Rebalance failed: %v", err)
 				os.Exit(1)
 			}
 			console.RenderSectionHeader(fmt.Sprintf("ZERO-DOWNTIME CDC RESHARDING (4 -> %d SHARDS)", targetNumShards))
@@ -298,21 +299,25 @@ func main() {
 	var simTo uint32
 	scaleSimCmd := &cobra.Command{
 		Use:   "scale-sim",
-		Short: "Simulate 1-Petabyte (1 Trillion Rows) cluster topology & resharding math in <5MB RAM",
+		Short: "Benchmark consistent-hashing shard split & bucket movement vs naive modulo",
 		Run: func(cmd *cobra.Command, args []string) {
+			var qr *router.QueryRouter
 			var rep bench.PetabyteSimReport
-			console.RunSpinnerWhile(fmt.Sprintf("Simulating 1-Petabyte Scale-Out (%d -> %d Shards)...", simFrom, simTo), func() {
+			console.RunSpinnerWhile(fmt.Sprintf("Computing Consistent-Hash Split Plan (%d -> %d Shards)...", simFrom, simTo), func() {
+				qr = bootstrapEngine(4, storage.DefaultInitialRows)
 				rep = bench.SimulatePetabyteScale(simFrom, simTo)
 			})
-			console.RenderSectionHeader("1-PETABYTE (1,000,000,000,000 ROWS) ARCHITECTURE PROOF")
+			liveRows := uint64(qr.Cluster.TotalRows())
+			liveBytes := qr.Cluster.TotalUsedBytes()
+			console.RenderSectionHeader("CONSISTENT-HASH SCALE-OUT SPLIT & MOVEMENT BENCHMARK")
 			console.RenderProfessionalTable(
-				[]string{"SIMULATION PARAMETER", "MEASURED VALUE", "ENGINEERING IMPACT"},
+				[]string{"SPLIT METRIC", "MEASURED VALUE", "ARCHITECTURAL IMPACT"},
 				[][]string{
-					{"Simulated Dataset Scale", "1.00 Petabyte (1,024 TB)", "1,000,000,000,000 Rows @ 1 KB/row"},
-					{"Virtual Bucket Density", console.FormatCommas(rep.RecordsPerBucket) + " rows/bucket", fmt.Sprintf("%.0f GB per Virtual Bucket", rep.DataGBPerBucket)},
+					{"Live Cluster Data Footprint", fmt.Sprintf("%s rows (%s)", console.FormatCommas(liveRows), storage.FormatBytesCompact(liveBytes)), fmt.Sprintf("%d Active Shards on Local NVMe State", qr.Dir.ActiveShards())},
+					{"Split Plan CPU Execution", fmt.Sprintf("%d ns (%.2f us)", rep.SplitComputeNs, float64(rep.SplitComputeNs)/1000.0), fmt.Sprintf("Computed %d -> %d Shard Optimal Bucket Split", simFrom, simTo)},
 					{"L1 Routing Table Footprint", fmt.Sprintf("%d Bytes (4 KB)", rep.DirectoryRAMBytes), "Fits 100% Inside CPU L1 Data Cache"},
-					{"Naive Modulo Data Movement", fmt.Sprintf("%.1f%% reshuffled", rep.NaiveModuloMovedPct), fmt.Sprintf("During %d -> %d Shard Scale-Out", simFrom, simTo)},
-					{"ShardMaster Bucket Movement", fmt.Sprintf("%.1f%% (%d/1024 buckets)", rep.DataMovedPct, rep.BucketsMoved), fmt.Sprintf("Saves %.1f Terabytes (TB) Network I/O", rep.NetworkSavedTB)},
+					{"Naive Modulo Key Movement", fmt.Sprintf("%.1f%% reshuffled", rep.NaiveModuloMovedPct), fmt.Sprintf("key %% %d -> key %% %d Reshuffles Almost All Keys", simFrom, simTo)},
+					{"Consistent-Hash Movement", fmt.Sprintf("%.1f%% (%d/1024 buckets)", rep.DataMovedPct, rep.BucketsMoved), fmt.Sprintf("%d Contiguous Ranges (%.1f%% Network I/O Saved)", len(rep.RangesToMigrate), rep.IOReductionPct)},
 				},
 			)
 		},
@@ -326,7 +331,7 @@ func main() {
 		Run: func(cmd *cobra.Command, args []string) {
 			var qr *router.QueryRouter
 			var res *router.ResultSet
-			console.RunSpinnerWhile("Computing 256-Bit Commutative XOR-SHA256 Across 50,000,000 Rows...", func() {
+			console.RunSpinnerWhile("Computing 256-Bit Commutative XOR-SHA256 Across All Shards...", func() {
 				qr = bootstrapEngine(4, storage.DefaultInitialRows)
 				res, _ = qr.ExecuteSQL("RUN VDIFF")
 			})
@@ -350,10 +355,10 @@ func main() {
 
 	demoCmd := &cobra.Command{
 		Use:   "demo",
-		Short: "Run the complete 6-Pillar Legendary Professor Demonstration in one command",
+		Short: "Run the complete 6-Pillar End-to-End Automated Showcase in one command",
 		Run: func(cmd *cobra.Command, args []string) {
 			var qr *router.QueryRouter
-			console.RunSpinnerWhile("Bootstrapping ShardMaster 6-Pillar Showcase (50,000,000 Rows)...", func() {
+			console.RunSpinnerWhile("Bootstrapping ShardMaster 6-Pillar Showcase...", func() {
 				qr = bootstrapEngine(4, storage.DefaultInitialRows)
 			})
 			console.RunSixPillarShowcase(qr)
