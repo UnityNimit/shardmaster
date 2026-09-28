@@ -17,6 +17,7 @@ import (
 	"shardmaster/pkg/pgwire"
 	"shardmaster/pkg/router"
 	"shardmaster/pkg/storage"
+	"shardmaster/pkg/tui"
 )
 
 func TestVirtualBucketRingAndSplit(t *testing.T) {
@@ -892,6 +893,34 @@ func TestRealSeededRowsAndFullDiskPersistence(t *testing.T) {
 	}
 }
 
+func TestTUIDashboardLabelsAndLocalZones(t *testing.T) {
+	dir := directory.NewShardDirectory(4)
+	cluster := storage.NewClusterStorage(4, t.TempDir())
+	cluster.SeedCluster(10000, dir.GetBucketOwner)
+	cdcEngine := cdc.NewEngine(dir, cluster)
+	tracker := hotspot.NewTracker(dir, cluster, cdcEngine)
+	qr := router.NewQueryRouter(dir, cluster, cdcEngine, tracker)
+
+	_, err := cdcEngine.RebalanceToShards(8, 0)
+	if err != nil {
+		t.Fatalf("RebalanceToShards(8) failed: %v", err)
+	}
+
+	model := tui.NewDashboardModel(qr)
+	viewOut := model.View()
+
+	for _, forbidden := range []string{"50M Rows", "0.0M", "eu-central", "ap-south"} {
+		if strings.Contains(viewOut, forbidden) {
+			t.Fatalf("expected TUI View() to NOT contain fake string %q, got:\n%s", forbidden, viewOut)
+		}
+	}
+	for _, required := range []string{"10,000", "SHARD NAME", "LOCAL ZONE", "BUCKETS", "RAM USED / MAX", "ROWS", "QPS", "shard-0", "local-node-0", "128/1024", "SELECTED:"} {
+		if !strings.Contains(viewOut, required) {
+			t.Fatalf("expected TUI View() to contain %q, got:\n%s", required, viewOut)
+		}
+	}
+}
+
 func ShardRowCount(cs *storage.ClusterStorage, id uint32) int64 {
 	if s, ok := cs.GetShard(id); ok {
 		return s.RowCount()
@@ -911,6 +940,3 @@ func BenchmarkZeroAllocRouting(b *testing.B) {
 		}
 	})
 }
-
-
-

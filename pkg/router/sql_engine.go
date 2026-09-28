@@ -176,7 +176,7 @@ func (re *RelationalEngine) initializeSchemaAndSeed() {
 			name          VARCHAR(128)  NOT NULL DEFAULT '',
 			email         VARCHAR(255)  NOT NULL DEFAULT '',
 			tenant_id     VARCHAR(64)   NOT NULL DEFAULT 'tenant_core',
-			region        VARCHAR(32)   NOT NULL DEFAULT 'us-west',
+			region        VARCHAR(32)   NOT NULL DEFAULT 'local-node-0',
 			balance_cents BIGINT        NOT NULL DEFAULT 250000,
 			balance_usd   NUMERIC(12,2) NOT NULL DEFAULT 2500.00,
 			created_at    TIMESTAMPTZ   NOT NULL DEFAULT '2026-09-01 00:00:00',
@@ -196,7 +196,7 @@ func (re *RelationalEngine) initializeSchemaAndSeed() {
 			amount_cents  BIGINT        NOT NULL DEFAULT 19900,
 			amount_usd    NUMERIC(12,2) NOT NULL DEFAULT 199.00,
 			order_status  VARCHAR(32)   NOT NULL DEFAULT 'COMPLETED',
-			region        VARCHAR(32)   NOT NULL DEFAULT 'us-west',
+			region        VARCHAR(32)   NOT NULL DEFAULT 'local-node-0',
 			created_at    TIMESTAMPTZ   NOT NULL DEFAULT '2026-09-15 12:00:00',
 			FOREIGN KEY (user_id) REFERENCES users(user_id)
 		);`,
@@ -267,7 +267,7 @@ func (re *RelationalEngine) registerInitialRelationalSchemas() {
 			{"amount_cents", "BIGINT", "NOT NULL", "NONE", "19900", "Order Total in Cents"},
 			{"amount_usd", "NUMERIC(12,2)", "NOT NULL", "NONE", "199.00", "Order Total in USD"},
 			{"order_status", "VARCHAR(32)", "NOT NULL", "LOCAL INDEX", "'COMPLETED'", "COMPLETED | PENDING | REFUNDED"},
-			{"region", "VARCHAR(32)", "NOT NULL", "PARTITION KEY", "'us-west'", "Regional Placement"},
+			{"region", "VARCHAR(32)", "NOT NULL", "PARTITION KEY", "'local-node-0'", "Local Zone Placement"},
 			{"created_at", "TIMESTAMPTZ", "NOT NULL", "SORT KEY", "CURRENT_TIMESTAMP", "UTC Timestamp"},
 		},
 		Indexes: []IndexSchema{
@@ -409,7 +409,7 @@ func (re *RelationalEngine) seedInitialRelationalRows() {
 			orderID := int64(1001 + i)
 			b := hash.ComputeBucket(strconv.FormatInt(uid, 10))
 			shardID := re.dir.GetBucketOwner(b)
-			reg := "us-west"
+			reg := "local-node-0"
 			if sh, ok := re.cluster.GetShard(shardID); ok {
 				reg = sh.Region
 			}

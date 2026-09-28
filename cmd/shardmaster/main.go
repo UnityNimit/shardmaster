@@ -57,7 +57,7 @@ func printMasterHelpScreen() {
 	fmt.Printf("    %-44s %s\n", okStyle.Render(".\\shardmaster.exe scale-sim"), "Benchmark consistent-hashing shard split & movement")
 	fmt.Printf("    %-44s %s\n", warnStyle.Render(".\\shardmaster.exe lookup 42"), "O(1) xxHash64 & Virtual Bucket directory lookup")
 	fmt.Printf("    %-44s %s\n", warnStyle.Render(".\\shardmaster.exe query \"SELECT ...\""), "Execute point SQL or K-Way Merge scatter-gather SQL")
-	fmt.Printf("    %-44s %s\n", warnStyle.Render(".\\shardmaster.exe add-shard --region us-west"), "Add a new physical shard & stream buckets via CDC")
+	fmt.Printf("    %-44s %s\n", warnStyle.Render(".\\shardmaster.exe add-shard --region local-node-0"), "Add a new physical shard & stream buckets via CDC")
 	fmt.Printf("    %-44s %s\n", warnStyle.Render(".\\shardmaster.exe rebalance -t 8"), "Zero-downtime shard split (4 -> 8 shards) + VDiff")
 	fmt.Printf("    %-44s %s\n", warnStyle.Render(".\\shardmaster.exe vdiff"), "Run cryptographic 256-bit XOR-SHA256 parity audit")
 	fmt.Printf("    %-44s %s\n", warnStyle.Render(".\\shardmaster.exe serve"), "Start PGWire (:6000) for psql/DBeaver & HTTP (:8080)")
@@ -227,7 +227,7 @@ func main() {
 			console.PrintStaticDashboard(qr, false)
 		},
 	}
-	addShardCmd.Flags().StringVar(&addRegion, "region", "us-west", "Geographic region for the new shard")
+	addShardCmd.Flags().StringVar(&addRegion, "region", "local-node-0", "Local zone/partition for the new shard")
 
 	var targetNumShards uint32
 	rebalanceCmd := &cobra.Command{

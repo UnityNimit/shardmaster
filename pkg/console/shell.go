@@ -573,7 +573,7 @@ func runGuidedAcademy(qr *router.QueryRouter, reader *bufio.Reader) {
 	fmt.Println(cyanStyle.Render("\n  [Lesson 3/5] Pillars 3 & 4: Vitess CDC VReplication & Cryptographic VDiff"))
 	fmt.Println("   * Streams buckets via Keyset Backfill + CDC log and verifies XOR-SHA256.")
 	_ = promptDefault(reader, "Press Enter to add a 5th shard with 0ms downtime", "")
-	runAddShardAction(qr, "us-west")
+	runAddShardAction(qr, "local-node-0")
 
 	fmt.Println(cyanStyle.Render("\n  [Lesson 4/5] Pillar 5: Autonomous EWMA Hotspot Detection"))
 	fmt.Println("   * Detects when Bucket #412 exceeds 5x average QPS and isolates it.")
@@ -627,7 +627,7 @@ var sqlPresets = map[string]string{
 	"13": "SELECT * FROM users WHERE user_id = 42;",
 	"14": "SELECT * FROM users WHERE user_id IN (42, 100, 777, 8888, 9999);",
 	"15": "SELECT * FROM users WHERE email LIKE '%@gmail.com' ORDER BY created_at DESC LIMIT 5;",
-	"16": "SELECT * FROM users WHERE region = 'us-west' ORDER BY created_at DESC LIMIT 5;",
+	"16": "SELECT * FROM users WHERE region = 'local-node-0' ORDER BY created_at DESC LIMIT 5;",
 	"17": "SELECT region, COUNT(*), SUM(balance_usd), AVG(balance_usd) FROM users GROUP BY region;",
 	"18": "SELECT shard_id, COUNT(*), AVG(balance_usd) FROM users GROUP BY shard_id;",
 	"19": "INSERT INTO users (user_id, name, email, balance_cents) VALUES (42, 'Ada Lovelace', 'ada@gmail.com', 950000);",
@@ -648,7 +648,7 @@ func runInteractiveSQLMenu(qr *router.QueryRouter, reader *bufio.Reader) {
 	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[1] "), "SHOW TABLES (All 8 Tables/Views)", warnStyle.Render("[13]"), "Point Lookup (user_id = 42)")
 	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[2] "), "DESCRIBE users (Full Schema)", warnStyle.Render("[14]"), "Multi-Key IN (42, 100, 777..)")
 	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[3] "), "DESCRIBE orders (Co-Located)", warnStyle.Render("[15]"), "K-Way Merge (@gmail.com Top 5)")
-	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[4] "), "SHOW CREATE TABLE users (DDL)", warnStyle.Render("[16]"), "K-Way Merge (region = us-west)")
+	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[4] "), "SHOW CREATE TABLE users (DDL)", warnStyle.Render("[16]"), "K-Way Merge (zone = local-node-0)")
 	fmt.Printf("   %s %-31s %s %s\n", okStyle.Render("[5] "), "SHOW INDEXES (Global & Local)", warnStyle.Render("[17]"), "GROUP BY region (Map-Reduce)")
 	fmt.Println(dimStyle.Render("  ------------------------------------------------------------------------"))
 	fmt.Printf("   %-36s %s\n", cyanStyle.Render("CLUSTER TELEMETRY & PLANNER"), cyanStyle.Render("AGGREGATIONS & CDC MUTATIONS"))
@@ -1189,7 +1189,7 @@ func RunSixPillarShowcase(qr *router.QueryRouter) {
 	runLookupAction(qr, "42")
 	runSQLAction(qr, "DESCRIBE users;")
 	runSQLAction(qr, "SELECT * FROM users WHERE email LIKE '%@gmail.com' ORDER BY created_at DESC LIMIT 3;")
-	runAddShardAction(qr, "us-west")
+	runAddShardAction(qr, "local-node-0")
 	runHotspotAction(qr, 412)
 	runBenchAction(qr, 1)
 	runPetabyteAction(qr, 64, 80)

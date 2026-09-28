@@ -424,7 +424,7 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 				stateLabel = "CUTOVER_GATE"
 			}
 			var rangeRows int64
-			region := "us-west"
+			region := "local-node-0"
 			if sh, ok := qr.Cluster.GetShard(owner); ok {
 				region = sh.Region
 				_, rangeRows = sh.ComputeBucketRangeXORHash(sB, eB)
@@ -631,7 +631,7 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 			{"13", "POINT_QUERY_O1", "SELECT * FROM users WHERE user_id = 42;", "O(1) point lookup routed to single owning shard in ~18ns"},
 			{"14", "MULTI_POINT_IN", "SELECT * FROM users WHERE user_id IN (42, 100, 777, 8888, 9999);", "Batch multi-key routing across exact target shards"},
 			{"15", "K_WAY_MERGE", "SELECT * FROM users WHERE email LIKE '%@gmail.com' ORDER BY created_at DESC LIMIT 5;", "Parallel Scatter-Gather + Min-Heap K-Way Merge Sort"},
-			{"16", "K_WAY_MERGE", "SELECT * FROM users WHERE region = 'us-west' ORDER BY created_at DESC LIMIT 5;", "Region-pruned Scatter-Gather K-Way Merge Sort"},
+			{"16", "K_WAY_MERGE", "SELECT * FROM users WHERE region = 'local-node-0' ORDER BY created_at DESC LIMIT 5;", "Zone-pruned Scatter-Gather K-Way Merge Sort"},
 			{"17", "MAP_REDUCE_AGG", "SELECT region, COUNT(*), SUM(balance_usd), AVG(balance_usd) FROM users GROUP BY region;", "Distributed Map-Reduce GROUP BY region across all shards"},
 			{"18", "MAP_REDUCE_AGG", "SELECT shard_id, COUNT(*), AVG(balance_usd) FROM users GROUP BY shard_id;", "Distributed Map-Reduce GROUP BY physical shard"},
 			{"19", "CDC_MUTATION", "INSERT INTO users (user_id, name, email, balance_cents) VALUES (42, 'Ada Lovelace', 'ada@gmail.com', 950000);", "Point Upsert + append LSN entry to _shardmaster_cdc log"},

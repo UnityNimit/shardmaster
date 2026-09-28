@@ -293,7 +293,7 @@ func NewPhysicalShard(shardID uint32, region string) *PhysicalShard {
 	if region == "" {
 		region = defaultRegions[int(shardID)%len(defaultRegions)]
 	}
-	alias := fmt.Sprintf("%s-core-%d", region, shardID)
+	alias := fmt.Sprintf("shard-%d", shardID)
 	s := &PhysicalShard{
 		ShardID: shardID,
 		Name:    fmt.Sprintf("Shard %d :%d", shardID, port),
@@ -1422,7 +1422,7 @@ type ClusterStorage struct {
 	dataDir string
 }
 
-var defaultRegions = []string{"us-west", "us-east", "eu-central", "ap-south"}
+var defaultRegions = []string{"local-node-0", "local-node-1", "local-node-2", "local-node-3"}
 
 func NewClusterStorage(initialShards uint32, dataDir string) *ClusterStorage {
 	if dataDir == "" {
@@ -1719,8 +1719,16 @@ func (cs *ClusterStorage) LoadStateFile(setBucketOwner func(bucket uint16, shard
 		return false
 	}
 
-	// Ensure all persisted shards exist
+	// Ensure all persisted shards exist (and upgrade legacy auto-generated cloud region names to local PC defaults)
 	for _, sm := range state.Shards {
+		if strings.HasPrefix(sm.Settings.CustomAlias, "us-west-core-") ||
+			strings.HasPrefix(sm.Settings.CustomAlias, "us-east-core-") ||
+			strings.HasPrefix(sm.Settings.CustomAlias, "eu-central-core-") ||
+			strings.HasPrefix(sm.Settings.CustomAlias, "ap-south-core-") {
+			sm.Region = defaultRegions[int(sm.ShardID)%len(defaultRegions)]
+			sm.Settings.Region = sm.Region
+			sm.Settings.CustomAlias = fmt.Sprintf("shard-%d", sm.ShardID)
+		}
 		sh := cs.EnsureShard(sm.ShardID, sm.Region)
 		sh.UpdateSettings(sm.Settings)
 	}
