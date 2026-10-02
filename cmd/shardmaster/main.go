@@ -51,6 +51,7 @@ func printMasterHelpScreen() {
 	fmt.Println("")
 	fmt.Println(cyanStyle.Render("   DIRECT CLI SUBCOMMANDS (OPTIONAL):"))
 	fmt.Printf("    %-44s %s\n", okStyle.Render(".\\shardmaster.exe demo"), "Run complete 6-Pillar end-to-end live showcase")
+	fmt.Printf("    %-44s %s\n", okStyle.Render(".\\shardmaster.exe import <file.csv>"), "Universal CSV import with auto-schema & routing")
 	fmt.Printf("    %-44s %s\n", okStyle.Render(".\\shardmaster.exe status"), "Display cluster shard topology & CDC status table")
 	fmt.Printf("    %-44s %s\n", okStyle.Render(".\\shardmaster.exe tui"), "Launch live interactive 4-Tab Bubbletea Terminal UI")
 	fmt.Printf("    %-44s %s\n", okStyle.Render(".\\shardmaster.exe bench --duration 3"), "Run Multi-Million QPS routing & resharding benchmark")
@@ -353,6 +354,68 @@ func main() {
 		},
 	}
 
+	var importTable string
+	var importShardKey string
+	var importDelim string
+	importCmd := &cobra.Command{
+		Use:   "import <file.csv> [target_table]",
+		Short: "Import arbitrary CSV/TSV data into the distributed cluster with automatic schema inference",
+		Args:  cobra.MinimumNArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			filePath := args[0]
+			targetTbl := importTable
+			if len(args) > 1 && args[1] != "" {
+				targetTbl = args[1]
+			}
+			var delim rune
+			if importDelim != "" {
+				delim = rune(importDelim[0])
+			}
+
+			var qr *router.QueryRouter
+			console.RunSpinnerWhile("Bootstrapping ShardMaster Cluster Storage...", func() {
+				qr = bootstrapEngine(4, storage.DefaultInitialRows)
+			})
+
+			opts := router.CSVOptions{
+				Delimiter:   delim,
+				HasHeader:   true,
+				TargetTable: targetTbl,
+				ShardKey:    importShardKey,
+			}
+
+			console.RenderSectionHeader(fmt.Sprintf("UNIVERSAL CSV IMPORT: '%s'", filePath))
+			var res *router.CSVImportResult
+			var impErr error
+			console.RunSpinnerWhile("Streaming & Sharding CSV into 1,024 Virtual Buckets...", func() {
+				res, impErr = qr.ImportCSVFile(filePath, targetTbl, importShardKey, opts)
+			})
+			if impErr != nil {
+				fmt.Printf("\n   %s %v\n\n", hotStyle.Render("IMPORT FAILED:"), impErr)
+				os.Exit(1)
+			}
+
+			throughput := float64(res.RowsImported) / max(0.001, float64(res.ElapsedMs)/1000.0)
+			console.RenderProfessionalTable(
+				[]string{"METRIC / PARAMETER", "VALUE", "DETAILS"},
+				[][]string{
+					{"Target Table", res.TableName, "Registered in distributed catalog & SQLite mirror"},
+					{"Rows Ingested", console.FormatCommas(uint64(res.RowsImported)), fmt.Sprintf("Throughput: %.0f rows/sec", throughput)},
+					{"Detected Columns", strconv.Itoa(len(res.Columns)), strings.Join(res.Columns, ", ")},
+					{"Primary Shard Key", res.ShardKey, "xxHash64 & 1023 virtual bucket routing key"},
+					{"Physical Shards Spanned", strconv.Itoa(res.ShardsSpanned), "Balanced distribution across active storage slabs"},
+					{"Data Volume Processed", storage.FormatBytesExact(res.BytesRead), "Zero-copy streaming pipeline"},
+					{"Execution Latency", fmt.Sprintf("%d ms", res.ElapsedMs), "Direct columnar slab upsert + WAL flush"},
+				},
+			)
+			fmt.Printf("\n   %s Query your table immediately with:\n", okStyle.Render("SUCCESS:"))
+			fmt.Printf("   %s\n\n", cyanStyle.Render(fmt.Sprintf(".\\shardmaster.exe query \"SELECT * FROM %s LIMIT 10;\"", res.TableName)))
+		},
+	}
+	importCmd.Flags().StringVarP(&importTable, "table", "t", "", "Target table name (auto-inferred from filename if omitted)")
+	importCmd.Flags().StringVarP(&importShardKey, "shard-key", "k", "", "Primary column to use as shard key (auto-detected if omitted)")
+	importCmd.Flags().StringVarP(&importDelim, "delimiter", "d", "", "CSV delimiter character (auto-detected: comma, tab, semicolon, pipe)")
+
 	demoCmd := &cobra.Command{
 		Use:   "demo",
 		Short: "Run the complete 6-Pillar End-to-End Automated Showcase in one command",
@@ -377,6 +440,7 @@ func main() {
 		scaleSimCmd,
 		vdiffCmd,
 		demoCmd,
+		importCmd,
 	)
 
 	if err := rootCmd.Execute(); err != nil {

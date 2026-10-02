@@ -503,6 +503,19 @@ func RunInteractiveShell(qr *router.QueryRouter) {
 				okStyle.Render("[OK]"), FormatCommas(uint64(seedCount)))
 			PrintStaticDashboard(qr, false)
 
+		case "import", "csv":
+			filePath := ""
+			targetTable := ""
+			if len(args) > 0 {
+				filePath = args[0]
+			} else {
+				filePath = promptDefault(reader, "Path to CSV file to import", "data.csv")
+			}
+			if len(args) > 1 {
+				targetTable = args[1]
+			}
+			runImportCSVAction(qr, filePath, targetTable)
+
 		case "clear", "cls":
 			fmt.Print("\033[H\033[2J")
 			AnimateBanner(qr, pgwireOnline)
@@ -705,6 +718,38 @@ func runSQLAction(qr *router.QueryRouter, sql string) {
 		return
 	}
 	RenderSQLResult(sql, res)
+}
+
+func runImportCSVAction(qr *router.QueryRouter, filePath, targetTable string) {
+	opts := router.CSVOptions{
+		HasHeader:   true,
+		TargetTable: targetTable,
+	}
+	var res *router.CSVImportResult
+	var err error
+	RunSpinnerWhile(fmt.Sprintf("Importing CSV '%s' into Distributed Cluster...", filePath), func() {
+		res, err = qr.ImportCSVFile(filePath, targetTable, "", opts)
+	})
+	if err != nil {
+		fmt.Printf("  %s CSV Import Failed: %v\n", hotStyle.Render("[ERROR]"), err)
+		return
+	}
+	RenderSectionHeader(fmt.Sprintf("UNIVERSAL CSV IMPORT COMPLETED: '%s' -> %s", filePath, res.TableName))
+	throughput := float64(res.RowsImported) / max(0.001, float64(res.ElapsedMs)/1000.0)
+	RenderProfessionalTable(
+		[]string{"METRIC / PARAMETER", "VALUE", "DETAILS"},
+		[][]string{
+			{"Target Table", res.TableName, "Registered in distributed catalog & SQLite mirror"},
+			{"Rows Ingested", FormatCommas(uint64(res.RowsImported)), fmt.Sprintf("Throughput: %.0f rows/sec", throughput)},
+			{"Detected Columns", strconv.Itoa(len(res.Columns)), strings.Join(res.Columns, ", ")},
+			{"Primary Shard Key", res.ShardKey, "xxHash64 & 1023 virtual bucket routing key"},
+			{"Physical Shards Spanned", strconv.Itoa(res.ShardsSpanned), "Balanced distribution across active storage slabs"},
+			{"Data Volume Processed", storage.FormatBytesExact(res.BytesRead), "Zero-copy streaming pipeline"},
+			{"Execution Latency", fmt.Sprintf("%d ms", res.ElapsedMs), "Direct columnar slab upsert + WAL flush"},
+		},
+	)
+	fmt.Printf("\n   %s Query your table immediately with:\n", okStyle.Render("SUCCESS:"))
+	fmt.Printf("   %s\n\n", cyanStyle.Render(fmt.Sprintf("SELECT * FROM %s LIMIT 10;", res.TableName)))
 }
 
 func runShardCustomizerMenu(qr *router.QueryRouter, reader *bufio.Reader) {

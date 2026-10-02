@@ -362,6 +362,62 @@ DELETE FROM users WHERE user_id = 100;
 SELECT * FROM _shardmaster_cdc LIMIT 6;
 ```
 
+### Universal CSV/TSV Import, Export & Streaming Data Engine
+
+ShardMaster features a production-grade universal CSV/TSV import and export engine (`pkg/router/csv_engine.go`):
+
+1. **Auto-Inferred Schema & Delimiter Detection**:
+   - Automatically detects delimiters: comma (`,`), tab (`\t`), semicolon (`;`), and pipe (`|`).
+   - Dynamically scans data rows to infer column types: `BIGINT`, `NUMERIC(12,2)`, `TIMESTAMPTZ`, `BOOLEAN`, and `TEXT`.
+   - Automatically detects optimal primary shard keys (`user_id`, `id`, `uuid`, `<table_name>_id`, `key`).
+   - Automatically provisions distributed tables with 1,024 Virtual Buckets in `SchemaCatalog` and the relational engine if the table does not exist.
+2. **Direct CLI Import**:
+   ```bash
+   .\shardmaster.exe import employees.csv
+   .\shardmaster.exe import orders.tsv custom_orders --delimiter "\t"
+   ```
+3. **Interactive Shell Import**:
+   ```sql
+   shardmaster [4-shards] > import customers.csv
+   ```
+4. **PostgreSQL Standard SQL `COPY` and `IMPORT CSV`**:
+   ```sql
+   -- Import from CSV file on disk:
+   COPY customers FROM 'C:/data/customers.csv' WITH (FORMAT CSV, HEADER);
+   IMPORT CSV 'C:/data/orders.csv' INTO orders SHARD BY order_id DELIMITER ',';
+
+   -- Export distributed table or query result to CSV file:
+   COPY customers TO 'C:/exports/customers.csv' WITH (FORMAT CSV, HEADER);
+   COPY (SELECT region, COUNT(*), AVG(balance_usd) FROM users GROUP BY region) TO 'C:/exports/regional_summary.csv';
+   ```
+5. **Streaming `COPY ... FROM STDIN` & `COPY ... TO STDOUT` (psql `\copy` and DBeaver Import Wizard)**:
+   - Full support for PostgreSQL streaming copy protocol (`CopyInResponse`, `CopyData`, `CopyDone`, `CopyOutResponse`).
+
+---
+
+### External SQL Editor & Tooling Compatibility (DBeaver, DataGrip, pgAdmin, VS Code, psql, JDBC)
+
+ShardMaster works out-of-the-box as a drop-in PostgreSQL server with any external database management tool or programming language:
+
+| Tool / Driver | Compatibility Level | Supported Features |
+| :--- | :--- | :--- |
+| **DBeaver** | **100% Native** | Full schema navigation, table introspections (`pg_catalog.pg_tables`), Data Editor, CSV Import Wizard (`COPY ... FROM STDIN`), SQL console |
+| **DataGrip / IntelliJ** | **100% Native** | Database Explorer tree, `information_schema.tables`, syntax inspection, prepared statements, multi-statement queries |
+| **pgAdmin 4** | **100% Native** | Object Browser, server dashboard, SQL query tool, schema/view inspection |
+| **VS Code PostgreSQL** | **100% Native** | Connection explorer, query runner, auto-complete against catalog |
+| **psql CLI** | **100% Native** | Meta-commands (`\dt`, `\d`, `\di`, `\dn`, `\l`), `\copy` file streaming, interactive query prompt |
+| **JDBC / Python psycopg2 / Go pgx** | **100% Native** | Extended Query Protocol (`Parse`, `Describe`, `Bind`, `Execute`, `Sync`), parameter substitution (`$1, $2, ...`), connection pooling |
+
+#### Connection Parameters:
+- **Host**: `localhost` (or `127.0.0.1`)
+- **Port**: `6000`
+- **Database**: `shardmaster` (or `postgres`)
+- **Username**: `shardmaster_admin` (or any username)
+- **Password**: *(any password / blank)*
+- **SSL Mode**: `disable` (or `allow`)
+
+---
+
 ### Real-Data Capacity Quotas, Exact Indexing & Local Persistence
 
 1. **100% Real Hashed Row Storage (`SeededUIDs` + `SlabBalances`)**: Every seeded user row (`1..N`) is individually hashed via `xxHash64` into its exact virtual bucket (`0..1023`), stored 1-to-1 in sorted `SeededUIDs []int64` and `SlabBalances []uint32`, and looked up via $O(\log N)$ binary search (`findSeededSlot`)—with zero collisions and zero synthetic row fabrication.

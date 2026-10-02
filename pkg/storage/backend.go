@@ -1883,3 +1883,21 @@ func (s *PhysicalShard) GetCustomTableTotalBytesAndRows(tableName string) (int64
 	return totalBytes, totalRows
 }
 
+// GetAllCustomRows returns all custom table rows currently residing on this physical shard across all 1,024 buckets.
+func (s *PhysicalShard) GetAllCustomRows() []CustomRow {
+	var out []CustomRow
+	for b := uint16(0); b < hash.TotalVirtualBuckets; b++ {
+		s.bucketMu[b].RLock()
+		slab := s.buckets[b]
+		if slab.CustomTables != nil {
+			for _, tblMap := range slab.CustomTables {
+				for _, r := range tblMap {
+					out = append(out, r)
+				}
+			}
+		}
+		s.bucketMu[b].RUnlock()
+	}
+	return out
+}
+

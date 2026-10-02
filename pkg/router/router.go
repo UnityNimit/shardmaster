@@ -161,11 +161,205 @@ func (qr *QueryRouter) executeSingleSQL(sql string) (*ResultSet, error) {
 			Title:         "SYSTEM CATALOG INTROSPECTION",
 			Columns:       []string{"version", "protocol", "virtual_buckets"},
 			ColumnTypes:   []string{"TEXT", "VARCHAR(16)", "INT4"},
-			Rows:          [][]string{{"PostgreSQL 15.0 (ShardMaster Distributed SQL Engine)", "PGWire v3.0", "1024"}},
+			Rows:          [][]string{{"PostgreSQL 15.0 (ShardMaster Distributed SQL Engine Pure-Go v1.0.0)", "PGWire v3.0", "1024"}},
 			CommandTag:    "SELECT 1",
 			LatencyUs:     time.Since(start).Microseconds(),
 			RoutedShard:   "CONTROL_PLANE",
 			ExecutionPlan: "Control-Plane System Catalog Handshake (0 Shard Hops)",
+		}, nil
+
+	case QuerySessionControl:
+		upper := strings.ToUpper(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(sql), ";")))
+		if strings.HasPrefix(upper, "SET ") {
+			return &ResultSet{
+				CommandTag:  "SET",
+				LatencyUs:   time.Since(start).Microseconds(),
+				RoutedShard: "SESSION",
+			}, nil
+		}
+		if strings.HasPrefix(upper, "RESET ") {
+			return &ResultSet{
+				CommandTag:  "RESET",
+				LatencyUs:   time.Since(start).Microseconds(),
+				RoutedShard: "SESSION",
+			}, nil
+		}
+		if strings.HasPrefix(upper, "DISCARD ") {
+			return &ResultSet{
+				CommandTag:  "DISCARD",
+				LatencyUs:   time.Since(start).Microseconds(),
+				RoutedShard: "SESSION",
+			}, nil
+		}
+		if strings.HasPrefix(upper, "SHOW ") {
+			varName := strings.TrimSpace(upper[5:])
+			cleanVar := strings.ToLower(strings.Trim(varName, "\"'`; "))
+			varVal := "on"
+			switch cleanVar {
+			case "search_path":
+				varVal = `"$user", public`
+			case "transaction isolation level", "transaction_isolation":
+				varVal = "read committed"
+			case "standard_conforming_strings":
+				varVal = "on"
+			case "client_encoding":
+				varVal = "UTF8"
+			case "server_encoding":
+				varVal = "UTF8"
+			case "server_version":
+				varVal = "15.0 (ShardMaster Distributed SQL Engine Pure-Go v1.0.0)"
+			case "datestyle":
+				varVal = "ISO, MDY"
+			case "timezone":
+				varVal = "UTC"
+			case "integer_datetimes":
+				varVal = "on"
+			case "extra_float_digits":
+				varVal = "3"
+			case "max_connections":
+				varVal = "1000"
+			case "all":
+				return &ResultSet{
+					Title:       "SESSION RUNTIME PARAMETERS (SHOW ALL)",
+					Columns:     []string{"name", "setting", "description"},
+					ColumnTypes: []string{"VARCHAR(32)", "VARCHAR(64)", "TEXT"},
+					Rows: [][]string{
+						{"client_encoding", "UTF8", "Sets the client's character set encoding"},
+						{"DateStyle", "ISO, MDY", "Sets the display format for date and time values"},
+						{"extra_float_digits", "3", "Sets the number of digits displayed for floating-point values"},
+						{"integer_datetimes", "on", "Reports whether datetimes are 64-bit integers"},
+						{"max_connections", "1000", "Sets the maximum number of concurrent connections"},
+						{"search_path", `"$user", public`, "Sets the schema search order for names that are not schema-qualified"},
+						{"server_encoding", "UTF8", "Sets the server (database) character set encoding"},
+						{"server_version", "15.0 (ShardMaster Distributed SQL Engine Pure-Go)", "Shows the server version"},
+						{"standard_conforming_strings", "on", "Causes '...' to treat backslashes literally in strings"},
+						{"TimeZone", "UTC", "Sets the time zone for displaying and interpreting time stamps"},
+						{"transaction_isolation", "read committed", "Sets the current transaction isolation level"},
+					},
+					CommandTag:  "SHOW",
+					LatencyUs:   time.Since(start).Microseconds(),
+					RoutedShard: "SESSION",
+				}, nil
+			}
+			return &ResultSet{
+				Title:       fmt.Sprintf("SESSION PARAMETER: %s", cleanVar),
+				Columns:     []string{cleanVar},
+				ColumnTypes: []string{"VARCHAR"},
+				Rows:        [][]string{{varVal}},
+				CommandTag:  "SHOW",
+				LatencyUs:   time.Since(start).Microseconds(),
+				RoutedShard: "SESSION",
+			}, nil
+		}
+		return &ResultSet{
+			CommandTag:  "OK",
+			LatencyUs:   time.Since(start).Microseconds(),
+			RoutedShard: "SESSION",
+		}, nil
+
+	case QueryImportCSV:
+		opts := CSVOptions{
+			Delimiter:   cq.CSVDelimiter,
+			HasHeader:   cq.CSVHasHeader,
+			TargetTable: cq.TableName,
+			ShardKey:    cq.ShardKeyCol,
+		}
+		res, err := qr.ImportCSVFile(cq.FilePath, cq.TableName, cq.ShardKeyCol, opts)
+		if err != nil {
+			return nil, err
+		}
+		return &ResultSet{
+			Title:       fmt.Sprintf("UNIVERSAL CSV IMPORT: '%s' -> %s", cq.FilePath, res.TableName),
+			Columns:     []string{"table_name", "rows_imported", "columns", "shard_key", "shards_spanned", "bytes_processed", "latency_ms"},
+			ColumnTypes: []string{"VARCHAR", "INT8", "INT4", "VARCHAR", "INT4", "VARCHAR", "INT8"},
+			Rows: [][]string{{
+				res.TableName,
+				strconv.FormatInt(res.RowsImported, 10),
+				strconv.Itoa(len(res.Columns)),
+				res.ShardKey,
+				strconv.Itoa(res.ShardsSpanned),
+				storage.FormatBytesCompact(res.BytesRead),
+				strconv.FormatInt(res.ElapsedMs, 10),
+			}},
+			CommandTag:    fmt.Sprintf("COPY %d", res.RowsImported),
+			LatencyUs:     time.Since(start).Microseconds(),
+			RoutedShard:   fmt.Sprintf("ALL_SHARDS (%d Shards)", res.ShardsSpanned),
+			ExecutionPlan: fmt.Sprintf("Streaming CSV Reader -> 1,024 Virtual Buckets via xxHash64(%s) -> Direct Columnar Slab Placement + SQLite Mirror", res.ShardKey),
+			FooterNotes: []string{
+				fmt.Sprintf("Successfully imported %d rows into distributed table '%s' (shard key: %s, %d columns detected).", res.RowsImported, res.TableName, res.ShardKey, len(res.Columns)),
+				"Data is immediately queryable via SQL SELECT, JOIN, AGGREGATE, and point lookups across all external tools.",
+			},
+		}, nil
+
+	case QueryCopy:
+		if cq.IsFrom {
+			if cq.IsStdin {
+				return nil, errors.New("COPY FROM STDIN must be executed over PGWire streaming connection or interactive shell import")
+			}
+			opts := CSVOptions{
+				Delimiter:   cq.CSVDelimiter,
+				HasHeader:   cq.CSVHasHeader,
+				TargetTable: cq.TableName,
+				ShardKey:    cq.ShardKeyCol,
+			}
+			res, err := qr.ImportCSVFile(cq.FilePath, cq.TableName, cq.ShardKeyCol, opts)
+			if err != nil {
+				return nil, err
+			}
+			return &ResultSet{
+				Title:       fmt.Sprintf("POSTGRESQL COPY FROM: '%s' -> %s", cq.FilePath, res.TableName),
+				Columns:     []string{"table_name", "rows_imported", "columns", "shard_key", "shards_spanned", "bytes_processed", "latency_ms"},
+				ColumnTypes: []string{"VARCHAR", "INT8", "INT4", "VARCHAR", "INT4", "VARCHAR", "INT8"},
+				Rows: [][]string{{
+					res.TableName,
+					strconv.FormatInt(res.RowsImported, 10),
+					strconv.Itoa(len(res.Columns)),
+					res.ShardKey,
+					strconv.Itoa(res.ShardsSpanned),
+					storage.FormatBytesCompact(res.BytesRead),
+					strconv.FormatInt(res.ElapsedMs, 10),
+				}},
+				CommandTag:    fmt.Sprintf("COPY %d", res.RowsImported),
+				LatencyUs:     time.Since(start).Microseconds(),
+				RoutedShard:   fmt.Sprintf("ALL_SHARDS (%d Shards)", res.ShardsSpanned),
+				ExecutionPlan: fmt.Sprintf("Streaming CSV Reader -> 1,024 Virtual Buckets via xxHash64(%s) -> Direct Columnar Slab Placement + SQLite Mirror", res.ShardKey),
+				FooterNotes: []string{
+					fmt.Sprintf("Successfully imported %d rows into distributed table '%s'.", res.RowsImported, res.TableName),
+				},
+			}, nil
+		}
+
+		if cq.IsStdout {
+			return nil, errors.New("COPY TO STDOUT must be executed over PGWire streaming connection")
+		}
+		opts := CSVOptions{
+			Delimiter:   cq.CSVDelimiter,
+			HasHeader:   cq.CSVHasHeader,
+			TargetTable: cq.TableName,
+		}
+		res, err := qr.ExportCSVFile(cq.TableName, cq.FilePath, opts)
+		if err != nil {
+			return nil, err
+		}
+		return &ResultSet{
+			Title:       fmt.Sprintf("POSTGRESQL COPY TO: %s -> '%s'", cq.TableName, res.FilePath),
+			Columns:     []string{"source", "file_path", "rows_exported", "columns", "bytes_written", "latency_ms"},
+			ColumnTypes: []string{"VARCHAR", "VARCHAR", "INT8", "INT4", "VARCHAR", "INT8"},
+			Rows: [][]string{{
+				cq.TableName,
+				res.FilePath,
+				strconv.FormatInt(res.RowsExported, 10),
+				strconv.Itoa(len(res.Columns)),
+				storage.FormatBytesCompact(res.BytesWritten),
+				strconv.FormatInt(res.ElapsedMs, 10),
+			}},
+			CommandTag:    fmt.Sprintf("COPY %d", res.RowsExported),
+			LatencyUs:     time.Since(start).Microseconds(),
+			RoutedShard:   "CONTROL_PLANE",
+			ExecutionPlan: fmt.Sprintf("Table/Query Export -> Streaming CSV Writer -> '%s'", res.FilePath),
+			FooterNotes: []string{
+				fmt.Sprintf("Successfully exported %d rows to CSV file '%s'.", res.RowsExported, res.FilePath),
+			},
 		}, nil
 
 	case QueryShowSchemas:

@@ -36,28 +36,40 @@ const (
 	QueryAdminVDiff
 	QueryFullRelationalSQL
 	QuerySystemCatalog
+	QueryCopy
+	QueryImportCSV
+	QuerySessionControl
 )
 
 type ClassifiedQuery struct {
-	Kind           QueryKind
-	RawSQL         string
-	TableName      string
-	ProjectedCols  []string
-	HasShardKey    bool
-	UserID         int64
-	UserIDs        []int64
-	UserKey        string
-	Name           string
-	Email          string
-	TenantFilter   string
-	RegionFilter   string
-	BalanceCents   int64
-	HasBalanceUpd  bool
-	GroupByCol     string
-	OrderByCol     string
-	OrderAsc       bool
-	Limit          int
-	TargetShards   uint32
+	Kind          QueryKind
+	RawSQL        string
+	TableName     string
+	ProjectedCols []string
+	HasShardKey   bool
+	UserID        int64
+	UserIDs       []int64
+	UserKey       string
+	Name          string
+	Email         string
+	TenantFilter  string
+	RegionFilter  string
+	BalanceCents  int64
+	HasBalanceUpd bool
+	GroupByCol    string
+	OrderByCol    string
+	OrderAsc      bool
+	Limit         int
+	TargetShards  uint32
+
+	// CSV Import & Export fields
+	FilePath     string
+	IsFrom       bool
+	IsStdin      bool
+	IsStdout     bool
+	CSVDelimiter rune
+	CSVHasHeader bool
+	ShardKeyCol  string
 }
 
 // ClassifySQL parses a SQL statement with fast zero-regex string scanning,
@@ -93,12 +105,16 @@ func ClassifySQL(sql string) ClassifiedQuery {
 		}
 	}
 
-	// 2. psql startup / system catalog introspection queries
+	// 2. Client session configuration (SET, RESET, DISCARD)
 	if strings.HasPrefix(upper, "SET ") ||
-		strings.HasPrefix(upper, "SELECT PG_CATALOG") ||
+		strings.HasPrefix(upper, "RESET ") ||
+		strings.HasPrefix(upper, "DISCARD ") {
+		return ClassifiedQuery{Kind: QuerySessionControl, RawSQL: trimmed}
+	}
+	if strings.HasPrefix(upper, "SELECT PG_CATALOG") ||
 		strings.HasPrefix(upper, "SELECT VERSION()") ||
 		strings.HasPrefix(upper, "SELECT CURRENT_") {
-		return ClassifiedQuery{Kind: QuerySystemCatalog, RawSQL: trimmed}
+		return ClassifiedQuery{Kind: QueryFullRelationalSQL, RawSQL: trimmed}
 	}
 	if strings.HasPrefix(upper, "BEGIN") ||
 		strings.HasPrefix(upper, "START TRANSACTION") ||
@@ -193,6 +209,9 @@ func ClassifySQL(sql string) ClassifiedQuery {
 	if strings.HasPrefix(upper, "SHOW QUERIES") || strings.HasPrefix(upper, "SHOW HELP") || strings.HasPrefix(upper, "SHOW COMMANDS") {
 		return ClassifiedQuery{Kind: QueryAdminShowQueries, RawSQL: trimmed}
 	}
+	if strings.HasPrefix(upper, "SHOW ") {
+		return ClassifiedQuery{Kind: QuerySessionControl, RawSQL: trimmed}
+	}
 	if strings.HasPrefix(upper, "EXPLAIN SHARD") {
 		uid, ukey, ok := extractUserIDClause(trimmed)
 		if !ok {
@@ -230,7 +249,15 @@ func ClassifySQL(sql string) ClassifiedQuery {
 		return ClassifiedQuery{Kind: QueryAdminVDiff, RawSQL: trimmed}
 	}
 
-	// 4b. Route any general / complex relational SQL (JOINs, CTEs, Window Functions, Subqueries,
+	// 4c. Data Import & Export (PostgreSQL COPY and IMPORT CSV)
+	if strings.HasPrefix(upper, "COPY ") {
+		return parseCopyClause(trimmed, upper)
+	}
+	if strings.HasPrefix(upper, "IMPORT CSV") || strings.HasPrefix(upper, "IMPORT ") {
+		return parseImportCSVClause(trimmed, upper)
+	}
+
+	// 4d. Route any general / complex relational SQL (JOINs, CTEs, Window Functions, Subqueries,
 	// Views, Indexes, ALTER TABLE, custom tables, functions, or complex predicates) to the 100% Full SQL Engine
 	if shouldUseFullRelationalEngine(trimmed, upper) {
 		return ClassifiedQuery{Kind: QueryFullRelationalSQL, RawSQL: trimmed}
@@ -882,6 +909,178 @@ func SplitSQLStatements(rawSQL string) []string {
 		stmts = append(stmts, rem)
 	}
 	return stmts
+}
+
+func parseCopyClause(trimmed, upper string) ClassifiedQuery {
+	cq := ClassifiedQuery{
+		Kind:         QueryCopy,
+		RawSQL:       trimmed,
+		CSVHasHeader: true,
+		CSVDelimiter: ',',
+	}
+
+	// Check COPY (SELECT ...) TO '<path>'
+	if strings.HasPrefix(upper, "COPY (") {
+		closeParen := strings.LastIndexByte(trimmed, ')')
+		if closeParen != -1 {
+			cq.ProjectedCols = []string{strings.TrimSpace(trimmed[6:closeParen])}
+			tail := strings.TrimSpace(trimmed[closeParen+1:])
+			upperTail := strings.ToUpper(tail)
+			if strings.HasPrefix(upperTail, "TO ") {
+				cq.IsFrom = false
+				rem := strings.TrimSpace(tail[3:])
+				cq.FilePath, cq.IsStdout, cq.CSVDelimiter, cq.CSVHasHeader = extractCopyTargetAndOptions(rem)
+			}
+			return cq
+		}
+	}
+
+	// COPY <table> [(cols)] FROM|TO <path|STDIN|STDOUT> [WITH (...)]
+	body := strings.TrimSpace(trimmed[4:])
+	fields := strings.Fields(body)
+	if len(fields) == 0 {
+		return cq
+	}
+
+	rawTbl := fields[0]
+	if paren := strings.IndexByte(rawTbl, '('); paren != -1 {
+		rawTbl = rawTbl[:paren]
+	}
+	cq.TableName = cleanTableIdentifier(rawTbl)
+
+	// Check if there are explicit columns in parentheses
+	if parenStart := strings.IndexByte(body, '('); parenStart != -1 {
+		if parenEnd := strings.IndexByte(body[parenStart:], ')'); parenEnd != -1 {
+			colStr := body[parenStart+1 : parenStart+parenEnd]
+			for _, c := range strings.Split(colStr, ",") {
+				if cleanC := strings.TrimSpace(c); cleanC != "" {
+					cq.ProjectedCols = append(cq.ProjectedCols, sanitizeColumnIdentifier(cleanC, 0))
+				}
+			}
+		}
+	}
+
+	upperBody := strings.ToUpper(body)
+	fromIdx := strings.Index(upperBody, " FROM ")
+	toIdx := strings.Index(upperBody, " TO ")
+
+	if fromIdx != -1 && (toIdx == -1 || fromIdx < toIdx) {
+		cq.IsFrom = true
+		tail := strings.TrimSpace(body[fromIdx+6:])
+		cq.FilePath, cq.IsStdin, cq.CSVDelimiter, cq.CSVHasHeader = extractCopyTargetAndOptions(tail)
+	} else if toIdx != -1 {
+		cq.IsFrom = false
+		tail := strings.TrimSpace(body[toIdx+4:])
+		cq.FilePath, cq.IsStdout, cq.CSVDelimiter, cq.CSVHasHeader = extractCopyTargetAndOptions(tail)
+	}
+
+	return cq
+}
+
+func extractCopyTargetAndOptions(tail string) (path string, isStd bool, delimiter rune, hasHeader bool) {
+	hasHeader = true
+	delimiter = ','
+
+	// Check for WITH (...) options
+	upperTail := strings.ToUpper(tail)
+	targetPart := tail
+	if withIdx := strings.Index(upperTail, " WITH "); withIdx != -1 {
+		targetPart = strings.TrimSpace(tail[:withIdx])
+		optsPart := strings.TrimSpace(tail[withIdx+6:])
+		optsPart = strings.Trim(optsPart, "()")
+		upperOpts := strings.ToUpper(optsPart)
+
+		if strings.Contains(upperOpts, "HEADER FALSE") || strings.Contains(upperOpts, "HEADER 0") {
+			hasHeader = false
+		} else if strings.Contains(upperOpts, "HEADER") {
+			hasHeader = true
+		}
+
+		if dIdx := strings.Index(upperOpts, "DELIMITER"); dIdx != -1 {
+			rem := strings.TrimSpace(optsPart[dIdx+9:])
+			rem = strings.Trim(rem, "= ")
+			if len(rem) > 0 {
+				remClean := strings.Trim(rem, "'\" ")
+				if len(remClean) > 0 {
+					delimiter = rune(remClean[0])
+				}
+			}
+		}
+	}
+
+	targetClean := strings.TrimSpace(targetPart)
+	upperTarget := strings.ToUpper(targetClean)
+	if upperTarget == "STDIN" {
+		isStd = true
+		path = "stdin"
+	} else if upperTarget == "STDOUT" {
+		isStd = true
+		path = "stdout"
+	} else {
+		path = strings.Trim(targetClean, "'\"` ")
+	}
+
+	return path, isStd, delimiter, hasHeader
+}
+
+func parseImportCSVClause(trimmed, upper string) ClassifiedQuery {
+	cq := ClassifiedQuery{
+		Kind:         QueryImportCSV,
+		RawSQL:       trimmed,
+		CSVHasHeader: true,
+		CSVDelimiter: ',',
+	}
+
+	body := trimmed
+	if strings.HasPrefix(upper, "IMPORT CSV") {
+		body = strings.TrimSpace(trimmed[10:])
+	} else if strings.HasPrefix(upper, "IMPORT") {
+		body = strings.TrimSpace(trimmed[6:])
+	}
+
+	// Syntax: '<path>' [INTO <table>] [SHARD BY <col>] [DELIMITER '<char>']
+	fields := strings.Fields(body)
+	if len(fields) == 0 {
+		return cq
+	}
+
+	// First argument is file path (may be quoted)
+	rawPath := fields[0]
+	if strings.HasPrefix(rawPath, "'") || strings.HasPrefix(rawPath, "\"") {
+		qChar := rawPath[0]
+		if endIdx := strings.IndexByte(body[1:], qChar); endIdx != -1 {
+			rawPath = body[1 : endIdx+1]
+			body = strings.TrimSpace(body[endIdx+2:])
+		}
+	}
+	cq.FilePath = strings.Trim(rawPath, "'\"` ")
+
+	upperBody := strings.ToUpper(body)
+	if intoIdx := strings.Index(upperBody, "INTO "); intoIdx != -1 {
+		rem := strings.TrimSpace(body[intoIdx+5:])
+		tblFields := strings.Fields(rem)
+		if len(tblFields) > 0 {
+			cq.TableName = cleanTableIdentifier(tblFields[0])
+		}
+	}
+
+	if shardIdx := strings.Index(upperBody, "SHARD BY "); shardIdx != -1 {
+		rem := strings.TrimSpace(body[shardIdx+9:])
+		sFields := strings.Fields(rem)
+		if len(sFields) > 0 {
+			cq.ShardKeyCol = sanitizeColumnIdentifier(sFields[0], 0)
+		}
+	}
+
+	if delimIdx := strings.Index(upperBody, "DELIMITER "); delimIdx != -1 {
+		rem := strings.TrimSpace(body[delimIdx+10:])
+		remClean := strings.Trim(rem, "'\"= ")
+		if len(remClean) > 0 {
+			cq.CSVDelimiter = rune(remClean[0])
+		}
+	}
+
+	return cq
 }
 
 

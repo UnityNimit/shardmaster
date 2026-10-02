@@ -718,7 +718,7 @@ func startsLikeSQL(input string) bool {
 	case "SELECT", "WITH", "INSERT", "REPLACE", "UPDATE", "DELETE", "TRUNCATE",
 		"CREATE", "ALTER", "DROP", "SHOW", "DESCRIBE", "DESC", "EXPLAIN",
 		"PRAGMA", "VALUES", "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE",
-		"REBALANCE", "RUN", "ANALYZE", "VACUUM":
+		"REBALANCE", "RUN", "ANALYZE", "VACUUM", "COPY", "IMPORT", "SET", "RESET", "DISCARD":
 		return true
 	}
 	return false

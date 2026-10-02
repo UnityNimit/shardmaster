@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -110,6 +111,76 @@ func ensureCustomSQLFunctions(dir *directory.ShardDirectory) {
 			h2 := hash.HashKey(fmt.Sprintf("uuid_salt_%d", ns+1))
 			return fmt.Sprintf("%08x-%04x-4%03x-8%03x-%012x",
 				uint32(h1>>32), uint16(h1>>16), uint16(h1)&0x0fff, uint16(h2>>48)&0x0fff, h2&0xffffffffffff), nil
+		})
+		// PostgreSQL compatibility scalar functions for external tools (DBeaver, DataGrip, pgAdmin)
+		_ = sqlite.RegisterDeterministicScalarFunction("version", 0, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			return "PostgreSQL 15.0 (ShardMaster Distributed SQL Engine Pure-Go v1.0.0)", nil
+		})
+		_ = sqlite.RegisterDeterministicScalarFunction("current_schema", 0, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			return "public", nil
+		})
+		_ = sqlite.RegisterDeterministicScalarFunction("current_database", 0, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			return "shardmaster", nil
+		})
+		_ = sqlite.RegisterDeterministicScalarFunction("current_user", 0, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			return "shardmaster_admin", nil
+		})
+		_ = sqlite.RegisterDeterministicScalarFunction("session_user", 0, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			return "shardmaster_admin", nil
+		})
+		_ = sqlite.RegisterDeterministicScalarFunction("pg_backend_pid", 0, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			return int64(6000), nil
+		})
+		_ = sqlite.RegisterDeterministicScalarFunction("pg_is_in_recovery", 0, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			return false, nil
+		})
+		_ = sqlite.RegisterDeterministicScalarFunction("pg_my_temp_schema", 0, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			return int64(0), nil
+		})
+		_ = sqlite.RegisterDeterministicScalarFunction("pg_is_other_temp_schema", 1, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			return false, nil
+		})
+		_ = sqlite.RegisterDeterministicScalarFunction("pg_table_is_visible", 1, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			return true, nil
+		})
+		_ = sqlite.RegisterDeterministicScalarFunction("format_type", -1, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			if len(args) > 0 && args[0] != nil {
+				oidStr := fmt.Sprintf("%v", args[0])
+				switch oidStr {
+				case "16":
+					return "boolean", nil
+				case "20":
+					return "bigint", nil
+				case "21":
+					return "smallint", nil
+				case "23":
+					return "integer", nil
+				case "25":
+					return "text", nil
+				case "1043":
+					return "character varying", nil
+				case "1700":
+					return "numeric", nil
+				case "1184":
+					return "timestamp with time zone", nil
+				}
+			}
+			return "text", nil
+		})
+		_ = sqlite.RegisterDeterministicScalarFunction("col_description", 2, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			return "", nil
+		})
+		_ = sqlite.RegisterDeterministicScalarFunction("obj_description", 2, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			return "", nil
+		})
+		_ = sqlite.RegisterDeterministicScalarFunction("has_schema_privilege", -1, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			return true, nil
+		})
+		_ = sqlite.RegisterDeterministicScalarFunction("has_table_privilege", -1, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			return true, nil
+		})
+		_ = sqlite.RegisterDeterministicScalarFunction("has_database_privilege", -1, func(ctx *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			return true, nil
 		})
 	})
 }
@@ -237,6 +308,175 @@ func (re *RelationalEngine) initializeSchemaAndSeed() {
 		LEFT JOIN orders o ON u.user_id = o.user_id
 		WHERE u.balance_cents >= 400000
 		GROUP BY u.user_id, u.shard_id, u.bucket_id, u.name, u.email, u.region, u.balance_usd;`,
+
+		// PostgreSQL Catalog Compatibility Tables & Views for External SQL Editors (DBeaver, DataGrip, pgAdmin)
+		`CREATE TABLE IF NOT EXISTS pg_database (
+			oid INTEGER PRIMARY KEY,
+			datname TEXT NOT NULL,
+			datdba INTEGER NOT NULL DEFAULT 10,
+			encoding INTEGER NOT NULL DEFAULT 6,
+			datcollate TEXT NOT NULL DEFAULT 'C',
+			datctype TEXT NOT NULL DEFAULT 'C',
+			datistemplate INTEGER NOT NULL DEFAULT 0,
+			datallowconn INTEGER NOT NULL DEFAULT 1,
+			datconnlimit INTEGER NOT NULL DEFAULT -1,
+			datlastsysoid INTEGER NOT NULL DEFAULT 0,
+			datfrozenxid INTEGER NOT NULL DEFAULT 0,
+			datminmxid INTEGER NOT NULL DEFAULT 0,
+			dattablespace INTEGER NOT NULL DEFAULT 1663,
+			datacl TEXT
+		);`,
+		`INSERT OR REPLACE INTO pg_database (oid, datname) VALUES (1, 'shardmaster'), (2, 'postgres');`,
+
+		`CREATE TABLE IF NOT EXISTS pg_namespace (
+			oid INTEGER PRIMARY KEY,
+			nspname TEXT NOT NULL,
+			nspowner INTEGER NOT NULL DEFAULT 10,
+			nspacl TEXT
+		);`,
+		`INSERT OR REPLACE INTO pg_namespace (oid, nspname) VALUES 
+			(11, 'pg_catalog'), 
+			(2200, 'public'), 
+			(3300, 'shardmaster'), 
+			(99, 'information_schema');`,
+
+		`CREATE TABLE IF NOT EXISTS pg_type (
+			oid INTEGER PRIMARY KEY,
+			typname TEXT NOT NULL,
+			typnamespace INTEGER NOT NULL DEFAULT 11,
+			typowner INTEGER NOT NULL DEFAULT 10,
+			typlen INTEGER NOT NULL DEFAULT -1,
+			typbyval INTEGER NOT NULL DEFAULT 0,
+			typtype TEXT NOT NULL DEFAULT 'b',
+			typcategory TEXT NOT NULL DEFAULT 'S',
+			typispreferred INTEGER NOT NULL DEFAULT 0,
+			typisdefined INTEGER NOT NULL DEFAULT 1,
+			typdelim TEXT NOT NULL DEFAULT ',',
+			typrelid INTEGER NOT NULL DEFAULT 0,
+			typelem INTEGER NOT NULL DEFAULT 0,
+			typarray INTEGER NOT NULL DEFAULT 0
+		);`,
+		`INSERT OR REPLACE INTO pg_type (oid, typname, typlen, typbyval, typcategory) VALUES
+			(16, 'bool', 1, 1, 'B'),
+			(20, 'int8', 8, 1, 'N'),
+			(21, 'int2', 2, 1, 'N'),
+			(23, 'int4', 4, 1, 'N'),
+			(25, 'text', -1, 0, 'S'),
+			(1043, 'varchar', -1, 0, 'S'),
+			(1700, 'numeric', -1, 0, 'N'),
+			(1184, 'timestamptz', 8, 1, 'D');`,
+
+		`CREATE TABLE IF NOT EXISTS pg_am (
+			oid INTEGER PRIMARY KEY,
+			amname TEXT NOT NULL,
+			amhandler INTEGER NOT NULL DEFAULT 332,
+			amtype TEXT NOT NULL DEFAULT 'i'
+		);`,
+		`INSERT OR REPLACE INTO pg_am (oid, amname) VALUES (403, 'btree'), (405, 'hash');`,
+
+		`CREATE TABLE IF NOT EXISTS pg_roles (
+			oid INTEGER PRIMARY KEY,
+			rolname TEXT NOT NULL,
+			rolsuper INTEGER NOT NULL DEFAULT 1,
+			rolinherit INTEGER NOT NULL DEFAULT 1,
+			rolcreaterole INTEGER NOT NULL DEFAULT 1,
+			rolcreatedb INTEGER NOT NULL DEFAULT 1,
+			rolcanlogin INTEGER NOT NULL DEFAULT 1,
+			rolreplication INTEGER NOT NULL DEFAULT 1,
+			rolconnlimit INTEGER NOT NULL DEFAULT -1,
+			rolpassword TEXT DEFAULT '********',
+			rolvaliduntil TEXT,
+			rolbypassrls INTEGER NOT NULL DEFAULT 1,
+			rolconfig TEXT
+		);`,
+		`INSERT OR REPLACE INTO pg_roles (oid, rolname) VALUES (10, 'shardmaster_admin');`,
+
+		`CREATE TABLE IF NOT EXISTS pg_user (
+			usesysid INTEGER PRIMARY KEY,
+			usename TEXT NOT NULL,
+			usecreatedb INTEGER NOT NULL DEFAULT 1,
+			usesuper INTEGER NOT NULL DEFAULT 1,
+			userepl INTEGER NOT NULL DEFAULT 1,
+			usebypassrls INTEGER NOT NULL DEFAULT 1,
+			passwd TEXT DEFAULT '********',
+			valuntil TEXT,
+			useconfig TEXT
+		);`,
+		`INSERT OR REPLACE INTO pg_user (usesysid, usename) VALUES (10, 'shardmaster_admin');`,
+
+		`CREATE TABLE IF NOT EXISTS information_schema_schemata (
+			catalog_name TEXT NOT NULL DEFAULT 'shardmaster',
+			schema_name TEXT NOT NULL,
+			schema_owner TEXT NOT NULL DEFAULT 'shardmaster_admin',
+			default_character_set_catalog TEXT,
+			default_character_set_schema TEXT,
+			default_character_set_name TEXT DEFAULT 'utf8'
+		);`,
+		`INSERT OR REPLACE INTO information_schema_schemata (schema_name) VALUES ('public'), ('shardmaster'), ('pg_catalog'), ('information_schema');`,
+
+		`CREATE VIEW IF NOT EXISTS pg_tables AS
+		SELECT
+			'public' AS schemaname,
+			name AS tablename,
+			'shardmaster_admin' AS tableowner,
+			NULL AS tablespace,
+			1 AS hasindexes,
+			0 AS hasrules,
+			0 AS hastriggers,
+			0 AS rowsecurity
+		FROM sqlite_master
+		WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'pg_%' AND name NOT LIKE 'information_schema_%';`,
+
+		`CREATE VIEW IF NOT EXISTS pg_views AS
+		SELECT
+			'public' AS schemaname,
+			name AS viewname,
+			'shardmaster_admin' AS viewowner,
+			sql AS definition
+		FROM sqlite_master
+		WHERE type = 'view' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'pg_%' AND name NOT LIKE 'information_schema_%';`,
+
+		`CREATE VIEW IF NOT EXISTS pg_class AS
+		SELECT
+			rowid + 16384 AS oid,
+			name AS relname,
+			2200 AS relnamespace,
+			10 AS relowner,
+			0 AS relam,
+			0 AS relfilenode,
+			0 AS reltablespace,
+			0 AS relpages,
+			0 AS reltuples,
+			0 AS relallvisible,
+			0 AS reltoastrelid,
+			1 AS relhasindex,
+			0 AS relisshared,
+			'p' AS relpersistence,
+			CASE WHEN type = 'table' THEN 'r' WHEN type = 'view' THEN 'v' ELSE 'i' END AS relkind,
+			0 AS relnatts,
+			0 AS relchecks,
+			0 AS relhasrules,
+			0 AS relhastriggers,
+			0 AS relhassubclass,
+			0 AS relrowsecurity,
+			0 AS relforcerowsecurity,
+			1 AS relispopulated,
+			'd' AS relreplident,
+			1 AS relispartitioned,
+			0 AS relfrozenxid,
+			0 AS relminmxid
+		FROM sqlite_master
+		WHERE name NOT LIKE 'sqlite_%' AND name NOT LIKE 'pg_%' AND name NOT LIKE 'information_schema_%';`,
+
+		`CREATE VIEW IF NOT EXISTS information_schema_tables AS
+		SELECT
+			'shardmaster' AS table_catalog,
+			'public' AS table_schema,
+			name AS table_name,
+			CASE WHEN type = 'table' THEN 'BASE TABLE' ELSE 'VIEW' END AS table_type,
+			'YES' AS is_insertable_into
+		FROM sqlite_master
+		WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'pg_%' AND name NOT LIKE 'information_schema_%';`,
 	}
 
 	for _, stmt := range ddlStatements {
@@ -544,9 +784,73 @@ func (re *RelationalEngine) seedInitialRelationalRows() {
 	}
 
 	_ = tx.Commit()
+	re.restoreCustomTablesFromClusterLocked()
 	re.refreshNonUserRowCountsLocked()
 	for _, s := range re.cluster.GetAllShards() {
 		s.ResetQPSCounter()
+	}
+}
+
+func (re *RelationalEngine) restoreCustomTablesFromClusterLocked() {
+	if re.cluster == nil {
+		return
+	}
+	byTable := make(map[string][]storage.CustomRow)
+	for _, s := range re.cluster.GetAllShards() {
+		for _, r := range s.GetAllCustomRows() {
+			byTable[r.TableName] = append(byTable[r.TableName], r)
+		}
+	}
+	for tblName, rows := range byTable {
+		if len(rows) == 0 {
+			continue
+		}
+		var dummy string
+		err := re.db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND lower(name)=?`, strings.ToLower(tblName)).Scan(&dummy)
+		if err != nil {
+			sample := rows[0]
+			colNames := make([]string, 0, len(sample.Columns)+2)
+			colNames = append(colNames, "shard_id", "bucket_id")
+			for col := range sample.Columns {
+				if col != "shard_id" && col != "bucket_id" {
+					colNames = append(colNames, col)
+				}
+			}
+			sort.Strings(colNames)
+			var colDefs []string
+			for _, col := range colNames {
+				colDefs = append(colDefs, fmt.Sprintf(`"%s" TEXT`, col))
+			}
+			createDDL := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS "%s" (%s);`, tblName, strings.Join(colDefs, ", "))
+			_, _ = re.db.Exec(createDDL)
+			re.customTables[tblName] = tblName
+			if re.catalog != nil {
+				if ts, ok := re.introspectLocked(tblName); ok {
+					re.catalog.mu.Lock()
+					re.catalog.registerTable(ts)
+					re.catalog.mu.Unlock()
+				}
+			}
+		}
+
+		for _, r := range rows {
+			cols := make([]string, 0, len(r.Columns)+2)
+			vals := make([]any, 0, len(r.Columns)+2)
+			cols = append(cols, "shard_id", "bucket_id")
+			vals = append(vals, fmt.Sprintf("shard_%d", re.dir.GetBucketOwner(r.BucketID)), int(r.BucketID))
+			for k, v := range r.Columns {
+				if k != "shard_id" && k != "bucket_id" {
+					cols = append(cols, fmt.Sprintf(`"%s"`, k))
+					vals = append(vals, v)
+				}
+			}
+			ph := make([]string, len(cols))
+			for i := range ph {
+				ph[i] = "?"
+			}
+			q := fmt.Sprintf(`INSERT OR REPLACE INTO "%s" (%s) VALUES (%s);`, tblName, strings.Join(cols, ", "), strings.Join(ph, ", "))
+			_, _ = re.db.Exec(q, vals...)
+		}
 	}
 }
 
@@ -577,7 +881,7 @@ func (re *RelationalEngine) refreshNonUserRowCountsLocked() {
 	var byShard [64]int64
 	appTables := int64(1) // `users` is always present
 
-	rows, err := re.db.Query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name != 'users' AND name NOT LIKE 'sqlite_%';`)
+	rows, err := re.db.Query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name != 'users' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'pg_%' AND name NOT LIKE 'information_schema_%';`)
 	if err == nil {
 		var tables []string
 		for rows.Next() {
@@ -792,6 +1096,15 @@ func (re *RelationalEngine) ExecuteFullSQL(rawSQL string) (*ResultSet, error) {
 	normSQL := normalizePostgresSQL(rawSQL)
 	trimmed := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(normSQL), ";"))
 	upper := NormalizeSQLWhitespace(strings.ToUpper(trimmed))
+
+	// Handle session configuration statements gracefully
+	if strings.HasPrefix(upper, "SET ") || strings.HasPrefix(upper, "RESET ") || strings.HasPrefix(upper, "DISCARD ") {
+		return &ResultSet{
+			CommandTag:  "SET",
+			LatencyUs:   time.Since(start).Microseconds(),
+			RoutedShard: "SESSION",
+		}, nil
+	}
 
 	// Handle explicit ACID transaction control statements (BEGIN, COMMIT, ROLLBACK)
 	if upper == "BEGIN" || strings.HasPrefix(upper, "BEGIN ") || strings.HasPrefix(upper, "START TRANSACTION") {
@@ -1491,20 +1804,36 @@ func (re *RelationalEngine) introspectLocked(tableName string) (*TableSchema, bo
 }
 
 var (
-	pgCastRe        = regexp.MustCompile(`::[a-zA-Z0-9_]+(\([0-9,]+\))?`)
-	pgSchemaRe      = regexp.MustCompile(`(?i)\b(public|shardmaster)\.`)
-	pgIlikeRe       = regexp.MustCompile(`(?i)\bILIKE\b`)
-	pgSerialRe      = regexp.MustCompile(`(?i)\b(BIGSERIAL|SMALLSERIAL|SERIAL)\b`)
-	pgStringAggRe   = regexp.MustCompile(`(?i)\bSTRING_AGG\s*\(`)
-	pgGreatestRe    = regexp.MustCompile(`(?i)\bGREATEST\s*\(`)
-	pgLeastRe       = regexp.MustCompile(`(?i)\bLEAST\s*\(`)
-	pgShardByTailRe = regexp.MustCompile(`(?is)\)\s*SHARD\s+BY\b.*$`)
+	pgCastRe           = regexp.MustCompile(`::[a-zA-Z0-9_]+(\([0-9,]+\))?`)
+	pgSchemaRe         = regexp.MustCompile(`(?i)\b(public|shardmaster)\.`)
+	pgCatalogPrefixRe  = regexp.MustCompile(`(?i)\bpg_catalog\.`)
+	infoSchemaTablesRe = regexp.MustCompile(`(?i)\binformation_schema\.tables\b`)
+	infoSchemaColsRe   = regexp.MustCompile(`(?i)\binformation_schema\.columns\b`)
+	infoSchemaSchRe    = regexp.MustCompile(`(?i)\binformation_schema\.schemata\b`)
+	pgCurrentUserRe    = regexp.MustCompile(`(?i)\bCURRENT_USER\b`)
+	pgSessionUserRe    = regexp.MustCompile(`(?i)\bSESSION_USER\b`)
+	pgCurrentSchemaRe  = regexp.MustCompile(`(?i)\bCURRENT_SCHEMA\b`)
+	pgCurrentDbRe      = regexp.MustCompile(`(?i)\bCURRENT_DATABASE\b`)
+	pgIlikeRe          = regexp.MustCompile(`(?i)\bILIKE\b`)
+	pgSerialRe         = regexp.MustCompile(`(?i)\b(BIGSERIAL|SMALLSERIAL|SERIAL)\b`)
+	pgStringAggRe      = regexp.MustCompile(`(?i)\bSTRING_AGG\s*\(`)
+	pgGreatestRe       = regexp.MustCompile(`(?i)\bGREATEST\s*\(`)
+	pgLeastRe          = regexp.MustCompile(`(?i)\bLEAST\s*\(`)
+	pgShardByTailRe    = regexp.MustCompile(`(?is)\)\s*SHARD\s+BY\b.*$`)
 )
 
 func normalizePostgresSQL(sqlStr string) string {
 	out := sqlStr
 	// Strip PostgreSQL public. / shardmaster. schema prefixes so SQLite resolves tables in main
 	out = pgSchemaRe.ReplaceAllString(out, "")
+	// Strip pg_catalog. prefixes and remap information_schema namespaces
+	out = pgCatalogPrefixRe.ReplaceAllString(out, "")
+	out = infoSchemaTablesRe.ReplaceAllString(out, "information_schema_tables")
+	out = infoSchemaColsRe.ReplaceAllString(out, "information_schema_columns")
+	// Normalize bare PostgreSQL keywords (CURRENT_USER, SESSION_USER, CURRENT_SCHEMA, CURRENT_DATABASE) to function calls
+	for _, kw := range []string{"CURRENT_USER", "SESSION_USER", "CURRENT_SCHEMA", "CURRENT_DATABASE"} {
+		out = replaceBareWithCall(out, kw)
+	}
 	// Replace PostgreSQL ILIKE with case-insensitive LIKE
 	out = pgIlikeRe.ReplaceAllString(out, "LIKE")
 	// Replace BIGSERIAL / SERIAL with INTEGER
@@ -1532,6 +1861,44 @@ func normalizePostgresSQL(sqlStr string) string {
 		return "DELETE FROM " + tbl + ";"
 	}
 	return out
+}
+
+func replaceBareWithCall(sql string, keyword string) string {
+	upper := strings.ToUpper(sql)
+	idx := 0
+	var b strings.Builder
+	kwLen := len(keyword)
+	for {
+		found := strings.Index(upper[idx:], keyword)
+		if found == -1 {
+			b.WriteString(sql[idx:])
+			break
+		}
+		actualIdx := idx + found
+		endIdx := actualIdx + kwLen
+		isWordStart := actualIdx == 0 || !isIdentChar(sql[actualIdx-1])
+		isWordEnd := endIdx == len(sql) || !isIdentChar(sql[endIdx])
+		b.WriteString(sql[idx:actualIdx])
+		if isWordStart && isWordEnd {
+			rem := strings.TrimSpace(sql[endIdx:])
+			if len(rem) > 0 && rem[0] == '(' {
+				// Already a function call
+				b.WriteString(sql[actualIdx:endIdx])
+			} else {
+				// Bare keyword -> append ()
+				b.WriteString(sql[actualIdx:endIdx])
+				b.WriteString("()")
+			}
+		} else {
+			b.WriteString(sql[actualIdx:endIdx])
+		}
+		idx = endIdx
+	}
+	return b.String()
+}
+
+func isIdentChar(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
 }
 
 func mapSQLTypeToPostgresBadge(colName string, dbType string) string {
