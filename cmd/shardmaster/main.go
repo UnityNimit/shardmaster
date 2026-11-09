@@ -27,7 +27,9 @@ func bootstrapEngine(initialShards uint32, seedRows int) *router.QueryRouter {
 	dir := directory.NewShardDirectory(initialShards)
 	cluster := storage.NewClusterStorage(initialShards, "./data")
 	cluster.SeedCluster(seedRows, dir.GetBucketOwner)
-	cluster.LoadStateFile(dir.AtomicCutoverBucket)
+	if cluster.LoadStateFile(dir.AtomicCutoverBucket) {
+		dir.SetActiveShards(uint32(len(cluster.GetAllShards())))
+	}
 	cdcEngine := cdc.NewEngine(dir, cluster)
 	tracker := hotspot.NewTracker(dir, cluster, cdcEngine)
 	return router.NewQueryRouter(dir, cluster, cdcEngine, tracker)

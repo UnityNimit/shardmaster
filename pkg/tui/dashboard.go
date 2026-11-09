@@ -664,18 +664,28 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
-		case "d":
-			if len(shards) > 0 {
+		case "d", "delete":
+			if m.activeTab == 0 && len(shards) > 0 {
+				if len(shards) <= 1 {
+					m.statusBanner = "Cannot delete: cluster requires at least 1 active shard"
+					return m, nil
+				}
 				s := shards[m.selectedShardIdx%len(shards)]
-				m.statusBanner = fmt.Sprintf("Draining S%d [%s] -> Evacuating all Buckets via CDC...", s.ShardID, s.DisplayName())
-				id := s.ShardID
+				targetID := s.ShardID
 				alias := s.DisplayName()
+				cur := len(shards)
+				m.statusBanner = fmt.Sprintf("Draining and Deleting Shard %d [%s] via Zero-Downtime CDC...", targetID, alias)
 				return m, func() tea.Msg {
-					_, err := m.qr.CDC.DrainShard(id, 18*time.Millisecond)
+					snap, err := m.qr.CDC.DeleteShard(targetID, 20*time.Millisecond)
 					if err != nil {
-						return asyncOpDoneMsg(fmt.Sprintf("Drain S%d [%s] Rejected: %v", id, alias, err))
+						return asyncOpDoneMsg(fmt.Sprintf("Delete Shard %d [%s] Rejected: %v", targetID, alias, err))
 					}
-					return asyncOpDoneMsg(fmt.Sprintf("Drained S%d [%s]: 0 Buckets Remaining (All Data Evacuated)", id, alias))
+					moved := int64(0)
+					if snap != nil {
+						moved = snap.RowsMigrated
+					}
+					return asyncOpDoneMsg(fmt.Sprintf("Shard %d [%s] Safely Deleted: Cluster scaled %d -> %d Shards (%s rows evacuated, 0ms Downtime)",
+						targetID, alias, cur, cur-1, formatUintComma(uint64(moved))))
 				}
 			}
 			return m, nil
@@ -1192,8 +1202,8 @@ func (m *DashboardModel) View() string {
 		b.WriteString(fmt.Sprintf(" %s Preset  %s Tab  %s Pin Shard  %s Type SQL  %s Quit",
 			keyStyle.Render("p/n"), keyStyle.Render("L/R"), keyStyle.Render("f"), keyStyle.Render("/"), keyStyle.Render("q")))
 	} else {
-		b.WriteString(fmt.Sprintf(" %s Edit  %s New  %s Buckets  %s Split+1  %s Traffic  %s Burst  %s Quit",
-			keyStyle.Render("e"), keyStyle.Render("n"), keyStyle.Render("+/-"), keyStyle.Render("s"), keyStyle.Render("b"), keyStyle.Render("m"), keyStyle.Render("q")))
+		b.WriteString(fmt.Sprintf(" %s Edit  %s New  %s Buckets  %s Split+1  %s Delete  %s Traffic  %s Burst  %s Quit",
+			keyStyle.Render("e"), keyStyle.Render("n"), keyStyle.Render("+/-"), keyStyle.Render("s"), keyStyle.Render("d"), keyStyle.Render("b"), keyStyle.Render("m"), keyStyle.Render("q")))
 	}
 
 	return borderStyle.Render(b.String())

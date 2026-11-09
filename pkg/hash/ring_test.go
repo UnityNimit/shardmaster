@@ -1001,6 +1001,81 @@ func ShardRowCount(cs *storage.ClusterStorage, id uint32) int64 {
 	return -1
 }
 
+func TestDeleteAndDownscaleShardCDC(t *testing.T) {
+	dir := directory.NewShardDirectory(4)
+	cluster := storage.NewClusterStorage(4, "")
+	cluster.SeedCluster(4000, dir.GetBucketOwner)
+	initialRows := cluster.TotalRows()
+	if initialRows != 4000 {
+		t.Fatalf("expected 4000 initial rows, got %d", initialRows)
+	}
+
+	cdcEngine := cdc.NewEngine(dir, cluster)
+
+	// 1. Scale from 4 to 5 shards
+	_, err := cdcEngine.RebalanceToShards(5, 0)
+	if err != nil {
+		t.Fatalf("RebalanceToShards(5) failed: %v", err)
+	}
+	if dir.ActiveShards() != 5 {
+		t.Fatalf("expected 5 active shards, got %d", dir.ActiveShards())
+	}
+	s4, ok := cluster.GetShard(4)
+	if !ok || s4.RowCount() == 0 {
+		t.Fatalf("expected shard 4 to exist and hold rows, ok=%v", ok)
+	}
+
+	// 2. Delete shard 4 (highest shard)
+	snap, err := cdcEngine.DeleteShard(4, 0)
+	if err != nil {
+		t.Fatalf("DeleteShard(4) failed: %v", err)
+	}
+	if dir.ActiveShards() != 4 {
+		t.Fatalf("expected 4 active shards after deleting S4, got %d", dir.ActiveShards())
+	}
+	if _, ok := cluster.GetShard(4); ok {
+		t.Fatalf("expected shard 4 to be removed from cluster storage")
+	}
+	if cluster.TotalRows() != 4000 {
+		t.Fatalf("expected 4000 total rows after deleting S4 (0 rows lost), got %d", cluster.TotalRows())
+	}
+	// Verify all 1,024 buckets are accounted for
+	counts := dir.BucketCountsByShard()
+	totalBuckets := 0
+	for s := uint32(0); s < dir.ActiveShards(); s++ {
+		totalBuckets += counts[s]
+	}
+	if totalBuckets != hash.TotalVirtualBuckets {
+		t.Fatalf("expected 1,024 total buckets across shards, got %d", totalBuckets)
+	}
+	if snap == nil || snap.RowsMigrated == 0 {
+		t.Fatalf("expected rows migrated in snapshot, got %+v", snap)
+	}
+
+	// 3. Delete middle shard 1 (tests compaction of highest shard into S1)
+	_, err = cdcEngine.DeleteShard(1, 0)
+	if err != nil {
+		t.Fatalf("DeleteShard(1) failed: %v", err)
+	}
+	if dir.ActiveShards() != 3 {
+		t.Fatalf("expected 3 active shards after deleting middle shard, got %d", dir.ActiveShards())
+	}
+	if len(cluster.GetAllShards()) != 3 {
+		t.Fatalf("expected 3 physical shards, got %d", len(cluster.GetAllShards()))
+	}
+	if cluster.TotalRows() != 4000 {
+		t.Fatalf("expected 4000 total rows after deleting S1, got %d", cluster.TotalRows())
+	}
+	counts3 := dir.BucketCountsByShard()
+	totalBuckets3 := 0
+	for s := uint32(0); s < dir.ActiveShards(); s++ {
+		totalBuckets3 += counts3[s]
+	}
+	if totalBuckets3 != hash.TotalVirtualBuckets {
+		t.Fatalf("expected 1,024 total buckets across remaining 3 shards, got %d", totalBuckets3)
+	}
+}
+
 func BenchmarkZeroAllocRouting(b *testing.B) {
 	dir := directory.NewShardDirectory(8)
 	b.ReportAllocs()

@@ -1512,6 +1512,64 @@ func (cs *ClusterStorage) CreateCustomShard(cfg ShardSettings) *PhysicalShard {
 	return s
 }
 
+// RemovePhysicalShard safely removes an evacuated physical shard (0 rows, 0 buckets) from cluster storage.
+func (cs *ClusterStorage) RemovePhysicalShard(shardID uint32) error {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	s, ok := cs.shards[shardID]
+	if !ok {
+		return fmt.Errorf("shard %d does not exist", shardID)
+	}
+	if s.RowCount() > 0 {
+		return fmt.Errorf("cannot remove shard %d: still contains %d rows", shardID, s.RowCount())
+	}
+	delete(cs.shards, shardID)
+	return nil
+}
+
+// CompactShardsAfterRemoval reindexes shards when a non-highest shard is removed,
+// ensuring physical shard IDs and settings remain contiguous 0..len(shards)-1.
+func (cs *ClusterStorage) CompactShardsAfterRemoval(deletedID uint32, updateDirBucket func(b uint16, newShardID uint32)) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	var highestID uint32
+	var foundHighest bool
+	for id := range cs.shards {
+		if !foundHighest || id > highestID {
+			highestID = id
+			foundHighest = true
+		}
+	}
+	if !foundHighest || highestID <= deletedID {
+		return
+	}
+
+	movingShard := cs.shards[highestID]
+	delete(cs.shards, highestID)
+	movingShard.ShardID = deletedID
+	port := 5432 + int(deletedID)
+	movingShard.Port = port
+	movingShard.Name = fmt.Sprintf("Shard %d :%d", deletedID, port)
+	movingShard.DSN = fmt.Sprintf("postgres://postgres:postgres@localhost:%d/shard_%d?sslmode=disable", port, deletedID)
+
+	st := movingShard.GetSettings()
+	if strings.HasPrefix(st.CustomAlias, "shard-") {
+		st.CustomAlias = fmt.Sprintf("shard-%d", deletedID)
+	}
+	st.CustomPort = port
+	movingShard.UpdateSettings(st)
+
+	cs.shards[deletedID] = movingShard
+
+	if updateDirBucket != nil {
+		for b := uint16(0); b < hash.TotalVirtualBuckets; b++ {
+			updateDirBucket(b, deletedID)
+		}
+	}
+}
+
 func (cs *ClusterStorage) GetShard(shardID uint32) (*PhysicalShard, bool) {
 	cs.mu.RLock()
 	s, ok := cs.shards[shardID]
@@ -1745,6 +1803,19 @@ func (cs *ClusterStorage) LoadStateFile(setBucketOwner func(bucket uint16, shard
 	if err := json.Unmarshal(raw, &state); err != nil || len(state.Shards) == 0 {
 		return false
 	}
+
+	// Remove any pre-initialized shards that were not persisted in state.Shards (e.g. from a downscaled cluster)
+	persistedIDs := make(map[uint32]bool, len(state.Shards))
+	for _, sm := range state.Shards {
+		persistedIDs[sm.ShardID] = true
+	}
+	cs.mu.Lock()
+	for id := range cs.shards {
+		if !persistedIDs[id] {
+			delete(cs.shards, id)
+		}
+	}
+	cs.mu.Unlock()
 
 	// Ensure all persisted shards exist (and upgrade legacy auto-generated cloud region names to local PC defaults)
 	for _, sm := range state.Shards {

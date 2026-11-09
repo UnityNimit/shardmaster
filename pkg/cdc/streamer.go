@@ -109,7 +109,19 @@ func (e *Engine) RebalanceToShards(targetShards uint32, stepDelay time.Duration)
 	defer e.running.Store(false)
 
 	currentShards := e.dir.ActiveShards()
-	if targetShards <= currentShards {
+	if targetShards == currentShards {
+		snap := e.GetSnapshot()
+		return &snap, nil
+	}
+	if targetShards < currentShards {
+		if targetShards == 0 {
+			targetShards = 1
+		}
+		for sid := int(currentShards) - 1; sid >= int(targetShards); sid-- {
+			if _, err := e.deleteShardLocked(uint32(sid), stepDelay); err != nil {
+				return nil, err
+			}
+		}
 		snap := e.GetSnapshot()
 		return &snap, nil
 	}
@@ -586,6 +598,59 @@ func (e *Engine) AutoEvacuateForWrite(fullShardID uint32, activeBucket uint16, n
 		return false, err
 	}
 	return true, nil
+}
+
+// DeleteShard evacuates 100% of virtual buckets from shardID to remaining online shards
+// via CDC VReplication + VDiff verification + atomic cutover, removes the physical shard from the cluster,
+// compacts the topology to preserve contiguous 0..N-1 IDs, and decrements activeShards.
+func (e *Engine) DeleteShard(shardID uint32, stepDelay time.Duration) (*WorkflowSnapshot, error) {
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+	return e.deleteShardLocked(shardID, stepDelay)
+}
+
+func (e *Engine) deleteShardLocked(shardID uint32, stepDelay time.Duration) (*WorkflowSnapshot, error) {
+	curShards := e.dir.ActiveShards()
+	if curShards <= 1 {
+		return nil, fmt.Errorf("cannot delete shard: cluster requires at least 1 active shard")
+	}
+
+	_, ok := e.cluster.GetShard(shardID)
+	if !ok {
+		return nil, fmt.Errorf("shard %d does not exist", shardID)
+	}
+
+	// 1. Evacuate all virtual buckets from shardID onto remaining writable shards
+	snap, err := e.resizeShardBucketsLocked(shardID, 0, stepDelay)
+	if err != nil {
+		return nil, fmt.Errorf("failed to evacuate shard %d: %w", shardID, err)
+	}
+
+	// 2. Remove evacuated physical shard from ClusterStorage
+	if err := e.cluster.RemovePhysicalShard(shardID); err != nil {
+		return nil, fmt.Errorf("failed to remove shard %d from cluster: %w", shardID, err)
+	}
+
+	// 3. Compact IDs if deleted shard was not the highest ID
+	lastID := curShards - 1
+	if shardID < lastID {
+		e.cluster.CompactShardsAfterRemoval(shardID, func(b uint16, newID uint32) {
+			if e.dir.GetBucketOwner(b) == lastID {
+				e.dir.AtomicCutoverBucket(b, newID)
+			}
+		})
+		e.dir.ReassignShardBuckets(lastID, shardID)
+	}
+
+	// 4. Update active shards in directory
+	newActive := curShards - 1
+	e.dir.SetActiveShards(newActive)
+
+	// 5. Sync metadata and persist cluster state
+	e.syncTargetBucketMetadata()
+	e.cluster.SaveStateFile(e.dir.SnapshotBuckets())
+
+	return snap, nil
 }
 
 // DrainShard evacuates 100% of virtual buckets from shardID to remaining online shards via CDC VReplication.

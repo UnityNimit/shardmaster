@@ -760,9 +760,10 @@ func runShardCustomizerMenu(qr *router.QueryRouter, reader *bufio.Reader) {
 	fmt.Printf("   %s %-34s %s\n", hotStyle.Render("[3]"), whiteBold.Render("Drain / Evacuate a Shard (0ms)"), dimStyle.Render("Migrate 100% of shard buckets out via CDC + VDiff"))
 	fmt.Printf("   %s %-34s %s\n", warnStyle.Render("[4]"), whiteBold.Render("Rebalance All Shards by Weight"), dimStyle.Render("Distribute 1,024 Buckets proportional to Shard Weight"))
 	fmt.Printf("   %s %-34s %s\n", okStyle.Render("[5]"), whiteBold.Render("Pin & Query Specific Shard (SQL)"), dimStyle.Render("Choose a shard and run SELECT / SQL directly on it"))
+	fmt.Printf("   %s %-34s %s\n", hotStyle.Render("[6]"), whiteBold.Render("Delete & Remove Shard (CDC Evac)"), dimStyle.Render("Evacuate all buckets and permanently remove physical shard"))
 	fmt.Println(dimStyle.Render("  ------------------------------------------------------------------------"))
 
-	sub := promptDefault(reader, "Choose action [1-5, default: 1]", "1")
+	sub := promptDefault(reader, "Choose action [1-6, default: 1]", "1")
 	shards := qr.Cluster.GetAllShards()
 	counts := qr.Dir.BucketCountsByShard()
 
@@ -960,6 +961,31 @@ func runShardCustomizerMenu(qr *router.QueryRouter, reader *bufio.Reader) {
 			return
 		}
 		RenderSQLResult(sqlQuery, res)
+
+	case "6":
+		if len(shards) <= 1 {
+			fmt.Printf("  %s Cannot delete shard: cluster requires at least 1 active shard.\n", hotStyle.Render("[ERROR]"))
+			return
+		}
+		defDel := strconv.Itoa(len(shards) - 1)
+		sidStr := promptDefault(reader, fmt.Sprintf("Select Shard ID to Delete & Remove (0..%d) [default: %s]", len(shards)-1, defDel), defDel)
+		sid, _ := strconv.Atoi(sidStr)
+		var snap *cdc.WorkflowSnapshot
+		var delErr error
+		RunSpinnerWhile(fmt.Sprintf("Evacuating & Permanently Deleting Shard %d via CDC...", sid), func() {
+			snap, delErr = qr.CDC.DeleteShard(uint32(sid), 12*time.Millisecond)
+		})
+		if delErr != nil {
+			fmt.Printf("  %s Delete Shard Rejected: %v\n", hotStyle.Render("[ERROR]"), delErr)
+			return
+		}
+		rowsDone := int64(0)
+		if snap != nil {
+			rowsDone = snap.RowsMigrated
+		}
+		fmt.Printf("  %s Shard %d Safely Deleted (%s rows evacuated with 0.00ms Downtime). Cluster now has %d Shards.\n",
+			okStyle.Render("[OK]"), sid, FormatCommas(uint64(rowsDone)), qr.Dir.ActiveShards())
+		PrintStaticDashboard(qr, false)
 	}
 }
 

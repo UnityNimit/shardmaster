@@ -232,6 +232,26 @@ func (d *ShardDirectory) RegisterShard(shardID uint32) {
 	d.routingVersion.Add(1)
 }
 
+// SetActiveShards explicitly updates activeShards (e.g. after deleting a shard).
+func (d *ShardDirectory) SetActiveShards(count uint32) {
+	d.activeShards.Store(count)
+	d.routingVersion.Add(1)
+}
+
+// ReassignShardBuckets updates all virtual buckets owned by oldShardID to newShardID.
+func (d *ShardDirectory) ReassignShardBuckets(oldShardID, newShardID uint32) int {
+	reassigned := 0
+	for b := uint16(0); b < hash.TotalVirtualBuckets; b++ {
+		if d.buckets[b].Load() == oldShardID {
+			d.buckets[b].Store(newShardID)
+			d.bucketStates[b].Store(BucketStateNormal)
+			reassigned++
+		}
+	}
+	d.routingVersion.Add(1)
+	return reassigned
+}
+
 // PinKey pins a specific hot key to a dedicated shard.
 func (d *ShardDirectory) PinKey(key string, shardID uint32) {
 	d.pinMu.Lock()
