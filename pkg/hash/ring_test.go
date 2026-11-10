@@ -1076,6 +1076,21 @@ func TestDeleteAndDownscaleShardCDC(t *testing.T) {
 	}
 }
 
+func TestMemoryOnlyZeroLocalDiskFiles(t *testing.T) {
+	dir := directory.NewShardDirectory(4)
+	cluster := storage.NewMemoryOnlyClusterStorage(4)
+	cluster.SeedCluster(500, dir.GetBucketOwner)
+
+	// Calling SaveStateFile in memory-only / TiDB-only mode must never create ./data on local disk
+	cluster.SaveStateFile(dir.SnapshotBuckets())
+	if cluster.DataDir() != "" {
+		t.Fatalf("expected empty DataDir in memory/TiDB-only mode, got %q", cluster.DataDir())
+	}
+	if cluster.TotalRows() != 500 {
+		t.Fatalf("expected 500 seeded rows, got %d", cluster.TotalRows())
+	}
+}
+
 func BenchmarkZeroAllocRouting(b *testing.B) {
 	dir := directory.NewShardDirectory(8)
 	b.ReportAllocs()

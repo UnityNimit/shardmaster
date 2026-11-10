@@ -136,6 +136,13 @@ func AnimateBanner(qr *router.QueryRouter, pgwireUp bool) {
 		pgStatus,
 	)
 	fmt.Println(whiteBold.Render(statusLine))
+	if enabled, host, _, lastErr := qr.Cluster.TiDBStatus(); enabled {
+		if lastErr == "" {
+			fmt.Printf("  STORAGE: %s (%s | 0 Local Disk Files)\n", okStyle.Render("TiDB Cloud LIVE"), dimStyle.Render(host))
+		} else {
+			fmt.Printf("  STORAGE: %s (%s)\n", warnStyle.Render("TiDB Cloud"), dimStyle.Render(lastErr))
+		}
+	}
 	fmt.Println(dimStyle.Render("  ========================================================================"))
 }
 

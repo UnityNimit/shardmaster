@@ -690,6 +690,21 @@ func (m *DashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
+		case "t":
+			if !m.qr.Cluster.IsTiDBEnabled() {
+				m.statusBanner = "TiDB Cloud not connected (set TIDB_HOST, TIDB_USER, TIDB_PASSWORD)"
+				return m, nil
+			}
+			m.statusBanner = "Syncing live shard metadata with TiDB Cloud..."
+			return m, func() tea.Msg {
+				updated, err := m.qr.Cluster.SyncShardEditsFromTiDB()
+				if err != nil {
+					return asyncOpDoneMsg(fmt.Sprintf("TiDB Sync Error: %v", err))
+				}
+				m.qr.Cluster.SaveStateFile(m.qr.Dir.SnapshotBuckets())
+				return asyncOpDoneMsg(fmt.Sprintf("TiDB Cloud Synced (%d shard edit(s) pulled)", updated))
+			}
+
 		case "w":
 			m.statusBanner = "Rebalancing 1,024 Buckets across Shards by Custom Weight..."
 			return m, func() tea.Msg {
@@ -895,7 +910,11 @@ func (m *DashboardModel) View() string {
 			renderedTabs = append(renderedTabs, inactiveTabStyle.Render(name))
 		}
 	}
-	b.WriteString(" " + strings.Join(renderedTabs, "  ") + "\n")
+	tidbBadge := ""
+	if m.qr.Cluster.IsTiDBEnabled() {
+		tidbBadge = "  " + okStyle.Render("● TiDB")
+	}
+	b.WriteString(" " + strings.Join(renderedTabs, "  ") + tidbBadge + "\n")
 	b.WriteString(ruleStyle.Render(strings.Repeat("─", 74)) + "\n")
 
 	// 3. Focused Tab Viewport (13 lines)
@@ -1202,8 +1221,8 @@ func (m *DashboardModel) View() string {
 		b.WriteString(fmt.Sprintf(" %s Preset  %s Tab  %s Pin Shard  %s Type SQL  %s Quit",
 			keyStyle.Render("p/n"), keyStyle.Render("L/R"), keyStyle.Render("f"), keyStyle.Render("/"), keyStyle.Render("q")))
 	} else {
-		b.WriteString(fmt.Sprintf(" %s Edit  %s New  %s Buckets  %s Split+1  %s Delete  %s Traffic  %s Burst  %s Quit",
-			keyStyle.Render("e"), keyStyle.Render("n"), keyStyle.Render("+/-"), keyStyle.Render("s"), keyStyle.Render("d"), keyStyle.Render("b"), keyStyle.Render("m"), keyStyle.Render("q")))
+		b.WriteString(fmt.Sprintf(" %s Edit  %s New  %s Bkt  %s Split  %s Del  %s TiDB  %s Load  %s Burst  %s Quit",
+			keyStyle.Render("e"), keyStyle.Render("n"), keyStyle.Render("+/-"), keyStyle.Render("s"), keyStyle.Render("d"), keyStyle.Render("t"), keyStyle.Render("b"), keyStyle.Render("m"), keyStyle.Render("q")))
 	}
 
 	return borderStyle.Render(b.String())
