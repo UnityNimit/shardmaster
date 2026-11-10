@@ -1441,11 +1441,44 @@ func (s *PhysicalShard) QueryFilter(emailSubstring string, regionFilter string, 
 	return matched
 }
 
+func (s *PhysicalShard) scanBucketRows(b uint16) []UserRow {
+	s.bucketMu[b].RLock()
+	defer s.bucketMu[b].RUnlock()
+
+	slab := s.buckets[b]
+	if slab == nil || (slab.RowCount == 0 && len(slab.DeltaOverrides) == 0) {
+		return nil
+	}
+	rows := make([]UserRow, 0, slab.RowCount)
+	seen := make(map[int64]bool, len(slab.DeltaOverrides))
+
+	for uid, dr := range slab.DeltaOverrides {
+		if slab.DeletedIDs[uid] {
+			continue
+		}
+		rows = append(rows, dr)
+		seen[uid] = true
+	}
+	for i, uid := range slab.SeededUIDs {
+		if seen[uid] || slab.DeletedIDs[uid] {
+			continue
+		}
+		bal := int64(0)
+		if i < len(slab.SlabBalances) {
+			bal = int64(slab.SlabBalances[i])
+		}
+		rows = append(rows, SynthesizeSeededUserRow(uid, b, s.Region, bal))
+	}
+	return rows
+}
+
 // ClusterStorage manages the pool of all physical shards.
 type ClusterStorage struct {
-	mu      sync.RWMutex
-	shards  map[uint32]*PhysicalShard
-	dataDir string
+	mu          sync.RWMutex
+	shards      map[uint32]*PhysicalShard
+	dataDir     string
+	disableDisk bool
+	tidb        *TiDBStore
 }
 
 var defaultRegions = []string{"local-node-0", "local-node-1", "local-node-2", "local-node-3"}
@@ -1461,6 +1494,57 @@ func NewClusterStorage(initialShards uint32, dataDir string) *ClusterStorage {
 	}
 	cs.InitializeShards(initialShards)
 	return cs
+}
+
+// NewMemoryOnlyClusterStorage initializes a cluster strictly in RAM without creating any ./data files on disk.
+func NewMemoryOnlyClusterStorage(initialShards uint32) *ClusterStorage {
+	cs := &ClusterStorage{
+		shards:      make(map[uint32]*PhysicalShard),
+		disableDisk: true,
+	}
+	cs.InitializeShards(initialShards)
+	return cs
+}
+
+// NewClusterStorageWithTiDB creates an in-memory + TiDB Cloud backed cluster with zero local disk files.
+func NewClusterStorageWithTiDB(initialShards uint32, cfg TiDBConfig) (*ClusterStorage, error) {
+	store, err := NewTiDBStore(cfg)
+	if err != nil {
+		return nil, err
+	}
+	cs := &ClusterStorage{
+		shards:      make(map[uint32]*PhysicalShard),
+		disableDisk: true,
+		tidb:        store,
+	}
+	cs.InitializeShards(initialShards)
+	return cs, nil
+}
+
+func (cs *ClusterStorage) IsTiDBEnabled() bool {
+	return cs.tidb != nil
+}
+
+func (cs *ClusterStorage) TiDBStatus() (enabled bool, host string, lastSync time.Time, lastErr string) {
+	if cs.tidb == nil {
+		return false, "", time.Time{}, ""
+	}
+	t, e := cs.tidb.StatusInfo()
+	return true, cs.tidb.Host(), t, e
+}
+
+func (cs *ClusterStorage) SyncShardEditsFromTiDB() (int, error) {
+	if cs.tidb == nil {
+		return 0, fmt.Errorf("TiDB storage is not enabled")
+	}
+	return cs.tidb.PullShardSettingsFromTiDB(cs)
+}
+
+func (cs *ClusterStorage) Close() error {
+	if cs.tidb != nil {
+		return cs.tidb.Close()
+	}
+	return nil
 }
 
 func (cs *ClusterStorage) InitializeShards(count uint32) {
@@ -1734,7 +1818,7 @@ type PersistedClusterState struct {
 	UpdatedAt time.Time                        `json:"updated_at"`
 }
 
-func (cs *ClusterStorage) SaveStateFile(buckets [hash.TotalVirtualBuckets]uint32) {
+func (cs *ClusterStorage) buildClusterStateSnapshot(buckets [hash.TotalVirtualBuckets]uint32) PersistedClusterState {
 	shards := cs.GetAllShards()
 	state := PersistedClusterState{
 		NumShards: len(shards),
@@ -1774,6 +1858,18 @@ func (cs *ClusterStorage) SaveStateFile(buckets [hash.TotalVirtualBuckets]uint32
 			LSNSeq:     s.lsnSeq.Load(),
 		}
 	}
+	return state
+}
+
+func (cs *ClusterStorage) SaveStateFile(buckets [hash.TotalVirtualBuckets]uint32) {
+	state := cs.buildClusterStateSnapshot(buckets)
+	if cs.tidb != nil {
+		_ = cs.tidb.SaveState(cs, state)
+		return
+	}
+	if cs.disableDisk {
+		return
+	}
 	raw, err := json.MarshalIndent(state, "", "  ")
 	if err == nil {
 		tmpPath := filepath.Join(cs.dataDir, "cluster_state.json.tmp")
@@ -1795,6 +1891,26 @@ func (cs *ClusterStorage) DropCustomTableEverywhere(tableName string) {
 }
 
 func (cs *ClusterStorage) LoadStateFile(setBucketOwner func(bucket uint16, shardID uint32)) bool {
+	if cs.tidb != nil {
+		state, found, err := cs.tidb.LoadState()
+		if err == nil && found && len(state.Shards) > 0 {
+			cs.applyClusterStateSnapshot(state, setBucketOwner)
+			return true
+		}
+		if err == nil && !found {
+			// Fresh TiDB Cloud database: upload initial seeded cluster right away
+			num := uint32(len(cs.GetAllShards()))
+			if num == 0 {
+				num = 4
+			}
+			initialBuckets := hash.InitialBucketAssignment(num)
+			_ = cs.tidb.EnsureInitialSeedInTiDB(cs, initialBuckets)
+		}
+		return false
+	}
+	if cs.disableDisk {
+		return false
+	}
 	raw, err := os.ReadFile(filepath.Join(cs.dataDir, "cluster_state.json"))
 	if err != nil {
 		return false
@@ -1803,7 +1919,11 @@ func (cs *ClusterStorage) LoadStateFile(setBucketOwner func(bucket uint16, shard
 	if err := json.Unmarshal(raw, &state); err != nil || len(state.Shards) == 0 {
 		return false
 	}
+	cs.applyClusterStateSnapshot(state, setBucketOwner)
+	return true
+}
 
+func (cs *ClusterStorage) applyClusterStateSnapshot(state PersistedClusterState, setBucketOwner func(bucket uint16, shardID uint32)) {
 	// Remove any pre-initialized shards that were not persisted in state.Shards (e.g. from a downscaled cluster)
 	persistedIDs := make(map[uint32]bool, len(state.Shards))
 	for _, sm := range state.Shards {
@@ -1913,7 +2033,6 @@ func (cs *ClusterStorage) LoadStateFile(setBucketOwner func(bucket uint16, shard
 			sh.bucketMu[b].Unlock()
 		}
 	}
-	return true
 }
 
 func (s *PhysicalShard) GetCustomTableKeys(tableName string) map[uint16][]string {
