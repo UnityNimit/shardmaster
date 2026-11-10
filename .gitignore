@@ -21,3 +21,9 @@ data/
 Thumbs.db
 .idea/
 .vscode/
+
+# Secret configs
+.env
+.env.*
+tidb_config.json
+.neuron/

@@ -25,7 +25,18 @@ import (
 
 func bootstrapEngine(initialShards uint32, seedRows int) *router.QueryRouter {
 	dir := directory.NewShardDirectory(initialShards)
-	cluster := storage.NewClusterStorage(initialShards, "./data")
+	var cluster *storage.ClusterStorage
+	tidbCfg := storage.LoadTiDBConfigFromEnv()
+	if tidbCfg.Enabled() {
+		var err error
+		cluster, err = storage.NewClusterStorageWithTiDB(initialShards, tidbCfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "\n  [TiDB Warning] Could not connect to TiDB (%v). Running strictly in-memory (0 local disk data).\n", err)
+			cluster = storage.NewMemoryOnlyClusterStorage(initialShards)
+		}
+	} else {
+		cluster = storage.NewMemoryOnlyClusterStorage(initialShards)
+	}
 	cluster.SeedCluster(seedRows, dir.GetBucketOwner)
 	if cluster.LoadStateFile(dir.AtomicCutoverBucket) {
 		dir.SetActiveShards(uint32(len(cluster.GetAllShards())))
